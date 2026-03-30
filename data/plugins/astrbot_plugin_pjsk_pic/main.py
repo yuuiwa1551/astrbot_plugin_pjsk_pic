@@ -669,7 +669,7 @@ class PJSKPicPlugin(Star):
         await self._send_tag_image(event, tag, count=count, silent_on_tool=False)
         return None
 
-    @filter.command_group("pjsk图库")
+    @filter.command_group("pjsk图库", alias={"pp"})
     async def pjsk_gallery(self):
         """PJSK 图片库管理命令。"""
 
