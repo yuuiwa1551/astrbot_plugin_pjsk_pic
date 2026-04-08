@@ -63,19 +63,28 @@ HTML_PAGE = """<!DOCTYPE html>
     .modal-body { padding: 16px; display: grid; grid-template-columns: minmax(320px, 1fr) minmax(320px, 0.95fr); gap: 16px; }
     .modal-image img { width: 100%; max-height: 72vh; object-fit: contain; border-radius: 12px; background: #ddd; }
     .mapping-box { border: 1px solid #eceef2; border-radius: 10px; padding: 10px; margin-bottom: 8px; }
+    .split-grid { display: grid; grid-template-columns: minmax(380px, 1.15fr) minmax(320px, 0.85fr); gap: 16px; }
+    .stack { display: grid; gap: 16px; }
+    .term-item { border: 1px solid #eceef2; border-radius: 10px; padding: 12px; display: grid; gap: 6px; }
+    .term-head { display: flex; justify-content: space-between; gap: 10px; align-items: start; flex-wrap: wrap; }
+    .term-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .mini-btn { padding: 6px 10px; font-size: 12px; }
+    button.danger { background: #dc2626; }
+    .sample-links { display: grid; gap: 4px; }
     pre.json { background: #0f172a; color: #d7e2ff; padding: 10px; border-radius: 12px; overflow: auto; font-size: 12px; }
     @media (max-width: 1000px) {
       main { grid-template-columns: 1fr; }
       section.wide { grid-column: auto; }
       .modal-body { grid-template-columns: 1fr; }
       .pixiv-grid { grid-template-columns: 1fr; }
+      .split-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
 <header>
   <h1 style="margin:0;">PJSK 图片库管理台</h1>
-  <div class="muted" style="color:#dce4ff;">独立 WebUI：支持图库检索、Pixiv 图片审批、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
+  <div class="muted" style="color:#dce4ff;">独立 WebUI：支持图库检索、Pixiv 图片审批、Pixiv 平台词管理、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
   <div class="notice" id="notice"></div>
 </header>
 <main>
@@ -155,6 +164,52 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="pixiv-grid" id="pixivReviewImages"></div>
   </section>
+  <section class="wide">
+    <h2>Pixiv 平台词管理</h2>
+    <div class="row">
+      <input id="pixivPlatformTagFilter" placeholder="按主 tag 筛选，例如 初音未来" />
+      <input id="pixivPlatformKeyword" placeholder="按 Pixiv 词搜索 / 查看未解决词" style="flex:1;" />
+      <select id="pixivPlatformTypeFilter">
+        <option value="">全部类型</option>
+        <option value="both">both</option>
+        <option value="query">query</option>
+        <option value="match">match</option>
+      </select>
+      <button onclick="loadPixivPlatformTerms()">查询平台词</button>
+      <button class="secondary" onclick="loadPixivPlatformSuggestions()">查看建议词</button>
+      <button class="secondary" onclick="loadPixivPlatformUnresolved()">刷新未解决词</button>
+    </div>
+    <div class="row">
+      <input id="pixivPlatformTagInput" placeholder="主 tag" />
+      <input id="pixivPlatformTermInput" placeholder="Pixiv 词，例如 初音ミク" style="flex:1;" />
+      <select id="pixivPlatformTypeInput">
+        <option value="both">both</option>
+        <option value="query">query</option>
+        <option value="match">match</option>
+      </select>
+      <input id="pixivPlatformSourceInput" placeholder="来源" value="manual_review" />
+      <input id="pixivPlatformConfidenceInput" type="number" step="0.01" min="0" max="1" value="1" style="width:110px;" />
+      <button id="pixivPlatformSaveButton" onclick="savePixivPlatformTerm()">新增平台词</button>
+      <button class="secondary" onclick="resetPixivPlatformForm()">重置</button>
+    </div>
+    <div class="split-grid">
+      <div>
+        <div class="subheading">已配置平台词</div>
+        <div class="list" id="pixivPlatformTerms"></div>
+      </div>
+      <div class="stack">
+        <div>
+          <div class="subheading">历史建议词</div>
+          <div class="muted" id="pixivPlatformSuggestionsHint">输入主 tag 后点击“查看建议词”。</div>
+          <div class="list" id="pixivPlatformSuggestions"></div>
+        </div>
+        <div>
+          <div class="subheading">未解决词 / 待确认词</div>
+          <div class="list" id="pixivPlatformUnresolved"></div>
+        </div>
+      </div>
+    </div>
+  </section>
 </main>
 <div class="modal" id="pixivPreviewModal">
   <div class="modal-panel">
@@ -194,6 +249,14 @@ const pixivReviewState = {
   selectedTagsByImage: {},
   selectedTermsByImage: {},
   previewImageId: null,
+};
+
+const pixivPlatformState = {
+  items: [],
+  suggestionsTag: '',
+  suggestions: [],
+  unresolved: [],
+  editingTermId: 0,
 };
 
 function normalizeKey(value) {
@@ -534,14 +597,240 @@ async function submitPixivReview(imageId) {
   delete pixivReviewState.selectedTagsByImage[imageId];
   delete pixivReviewState.selectedTermsByImage[imageId];
   closePixivPreview();
-  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary()]);
+  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions()]);
 }
 
 document.getElementById('pixivPreviewModal').addEventListener('click', (event) => {
   if (event.target.id === 'pixivPreviewModal') closePixivPreview();
 });
 
-Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags(), loadPixivReviewImages()]).catch(err => { console.error(err); alert(err.message || err); });
+function syncPixivPlatformSaveButton() {
+  const button = document.getElementById('pixivPlatformSaveButton');
+  if (!button) return;
+  button.textContent = pixivPlatformState.editingTermId ? '更新平台词' : '新增平台词';
+}
+
+function prefillPixivPlatformForm(tagName = '', term = '', termType = 'both', source = 'manual_review', confidence = '1', termId = 0) {
+  document.getElementById('pixivPlatformTagInput').value = tagName || '';
+  document.getElementById('pixivPlatformTermInput').value = term || '';
+  document.getElementById('pixivPlatformTypeInput').value = termType || 'both';
+  document.getElementById('pixivPlatformSourceInput').value = source || 'manual_review';
+  document.getElementById('pixivPlatformConfidenceInput').value = confidence ?? '1';
+  pixivPlatformState.editingTermId = Number(termId || 0);
+  syncPixivPlatformSaveButton();
+}
+
+function resetPixivPlatformForm() {
+  prefillPixivPlatformForm(document.getElementById('pixivPlatformTagFilter').value.trim(), '', 'both', 'manual_review', '1', 0);
+}
+
+function editPixivPlatformTerm(termId, tagName, term, termType, source, confidence) {
+  prefillPixivPlatformForm(tagName, term, termType, source, String(confidence ?? '1'), termId);
+}
+
+function currentPixivPlatformSuggestionTag() {
+  return document.getElementById('pixivPlatformTagFilter').value.trim() || document.getElementById('pixivPlatformTagInput').value.trim();
+}
+
+function selectPixivPlatformTag(tagName) {
+  document.getElementById('pixivPlatformTagFilter').value = tagName || '';
+  document.getElementById('pixivPlatformTagInput').value = tagName || '';
+  loadPixivPlatformTerms();
+  loadPixivPlatformSuggestions(tagName || '');
+}
+
+function usePixivTermInForm(term, defaultTag = '') {
+  prefillPixivPlatformForm(defaultTag || currentPixivPlatformSuggestionTag(), term, 'both', 'pixiv_history', '0.8', 0);
+}
+
+function renderPixivPlatformTermItem(item) {
+  return `
+    <div class="term-item">
+      <div class="term-head">
+        <div>
+          <div><strong>${escapeHtml(item.term)}</strong> <span class="pill">${escapeHtml(item.term_type)}</span>${item.is_character ? ' <span class="pill">角色</span>' : ''}</div>
+          <div class="muted">主 tag：${escapeHtml(item.tag_name)} · 来源：${escapeHtml(item.source || '-')} · 置信度：${Number(item.confidence || 0).toFixed(2)}</div>
+        </div>
+        <div class="term-actions">
+          <button class="secondary mini-btn" onclick='selectPixivPlatformTag(${JSON.stringify(item.tag_name)})'>查看建议</button>
+          <button class="secondary mini-btn" onclick='editPixivPlatformTerm(${item.id}, ${JSON.stringify(item.tag_name)}, ${JSON.stringify(item.term)}, ${JSON.stringify(item.term_type)}, ${JSON.stringify(item.source || "manual_review")}, ${JSON.stringify(item.confidence ?? 1)})'>编辑</button>
+          <button class="danger mini-btn" onclick="deletePixivPlatformTerm(${item.id})">删除</button>
+        </div>
+      </div>
+      <div class="muted">alias：${(item.aliases || []).map(escapeHtml).join('、') || '无'}</div>
+      <div class="muted">更新时间：${escapeHtml(item.updated_at || item.created_at || '-')}</div>
+    </div>
+  `;
+}
+
+function renderPixivPlatformTerms() {
+  document.getElementById('pixivPlatformTerms').innerHTML = (pixivPlatformState.items || []).length
+    ? pixivPlatformState.items.map(renderPixivPlatformTermItem).join('')
+    : '<div class="muted">暂无 Pixiv 平台词</div>';
+}
+
+function renderPixivPlatformSuggestionItem(item) {
+  const currentTag = pixivPlatformState.suggestionsTag || '';
+  return `
+    <div class="term-item">
+      <div class="term-head">
+        <div>
+          <div><strong>${escapeHtml(item.term)}</strong> <span class="pill">建议</span></div>
+          <div class="muted">历史命中 ${item.count || 0} 次</div>
+        </div>
+        <div class="term-actions">
+          ${currentTag ? `<button class="mini-btn" onclick='quickSavePixivPlatformTerm(${JSON.stringify(currentTag)}, ${JSON.stringify(item.term)}, "both", "pixiv_history")'>采纳到当前 tag</button>` : ''}
+          <button class="secondary mini-btn" onclick='usePixivTermInForm(${JSON.stringify(item.term)}, ${JSON.stringify(currentTag)})'>填入表单</button>
+        </div>
+      </div>
+      <div class="muted">候选主 tag：${(item.candidate_tags || []).map(escapeHtml).join('、') || '无'}</div>
+    </div>
+  `;
+}
+
+function renderPixivPlatformSuggestions() {
+  const hint = document.getElementById('pixivPlatformSuggestionsHint');
+  hint.textContent = pixivPlatformState.suggestionsTag
+    ? `当前主 tag：${pixivPlatformState.suggestionsTag}，下面是历史 Pixiv 数据里推荐沉淀的词。`
+    : '输入主 tag 后点击“查看建议词”。';
+  document.getElementById('pixivPlatformSuggestions').innerHTML = (pixivPlatformState.suggestions || []).length
+    ? pixivPlatformState.suggestions.map(renderPixivPlatformSuggestionItem).join('')
+    : '<div class="muted">暂无建议词</div>';
+}
+
+function renderPixivPlatformUnresolvedItem(item) {
+  return `
+    <div class="term-item">
+      <div class="term-head">
+        <div>
+          <div><strong>${escapeHtml(item.term)}</strong> <span class="pill">待确认</span></div>
+          <div class="muted">出现 ${item.count || 0} 次 · 候选主 tag：${(item.candidate_tags || []).map(escapeHtml).join('、') || '无'}</div>
+        </div>
+        <div class="term-actions">
+          ${((item.candidate_tags || []).slice(0, 3)).map(tagName => `<button class="mini-btn" onclick='quickSavePixivPlatformTerm(${JSON.stringify(tagName)}, ${JSON.stringify(item.term)}, "both", "pixiv_history")'>映射到 ${escapeHtml(tagName)}</button>`).join('')}
+          <button class="secondary mini-btn" onclick='usePixivTermInForm(${JSON.stringify(item.term)})'>填入表单</button>
+        </div>
+      </div>
+      <div class="muted">作者：${(item.sample_authors || []).map(escapeHtml).join('、') || '无'}</div>
+      <div class="sample-links">${(item.sample_post_urls || []).map(url => `<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`).join('') || '<span class="muted">暂无示例链接</span>'}</div>
+    </div>
+  `;
+}
+
+function renderPixivPlatformUnresolved() {
+  document.getElementById('pixivPlatformUnresolved').innerHTML = (pixivPlatformState.unresolved || []).length
+    ? pixivPlatformState.unresolved.map(renderPixivPlatformUnresolvedItem).join('')
+    : '<div class="muted">暂无未解决词</div>';
+}
+
+async function loadPixivPlatformTerms() {
+  const q = new URLSearchParams({
+    tag_name: document.getElementById('pixivPlatformTagFilter').value,
+    keyword: document.getElementById('pixivPlatformKeyword').value,
+    term_type: document.getElementById('pixivPlatformTypeFilter').value,
+    limit: '80',
+  });
+  const data = await fetchJson(`/api/pixiv-platform-terms?${q.toString()}`);
+  pixivPlatformState.items = data.items || [];
+  renderPixivPlatformTerms();
+}
+
+async function loadPixivPlatformSuggestions(tagName = '') {
+  const target = String(tagName || currentPixivPlatformSuggestionTag()).trim();
+  if (!target) {
+    pixivPlatformState.suggestionsTag = '';
+    pixivPlatformState.suggestions = [];
+    renderPixivPlatformSuggestions();
+    return;
+  }
+  const data = await fetchJson(`/api/pixiv-platform-suggestions?tag_name=${encodeURIComponent(target)}&limit=20`);
+  const canonicalTag = (data.tag && data.tag.name) || target;
+  pixivPlatformState.suggestionsTag = canonicalTag;
+  pixivPlatformState.suggestions = data.items || [];
+  document.getElementById('pixivPlatformTagFilter').value = canonicalTag;
+  if (!document.getElementById('pixivPlatformTagInput').value.trim()) {
+    document.getElementById('pixivPlatformTagInput').value = canonicalTag;
+  }
+  const aliases = (data.tag && data.tag.aliases) ? data.tag.aliases.join('、') : '';
+  document.getElementById('pixivPlatformSuggestionsHint').textContent = `当前主 tag：${canonicalTag}${data.tag && data.tag.is_character ? '（角色）' : ''}${aliases ? ` · alias：${aliases}` : ''}`;
+  renderPixivPlatformSuggestions();
+}
+
+async function loadPixivPlatformUnresolved() {
+  const q = new URLSearchParams({
+    keyword: document.getElementById('pixivPlatformKeyword').value,
+    limit: '30',
+  });
+  const data = await fetchJson(`/api/pixiv-platform-unresolved?${q.toString()}`);
+  pixivPlatformState.unresolved = data.items || [];
+  renderPixivPlatformUnresolved();
+}
+
+async function savePixivPlatformTerm() {
+  const tagName = document.getElementById('pixivPlatformTagInput').value.trim();
+  const term = document.getElementById('pixivPlatformTermInput').value.trim();
+  const confidenceText = document.getElementById('pixivPlatformConfidenceInput').value.trim();
+  if (!tagName || !term) {
+    alert('请先填写主 tag 和 Pixiv 词。');
+    return;
+  }
+  const confidence = confidenceText === '' ? 1 : Number(confidenceText);
+  if (Number.isNaN(confidence)) {
+    alert('置信度格式不正确。');
+    return;
+  }
+  const result = await fetchJson('/api/pixiv-platform-terms/save', {
+    method: 'POST',
+    body: JSON.stringify({
+      term_id: pixivPlatformState.editingTermId || 0,
+      tag_name: tagName,
+      term,
+      term_type: document.getElementById('pixivPlatformTypeInput').value,
+      source: document.getElementById('pixivPlatformSourceInput').value,
+      confidence,
+    }),
+  });
+  alert(result.message || '已保存平台词');
+  document.getElementById('pixivPlatformTagFilter').value = tagName;
+  resetPixivPlatformForm();
+  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(tagName), loadPixivPlatformUnresolved(), loadPixivReviewImages()]);
+}
+
+async function deletePixivPlatformTerm(termId) {
+  if (!confirm('确认删除这条 Pixiv 平台词吗？')) return;
+  const result = await fetchJson('/api/pixiv-platform-terms', {
+    method: 'DELETE',
+    body: JSON.stringify({term_id: termId}),
+  });
+  alert(result.message || '已删除平台词');
+  if (pixivPlatformState.editingTermId === Number(termId || 0)) resetPixivPlatformForm();
+  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(), loadPixivPlatformUnresolved(), loadPixivReviewImages()]);
+}
+
+async function quickSavePixivPlatformTerm(tagName, term, termType = 'both', source = 'pixiv_history') {
+  const resolvedTag = String(tagName || currentPixivPlatformSuggestionTag()).trim();
+  if (!resolvedTag) {
+    alert('请先指定主 tag。');
+    usePixivTermInForm(term);
+    return;
+  }
+  const result = await fetchJson('/api/pixiv-platform-terms/save', {
+    method: 'POST',
+    body: JSON.stringify({
+      tag_name: resolvedTag,
+      term,
+      term_type: termType,
+      source,
+      confidence: 0.8,
+    }),
+  });
+  alert(result.message || '已保存平台词');
+  document.getElementById('pixivPlatformTagFilter').value = resolvedTag;
+  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(resolvedTag), loadPixivPlatformUnresolved(), loadPixivReviewImages()]);
+}
+
+resetPixivPlatformForm();
+Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags(), loadPixivReviewImages(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved()]).catch(err => { console.error(err); alert(err.message || err); });
 </script>
 </body>
 </html>
@@ -587,6 +876,11 @@ class GalleryWebUI:
                 web.get("/api/pixiv-review-images", self.api_pixiv_review_images),
                 web.get("/api/pixiv-review-image", self.api_pixiv_review_image),
                 web.post("/api/pixiv-review/submit", self.api_pixiv_review_submit),
+                web.get("/api/pixiv-platform-terms", self.api_pixiv_platform_terms),
+                web.post("/api/pixiv-platform-terms/save", self.api_pixiv_platform_terms_save),
+                web.delete("/api/pixiv-platform-terms", self.api_pixiv_platform_terms_delete),
+                web.get("/api/pixiv-platform-suggestions", self.api_pixiv_platform_suggestions),
+                web.get("/api/pixiv-platform-unresolved", self.api_pixiv_platform_unresolved),
                 web.post("/api/reviews/decision", self.api_review_decision),
                 web.post("/api/tag/alias", self.api_tag_alias),
                 web.delete("/api/tag/alias", self.api_tag_alias),
@@ -755,6 +1049,64 @@ class GalleryWebUI:
                 platform="pixiv",
                 limit=8,
             ),
+        }
+
+    def _candidate_tag_names_for_term(self, term: str) -> list[str]:
+        match = self.db.resolve_tag(term, allow_fuzzy=True, candidate_limit=5)
+        resolved: list[str] = []
+        seen: set[str] = set()
+
+        def push(name: str) -> None:
+            text = str(name or "").strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            resolved.append(text)
+
+        if match.matched and match.tag_name:
+            push(str(match.tag_name))
+        for candidate in match.candidates:
+            push(candidate)
+        return resolved
+
+    def _build_platform_term_item(self, row: Any) -> dict[str, Any]:
+        tag_name = str(row["tag_name"])
+        tag_row = self.db.get_tag_row(tag_name)
+        return {
+            "id": int(row["id"]),
+            "tag_id": int(row["tag_id"]),
+            "tag_name": tag_name,
+            "platform": str(row["platform"] or ""),
+            "term": str(row["term"] or ""),
+            "normalized_term": str(row["normalized_term"] or ""),
+            "term_type": str(row["term_type"] or "both"),
+            "source": str(row["source"] or ""),
+            "confidence": float(row["confidence"] or 0.0),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+            "aliases": self.db.list_aliases(tag_name),
+            "is_character": bool(tag_row["is_character"]) if tag_row else False,
+        }
+
+    def _build_platform_suggestion_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        term = str(item.get("term", "") or "").strip()
+        return {
+            "term": term,
+            "normalized_term": str(item.get("normalized_term", "") or ""),
+            "count": int(item.get("count", 0) or 0),
+            "candidate_tags": self._candidate_tag_names_for_term(term),
+        }
+
+    def _build_unresolved_platform_term_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        term = str(item.get("term", "") or "").strip()
+        return {
+            "term": term,
+            "normalized_term": str(item.get("normalized_term", "") or ""),
+            "count": int(item.get("count", 0) or 0),
+            "candidate_tags": self._candidate_tag_names_for_term(term),
+            "sample_post_urls": self._dedupe_texts(list(item.get("sample_post_urls", []) or [])),
+            "sample_authors": self._dedupe_texts(list(item.get("sample_authors", []) or [])),
         }
 
     def _build_pixiv_review_item(self, image_id: int) -> dict[str, Any] | None:
@@ -1046,6 +1398,114 @@ class GalleryWebUI:
         else:
             payload["message"] = str(result)
         return self._json_response(payload, status=(200 if ok else 400))
+
+    async def api_pixiv_platform_terms(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        args = request.query
+        term_type = str(args.get("term_type", "") or "").strip()
+        rows = self.db.list_platform_terms(
+            tag_name=str(args.get("tag_name", "") or "").strip(),
+            platform="pixiv",
+            term_types=[term_type] if term_type else None,
+            keyword=str(args.get("keyword", "") or "").strip(),
+            limit=min(max(int(args.get("limit", 80) or 80), 1), 200),
+            offset=max(int(args.get("offset", 0) or 0), 0),
+        )
+        return self._json_response({"items": [self._build_platform_term_item(row) for row in rows]})
+
+    async def api_pixiv_platform_terms_save(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        confidence_raw = data.get("confidence", None)
+        confidence: float | None = None
+        if confidence_raw not in (None, ""):
+            try:
+                confidence = float(confidence_raw)
+            except (TypeError, ValueError):
+                return self._json_response({"ok": False, "message": "confidence_invalid"}, status=400)
+        term_id = int(data.get("term_id", 0) or 0)
+        if term_id > 0:
+            ok, message = self.db.update_platform_term(
+                term_id,
+                tag_name=str(data.get("tag_name", "") or "").strip(),
+                term=str(data.get("term", "") or "").strip(),
+                term_type=str(data.get("term_type", "") or "").strip(),
+                source=str(data.get("source", "") or "").strip(),
+                confidence=confidence,
+            )
+        else:
+            ok, message = self.db.add_platform_term(
+                str(data.get("tag_name", "") or "").strip(),
+                str(data.get("term", "") or "").strip(),
+                platform="pixiv",
+                term_type=str(data.get("term_type", "") or "").strip() or "both",
+                source=str(data.get("source", "") or "").strip() or "manual_review",
+                confidence=(1.0 if confidence is None else confidence),
+            )
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
+
+    async def api_pixiv_platform_terms_delete(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        ok, message = self.db.remove_platform_term(int(data.get("term_id", 0) or 0))
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
+
+    async def api_pixiv_platform_suggestions(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        requested = str(request.query.get("tag_name", "") or "").strip()
+        resolved = self.db.resolve_tag(requested, allow_fuzzy=False)
+        canonical_tag = str(resolved.tag_name or requested).strip()
+        row = self.db.get_tag_row(canonical_tag)
+        if not row:
+            return self._json_response({"ok": False, "message": "tag_not_found"}, status=404)
+        canonical_name = str(row["name"])
+        items = [
+            self._build_platform_suggestion_item(item)
+            for item in self.db.suggest_platform_terms_for_tag(
+                tag_name=canonical_name,
+                platform="pixiv",
+                limit=min(max(int(request.query.get("limit", 20) or 20), 1), 50),
+            )
+        ]
+        current_terms = [
+            self._build_platform_term_item(term_row)
+            for term_row in self.db.list_platform_terms(tag_id=int(row["id"]), platform="pixiv", limit=200)
+        ]
+        return self._json_response(
+            {
+                "ok": True,
+                "tag": {
+                    "id": int(row["id"]),
+                    "name": canonical_name,
+                    "is_character": bool(row["is_character"]),
+                    "aliases": self.db.list_aliases(canonical_name),
+                    "current_terms": current_terms,
+                },
+                "items": items,
+            }
+        )
+
+    async def api_pixiv_platform_unresolved(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        items = [
+            self._build_unresolved_platform_term_item(item)
+            for item in self.db.list_unresolved_platform_terms(
+                platform="pixiv",
+                keyword=str(request.query.get("keyword", "") or "").strip(),
+                limit=min(max(int(request.query.get("limit", 30) or 30), 1), 80),
+            )
+        ]
+        return self._json_response({"items": items})
 
     async def api_review_decision(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)

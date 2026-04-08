@@ -1322,6 +1322,8 @@ class ImageIndexDB:
         platform: str = '',
         term_types: Iterable[str] | None = None,
         limit: int = 100,
+        offset: int = 0,
+        keyword: str = '',
     ) -> list[sqlite3.Row]:
         resolved_tag_id = tag_id
         if resolved_tag_id is None and tag_name:
@@ -1342,6 +1344,18 @@ class ImageIndexDB:
         if platform:
             clauses.append('p.platform = ?')
             params.append(str(platform).strip().lower())
+        keyword_text = str(keyword or '').strip()
+        normalized_keyword = normalize_tag_name(keyword_text)
+        if keyword_text:
+            keyword_clauses: list[str] = []
+            keyword_params: list[Any] = []
+            if normalized_keyword:
+                keyword_clauses.extend(['p.normalized_term LIKE ?', 't.normalized_name LIKE ?'])
+                keyword_params.extend([f'%{normalized_keyword}%', f'%{normalized_keyword}%'])
+            keyword_clauses.extend(['p.term LIKE ?', 't.name LIKE ?'])
+            keyword_params.extend([f'%{keyword_text}%', f'%{keyword_text}%'])
+            clauses.append('(' + ' OR '.join(keyword_clauses) + ')')
+            params.extend(keyword_params)
         normalized_term_types = {
             self._normalize_platform_term_type(item)
             for item in (term_types or [])
@@ -1349,13 +1363,93 @@ class ImageIndexDB:
         }
         if clauses:
             sql += ' WHERE ' + ' AND '.join(clauses)
-        sql += ' ORDER BY p.confidence DESC, p.term ASC LIMIT ?'
-        params.append(limit)
+        sql += ' ORDER BY p.confidence DESC, p.term ASC'
         with self._lock, self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        if not normalized_term_types:
-            return rows
-        return [row for row in rows if self._platform_term_type_matches(str(row['term_type'] or ''), normalized_term_types)]
+        if normalized_term_types:
+            rows = [row for row in rows if self._platform_term_type_matches(str(row['term_type'] or ''), normalized_term_types)]
+        resolved_offset = max(0, int(offset or 0))
+        resolved_limit = max(1, int(limit or 100))
+        return rows[resolved_offset : resolved_offset + resolved_limit]
+
+    def update_platform_term(
+        self,
+        term_id: int,
+        *,
+        tag_name: str = '',
+        term: str = '',
+        term_type: str = '',
+        source: str = '',
+        confidence: float | None = None,
+    ) -> tuple[bool, str]:
+        resolved_term_id = int(term_id or 0)
+        if resolved_term_id <= 0:
+            return False, 'term_id 无效'
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT p.id, p.tag_id, p.platform, p.term, p.normalized_term, p.term_type, p.source, p.confidence,
+                       t.name AS tag_name
+                FROM platform_tag_terms p
+                JOIN tags t ON t.id = p.tag_id
+                WHERE p.id = ?
+                LIMIT 1
+                """,
+                (resolved_term_id,),
+            ).fetchone()
+            if not row:
+                return False, 'platform_term_not_found'
+
+            if tag_name:
+                target_row, _ = self._resolve_tag_exact_conn(conn, tag_name)
+                if not target_row:
+                    return False, f'tag 不存在：{tag_name}'
+                if int(target_row['id']) != int(row['tag_id']):
+                    return False, '暂不支持直接修改主 tag，请删除后重建'
+
+            term_text = str(term or row['term'] or '').strip()
+            normalized_term = normalize_tag_name(term_text)
+            if not term_text or not normalized_term:
+                return False, 'Pixiv 词不能为空'
+            if normalized_term != str(row['normalized_term'] or ''):
+                return False, '暂不支持直接修改词本身，请删除后重建'
+
+            normalized_term_type = self._normalize_platform_term_type(term_type or str(row['term_type'] or 'both'))
+            source_text = str(source or row['source'] or 'manual_review').strip() or 'manual_review'
+            if confidence is None:
+                confidence_value = float(row['confidence'] or 0.0)
+            else:
+                confidence_value = float(confidence or 0.0)
+            current_time = utcnow_str()
+            conn.execute(
+                """
+                UPDATE platform_tag_terms
+                SET term = ?, term_type = ?, source = ?, confidence = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (term_text, normalized_term_type, source_text, confidence_value, current_time, resolved_term_id),
+            )
+            return True, f'已更新 {str(row["platform"] or "")} term：{str(row["tag_name"])} -> {term_text}'
+
+    def remove_platform_term(self, term_id: int) -> tuple[bool, str]:
+        resolved_term_id = int(term_id or 0)
+        if resolved_term_id <= 0:
+            return False, 'term_id 无效'
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT p.id, p.platform, p.term, t.name AS tag_name
+                FROM platform_tag_terms p
+                JOIN tags t ON t.id = p.tag_id
+                WHERE p.id = ?
+                LIMIT 1
+                """,
+                (resolved_term_id,),
+            ).fetchone()
+            if not row:
+                return False, 'platform_term_not_found'
+            conn.execute('DELETE FROM platform_tag_terms WHERE id = ?', (resolved_term_id,))
+            return True, f'已删除 {str(row["platform"] or "")} term：{str(row["tag_name"])} -> {str(row["term"] or "")}'
 
     def get_platform_terms_for_tag(
         self,
@@ -1450,6 +1544,107 @@ class ImageIndexDB:
                 'term': display_terms.get(normalized, normalized),
                 'count': int(count),
                 'normalized_term': normalized,
+            }
+            for normalized, count in suggestions[: max(1, int(limit or 1))]
+        ]
+
+    def list_unresolved_platform_terms(
+        self,
+        *,
+        platform: str = 'pixiv',
+        keyword: str = '',
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        keyword_text = str(keyword or '').strip()
+        normalized_keyword = normalize_tag_name(keyword_text)
+        with self._lock, self._connect() as conn:
+            existing_terms = {
+                str(row['normalized_term'] or '')
+                for row in conn.execute(
+                    'SELECT normalized_term FROM platform_tag_terms WHERE platform = ?',
+                    (platform_text,),
+                ).fetchall()
+                if str(row['normalized_term'] or '').strip()
+            }
+            existing_terms.update(
+                str(row['normalized_name'] or '')
+                for row in conn.execute('SELECT normalized_name FROM tags').fetchall()
+                if str(row['normalized_name'] or '').strip()
+            )
+            existing_terms.update(
+                str(row['normalized_alias'] or '')
+                for row in conn.execute('SELECT normalized_alias FROM tag_aliases').fetchall()
+                if str(row['normalized_alias'] or '').strip()
+            )
+            rows = conn.execute(
+                """
+                SELECT s.post_url, s.author, s.raw_tags, s.extra_json
+                FROM sources s
+                JOIN images i ON i.id = s.image_id
+                WHERE s.platform = ?
+                  AND i.is_active = 1
+                ORDER BY s.id DESC
+                """,
+                (platform_text,),
+            ).fetchall()
+
+        counter: Counter[str] = Counter()
+        display_terms: dict[str, str] = {}
+        sample_post_urls: dict[str, list[str]] = {}
+        sample_authors: dict[str, list[str]] = {}
+
+        for row in rows:
+            try:
+                raw_terms = json.loads(row['raw_tags'] or '[]') if row['raw_tags'] else []
+            except Exception:
+                raw_terms = []
+            try:
+                extra = json.loads(row['extra_json'] or '{}') if row['extra_json'] else {}
+            except Exception:
+                extra = {}
+            translated_terms = extra.get('translated_tags') if isinstance(extra, dict) else []
+            if not isinstance(translated_terms, list):
+                translated_terms = []
+
+            row_seen: set[str] = set()
+            for value in [*raw_terms, *translated_terms]:
+                text = str(value or '').strip()
+                normalized = normalize_tag_name(text)
+                if (
+                    not text
+                    or not normalized
+                    or normalized in row_seen
+                    or normalized in existing_terms
+                    or not self._looks_like_platform_term(text)
+                ):
+                    continue
+                if keyword_text and keyword_text.lower() not in text.lower():
+                    if not normalized_keyword or normalized_keyword not in normalized:
+                        continue
+                row_seen.add(normalized)
+                counter[normalized] += 1
+                display_terms.setdefault(normalized, text)
+
+                post_url = str(row['post_url'] or '').strip()
+                if post_url:
+                    bucket = sample_post_urls.setdefault(normalized, [])
+                    if post_url not in bucket and len(bucket) < 3:
+                        bucket.append(post_url)
+                author = str(row['author'] or '').strip()
+                if author:
+                    bucket = sample_authors.setdefault(normalized, [])
+                    if author not in bucket and len(bucket) < 3:
+                        bucket.append(author)
+
+        suggestions = sorted(counter.items(), key=lambda item: (-item[1], display_terms.get(item[0], item[0])))
+        return [
+            {
+                'term': display_terms.get(normalized, normalized),
+                'normalized_term': normalized,
+                'count': int(count),
+                'sample_post_urls': sample_post_urls.get(normalized, []),
+                'sample_authors': sample_authors.get(normalized, []),
             }
             for normalized, count in suggestions[: max(1, int(limit or 1))]
         ]
