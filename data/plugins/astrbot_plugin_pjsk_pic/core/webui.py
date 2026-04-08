@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import socket
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 from astrbot.api import logger
 
 from .crawl_tag_rules import parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
+from .matcher import normalize_tag_name
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -20,8 +22,9 @@ HTML_PAGE = """<!DOCTYPE html>
     header { padding: 16px 20px; background: #3c65f5; color: white; }
     main { padding: 16px; display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 16px; }
     section { background: white; border-radius: 10px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
-    h2 { margin-top: 0; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    section.wide { grid-column: 1 / -1; }
+    h2, h3 { margin-top: 0; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
     input, select, button { padding: 8px; border: 1px solid #d5d8df; border-radius: 8px; }
     button { cursor: pointer; background: #3c65f5; color: white; border: none; }
     button.secondary { background: #8892a6; }
@@ -37,13 +40,42 @@ HTML_PAGE = """<!DOCTYPE html>
     .review-item img { width: 92px; height: 92px; object-fit: cover; border-radius: 8px; background: #ddd; }
     .muted { color: #666; font-size: 12px; }
     .pill { display: inline-block; background: #eef2ff; color: #2f52d6; border-radius: 999px; padding: 2px 8px; margin: 2px 4px 2px 0; }
+    .chip-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+    .chip { display: inline-block; background: white; color: #2f52d6; border: 1px solid #cfd8ff; border-radius: 999px; padding: 6px 10px; margin: 2px 4px 2px 0; font-size: 12px; }
+    .chip.selected { background: #3c65f5; color: white; border-color: #3c65f5; }
+    .chip.resolved { border-color: #93a7ff; }
+    .chip.unresolved { border-style: dashed; }
     .notice { margin-top: 8px; font-size: 12px; color: #dce4ff; }
+    .subheading { font-size: 12px; color: #666; margin: 10px 0 6px; }
+    .tag-block { border: 1px dashed #e5e7eb; border-radius: 10px; padding: 10px; }
+    .empty { padding: 20px 0; text-align: center; color: #666; }
+    .pixiv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+    .pixiv-card { border: 1px solid #eceef2; border-radius: 12px; overflow: hidden; background: #fff; }
+    .pixiv-thumb-wrap { position: relative; }
+    .pixiv-thumb-wrap img { width: 100%; height: 250px; object-fit: cover; background: #ddd; cursor: zoom-in; }
+    .preview-btn { position: absolute; right: 10px; bottom: 10px; background: rgba(0,0,0,.65); }
+    .pixiv-body { padding: 12px; display: grid; gap: 6px; }
+    .pixiv-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .modal { position: fixed; inset: 0; background: rgba(15,23,42,.55); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 999; }
+    .modal.show { display: flex; }
+    .modal-panel { width: min(1180px, 96vw); max-height: 92vh; overflow: auto; background: white; border-radius: 16px; box-shadow: 0 18px 50px rgba(15,23,42,.28); }
+    .modal-header { padding: 14px 16px; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; gap: 8px; position: sticky; top: 0; background: white; z-index: 2; }
+    .modal-body { padding: 16px; display: grid; grid-template-columns: minmax(320px, 1fr) minmax(320px, 0.95fr); gap: 16px; }
+    .modal-image img { width: 100%; max-height: 72vh; object-fit: contain; border-radius: 12px; background: #ddd; }
+    .mapping-box { border: 1px solid #eceef2; border-radius: 10px; padding: 10px; margin-bottom: 8px; }
+    pre.json { background: #0f172a; color: #d7e2ff; padding: 10px; border-radius: 12px; overflow: auto; font-size: 12px; }
+    @media (max-width: 1000px) {
+      main { grid-template-columns: 1fr; }
+      section.wide { grid-column: auto; }
+      .modal-body { grid-template-columns: 1fr; }
+      .pixiv-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
 <header>
   <h1 style="margin:0;">PJSK 图片库管理台</h1>
-  <div class="muted" style="color:#dce4ff;">独立 WebUI：支持图库检索、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
+  <div class="muted" style="color:#dce4ff;">独立 WebUI：支持图库检索、Pixiv 图片审批、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
   <div class="notice" id="notice"></div>
 </header>
 <main>
@@ -109,7 +141,35 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="list" id="tags"></div>
     </section>
   </div>
+  <section class="wide">
+    <h2>Pixiv 审批页</h2>
+    <div class="row">
+      <select id="pixivReviewStatus">
+        <option value="">全部待处理</option>
+        <option value="pending">pending</option>
+        <option value="uncertain">uncertain</option>
+        <option value="rejected">rejected</option>
+      </select>
+      <button onclick="loadPixivReviewImages()">刷新 Pixiv 审批</button>
+      <span class="muted">点击来源 tag 可勾选本次要沉淀的 Pixiv 词；点击候选主 tag 可确认最终入库 tag。</span>
+    </div>
+    <div class="pixiv-grid" id="pixivReviewImages"></div>
+  </section>
 </main>
+<div class="modal" id="pixivPreviewModal">
+  <div class="modal-panel">
+    <div class="modal-header">
+      <div>
+        <strong id="pixivPreviewTitle">Pixiv 预览</strong>
+        <div class="muted" id="pixivPreviewSubtitle"></div>
+      </div>
+      <div class="row" style="margin:0;">
+        <button class="secondary" onclick="closePixivPreview()">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body" id="pixivPreviewBody"></div>
+  </div>
+</div>
 <script>
 const params = new URLSearchParams(location.search);
 const token = params.get('token') || '';
@@ -127,6 +187,38 @@ async function fetchJson(path, options = {}) {
   const resp = await fetch(api(path), {...options, headers});
   if (!resp.ok) throw new Error(await resp.text());
   return await resp.json();
+}
+
+const pixivReviewState = {
+  items: {},
+  selectedTagsByImage: {},
+  selectedTermsByImage: {},
+  previewImageId: null,
+};
+
+function normalizeKey(value) {
+  return String(value || '').normalize('NFKC').trim().toLowerCase().replace(/\\s+/g, '');
+}
+
+function uniqueTexts(values) {
+  const seen = new Set();
+  const result = [];
+  for (const raw of values || []) {
+    const text = String(raw || '').trim();
+    const key = normalizeKey(text);
+    if (!text || !key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+  }
+  return result;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/`/g, '&#96;');
 }
 
 function renderStats(stats) {
@@ -212,7 +304,7 @@ async function loadReviews() {
 
 async function reviewDecision(reviewId, approved) {
   await fetchJson('/api/reviews/decision', {method: 'POST', body: JSON.stringify({review_id: reviewId, approved})});
-  await loadReviews(); await loadImages(); await loadSummary();
+  await Promise.all([loadReviews(), loadImages(), loadSummary(), loadPixivReviewImages()]);
 }
 
 async function loadTags() {
@@ -242,7 +334,214 @@ async function setCharacter() {
   await loadTags();
 }
 
-Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags()]).catch(err => { console.error(err); alert(err.message || err); });
+function ensurePixivReviewSelection(item) {
+  if (!item) return;
+  const imageId = item.image_id;
+  if (!pixivReviewState.selectedTagsByImage[imageId]) {
+    const defaults = uniqueTexts((item.review_tasks || []).filter(task => task.status !== 'manual_rejected').map(task => task.tag_name));
+    pixivReviewState.selectedTagsByImage[imageId] = defaults.length ? defaults : uniqueTexts((item.candidate_tags || []).slice(0, 1).map(tag => tag.name));
+  }
+  if (!pixivReviewState.selectedTermsByImage[imageId]) {
+    pixivReviewState.selectedTermsByImage[imageId] = [];
+  }
+}
+
+function resetPixivReviewSelection(imageId) {
+  const item = pixivReviewState.items[imageId];
+  if (!item) return;
+  delete pixivReviewState.selectedTagsByImage[imageId];
+  delete pixivReviewState.selectedTermsByImage[imageId];
+  ensurePixivReviewSelection(item);
+  renderPixivReviewList();
+  renderPixivPreview();
+}
+
+function toggleCandidateTag(imageId, tagName) {
+  const current = uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []);
+  const key = normalizeKey(tagName);
+  const exists = current.some(item => normalizeKey(item) === key);
+  pixivReviewState.selectedTagsByImage[imageId] = exists ? current.filter(item => normalizeKey(item) !== key) : [...current, tagName];
+  renderPixivReviewList();
+  renderPixivPreview();
+}
+
+function toggleSourceTerm(imageId, term, resolvedTagName) {
+  const current = uniqueTexts(pixivReviewState.selectedTermsByImage[imageId] || []);
+  const key = normalizeKey(term);
+  const exists = current.some(item => normalizeKey(item) === key);
+  pixivReviewState.selectedTermsByImage[imageId] = exists ? current.filter(item => normalizeKey(item) !== key) : [...current, term];
+  if (!exists && resolvedTagName) {
+    const selectedTags = uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []);
+    if (!selectedTags.some(item => normalizeKey(item) === normalizeKey(resolvedTagName))) {
+      pixivReviewState.selectedTagsByImage[imageId] = [...selectedTags, resolvedTagName];
+    }
+  }
+  renderPixivReviewList();
+  renderPixivPreview();
+}
+
+function renderCandidateTagChip(imageId, tag, selected) {
+  return `<button class="chip ${selected ? 'selected' : ''}" onclick='toggleCandidateTag(${imageId}, ${JSON.stringify(tag.name)})'>${escapeHtml(tag.name)}${tag.is_character ? ' ·角色' : ''}</button>`;
+}
+
+function renderSourceTermChip(imageId, term, selected) {
+  const prefix = term.origin === 'translated' ? '译' : '原';
+  const label = `${prefix}·${term.term}${term.resolved_tag_name ? ` → ${term.resolved_tag_name}` : ''}`;
+  const classes = ['chip', selected ? 'selected' : '', term.resolved_tag_name ? 'resolved' : 'unresolved'].filter(Boolean).join(' ');
+  return `<button class="${classes}" title="${escapeAttr(term.resolution || '')}" onclick='toggleSourceTerm(${imageId}, ${JSON.stringify(term.term)}, ${JSON.stringify(term.resolved_tag_name || '')})'>${escapeHtml(label)}</button>`;
+}
+
+function renderPixivReviewCard(item) {
+  ensurePixivReviewSelection(item);
+  const imageId = item.image_id;
+  const selectedTags = pixivReviewState.selectedTagsByImage[imageId] || [];
+  const selectedTerms = pixivReviewState.selectedTermsByImage[imageId] || [];
+  return `
+    <div class="pixiv-card">
+      <div class="pixiv-thumb-wrap">
+        <img src="${api(`/api/image-file?image_id=${imageId}`)}" loading="lazy" onclick="openPixivPreview(${imageId})" />
+        <button class="preview-btn" onclick="openPixivPreview(${imageId})">预览</button>
+      </div>
+      <div class="pixiv-body">
+        <div><strong>#${imageId}</strong> ${escapeHtml(item.file_name || '')}</div>
+        <div class="muted">${item.width}x${item.height} · ${escapeHtml(item.author || '-')}</div>
+        <div class="muted">标题：${escapeHtml(item.title || '-')}</div>
+        <div class="muted">来源：${item.post_url ? `<a href="${escapeAttr(item.post_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.post_url)}</a>` : '-'}</div>
+        <div class="tag-block">
+          <div class="subheading">当前审核项</div>
+          <div>${(item.review_tasks || []).map(task => `<span class="pill">${escapeHtml(task.tag_name)}(${escapeHtml(task.status)})</span>`).join('') || '<span class="muted">无</span>'}</div>
+          <div class="subheading">候选主 tag</div>
+          <div class="chip-row">${(item.candidate_tags || []).map(tag => renderCandidateTagChip(imageId, tag, selectedTags.some(name => normalizeKey(name) === normalizeKey(tag.name)))).join('') || '<span class="muted">暂无候选主 tag</span>'}</div>
+          <div class="subheading">Pixiv 来源 tag</div>
+          <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
+          <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
+        </div>
+        <div class="pixiv-actions">
+          <button onclick="submitPixivReview(${imageId})">确认审核</button>
+          <button class="secondary" onclick="resetPixivReviewSelection(${imageId})">重置</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderPixivReviewList() {
+  const items = Object.values(pixivReviewState.items).sort((a, b) => (b.image_id || 0) - (a.image_id || 0));
+  document.getElementById('pixivReviewImages').innerHTML = items.length ? items.map(renderPixivReviewCard).join('') : '<div class="empty">暂无 Pixiv 待审图片</div>';
+}
+
+async function loadPixivReviewImages() {
+  const q = new URLSearchParams({status: document.getElementById('pixivReviewStatus').value, limit: '24'});
+  const data = await fetchJson(`/api/pixiv-review-images?${q.toString()}`);
+  pixivReviewState.items = {};
+  for (const item of (data.items || [])) {
+    pixivReviewState.items[item.image_id] = item;
+    ensurePixivReviewSelection(item);
+  }
+  renderPixivReviewList();
+  renderPixivPreview();
+}
+
+function buildCandidateMappingsHtml(item) {
+  return (item.candidate_tags || []).map(tag => `
+    <div class="mapping-box">
+      <div><strong>${escapeHtml(tag.name)}</strong>${tag.is_character ? ' <span class="pill">角色</span>' : ''}</div>
+      <div class="muted">alias：${(tag.aliases || []).map(escapeHtml).join('、') || '无'}</div>
+      <div class="muted">已有 Pixiv 词：${(tag.platform_terms || []).map(escapeHtml).join('、') || '无'}</div>
+      <div class="muted">历史建议：${(tag.suggested_terms || []).map(term => `${escapeHtml(term.term)}(${term.count})`).join('、') || '无'}</div>
+    </div>
+  `).join('') || '<div class="muted">暂无候选 tag 细节</div>';
+}
+
+function renderPixivPreview() {
+  const modal = document.getElementById('pixivPreviewModal');
+  const body = document.getElementById('pixivPreviewBody');
+  if (!modal.classList.contains('show') || !pixivReviewState.previewImageId) {
+    body.innerHTML = '';
+    return;
+  }
+  const item = pixivReviewState.items[pixivReviewState.previewImageId];
+  if (!item) {
+    body.innerHTML = '<div class="empty">图片不存在</div>';
+    return;
+  }
+  ensurePixivReviewSelection(item);
+  const imageId = item.image_id;
+  const selectedTags = pixivReviewState.selectedTagsByImage[imageId] || [];
+  const selectedTerms = pixivReviewState.selectedTermsByImage[imageId] || [];
+  document.getElementById('pixivPreviewTitle').textContent = `#${imageId} ${item.file_name || ''}`;
+  document.getElementById('pixivPreviewSubtitle').textContent = `${item.width}x${item.height} · ${item.author || '-'} · ${item.title || '-'}`;
+  body.innerHTML = `
+    <div class="modal-image">
+      <img src="${api(`/api/image-file?image_id=${imageId}`)}" alt="preview" />
+      <div class="subheading">来源</div>
+      <div class="item">${item.post_url ? `<a href="${escapeAttr(item.post_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.post_url)}</a>` : '-'}</div>
+      <div class="subheading">当前图片 tag</div>
+      <div class="item">${(item.current_tags || []).map(tag => `<span class="pill">${escapeHtml(tag.name)}(${escapeHtml(tag.review_status)})</span>`).join('') || '<span class="muted">无</span>'}</div>
+      <div class="subheading">原始数据</div>
+      <pre class="json">${escapeHtml(JSON.stringify({raw_tags: item.raw_tags || [], translated_tags: item.translated_tags || []}, null, 2))}</pre>
+    </div>
+    <div>
+      <div class="subheading">候选主 tag</div>
+      <div class="chip-row">${(item.candidate_tags || []).map(tag => renderCandidateTagChip(imageId, tag, selectedTags.some(name => normalizeKey(name) === normalizeKey(tag.name)))).join('') || '<span class="muted">暂无候选主 tag</span>'}</div>
+      <div class="subheading">Pixiv 来源 tag</div>
+      <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
+      <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
+      <div class="row">
+        <button onclick="submitPixivReview(${imageId})">确认审核</button>
+        <button class="secondary" onclick="resetPixivReviewSelection(${imageId})">重置</button>
+      </div>
+      <div class="subheading">Pixiv 映射信息</div>
+      ${buildCandidateMappingsHtml(item)}
+    </div>
+  `;
+}
+
+async function openPixivPreview(imageId) {
+  let item = pixivReviewState.items[imageId];
+  const detail = await fetchJson(`/api/pixiv-review-image?image_id=${imageId}`);
+  item = detail.item || item;
+  if (!item) return;
+  pixivReviewState.items[imageId] = item;
+  ensurePixivReviewSelection(item);
+  pixivReviewState.previewImageId = imageId;
+  document.getElementById('pixivPreviewModal').classList.add('show');
+  renderPixivPreview();
+}
+
+function closePixivPreview() {
+  pixivReviewState.previewImageId = null;
+  document.getElementById('pixivPreviewModal').classList.remove('show');
+  renderPixivPreview();
+}
+
+async function submitPixivReview(imageId) {
+  const selectedTags = uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []);
+  if (!selectedTags.length) {
+    alert('请至少选择一个主 tag。');
+    return;
+  }
+  const payload = {
+    image_id: imageId,
+    selected_tag_names: selectedTags,
+    source_terms: uniqueTexts(pixivReviewState.selectedTermsByImage[imageId] || []),
+    reject_unselected: true,
+  };
+  const result = await fetchJson('/api/pixiv-review/submit', {method: 'POST', body: JSON.stringify(payload)});
+  const mappedText = (result.mapped_terms || []).map(item => `${item.term}→${item.tag_name}`).join('、');
+  const skippedText = (result.skipped_terms || []).join('；');
+  alert([result.message || '已完成审核', mappedText ? `已沉淀：${mappedText}` : '', skippedText ? `未沉淀：${skippedText}` : ''].filter(Boolean).join('\\n'));
+  delete pixivReviewState.selectedTagsByImage[imageId];
+  delete pixivReviewState.selectedTermsByImage[imageId];
+  closePixivPreview();
+  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary()]);
+}
+
+document.getElementById('pixivPreviewModal').addEventListener('click', (event) => {
+  if (event.target.id === 'pixivPreviewModal') closePixivPreview();
+});
+
+Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags(), loadPixivReviewImages()]).catch(err => { console.error(err); alert(err.message || err); });
 </script>
 </body>
 </html>
@@ -285,6 +584,9 @@ class GalleryWebUI:
                 web.post("/api/jobs", self.api_jobs),
                 web.post("/api/jobs/retry", self.api_jobs_retry),
                 web.get("/api/reviews", self.api_reviews),
+                web.get("/api/pixiv-review-images", self.api_pixiv_review_images),
+                web.get("/api/pixiv-review-image", self.api_pixiv_review_image),
+                web.post("/api/pixiv-review/submit", self.api_pixiv_review_submit),
                 web.post("/api/reviews/decision", self.api_review_decision),
                 web.post("/api/tag/alias", self.api_tag_alias),
                 web.delete("/api/tag/alias", self.api_tag_alias),
@@ -378,6 +680,184 @@ class GalleryWebUI:
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _dedupe_texts(values: list[str] | None) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for raw in values or []:
+            text = str(raw or "").strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(text)
+        return result
+
+    @staticmethod
+    def _pick_source(detail: dict[str, Any], platform: str) -> dict[str, Any]:
+        sources = detail.get("sources", []) if isinstance(detail, dict) else []
+        platform_text = str(platform or "").strip().lower()
+        for source in sources:
+            if str(source.get("platform", "") or "").strip().lower() == platform_text:
+                return source
+        return sources[0] if sources else {}
+
+    def _build_source_term_payload(self, term: str, origin: str) -> dict[str, Any]:
+        text = str(term or "").strip()
+        platform_match = self.db.resolve_platform_term("pixiv", text)
+        resolved_tag_name = ""
+        resolution = ""
+        candidates: list[str] = []
+        match_type = ""
+        if platform_match.matched and platform_match.tag_name:
+            resolved_tag_name = str(platform_match.tag_name)
+            match_type = str(platform_match.match_type or "")
+            resolution = f"已映射到主 tag：{resolved_tag_name}"
+        else:
+            direct_match = self.db.resolve_tag(text, allow_fuzzy=True, candidate_limit=5)
+            if direct_match.matched and direct_match.tag_name:
+                resolved_tag_name = str(direct_match.tag_name)
+                match_type = str(direct_match.match_type or "")
+                resolution = f"命中现有主 tag：{resolved_tag_name}"
+            else:
+                candidates = self._dedupe_texts(direct_match.candidates)
+                resolution = "未命中现有主 tag"
+                if candidates:
+                    resolution += "；可参考：" + "、".join(candidates)
+        return {
+            "term": text,
+            "origin": str(origin or "raw"),
+            "resolved_tag_name": resolved_tag_name,
+            "resolution": resolution,
+            "match_type": match_type,
+            "candidate_tags": candidates,
+        }
+
+    def _build_candidate_tag_payload(self, tag_name: str) -> dict[str, Any] | None:
+        row = self.db.get_tag_row(tag_name)
+        if not row:
+            return None
+        canonical_name = str(row["name"])
+        return {
+            "name": canonical_name,
+            "is_character": bool(row["is_character"]),
+            "aliases": self.db.list_aliases(canonical_name),
+            "platform_terms": self.db.get_platform_terms_for_tag(
+                tag_name=canonical_name,
+                platform="pixiv",
+                purpose="match",
+                include_aliases=False,
+                include_primary=False,
+            ),
+            "suggested_terms": self.db.suggest_platform_terms_for_tag(
+                tag_name=canonical_name,
+                platform="pixiv",
+                limit=8,
+            ),
+        }
+
+    def _build_pixiv_review_item(self, image_id: int) -> dict[str, Any] | None:
+        detail = self.db.get_image_detail(image_id)
+        if not detail:
+            return None
+        image = detail.get("image", {})
+        source = self._pick_source(detail, "pixiv")
+        if not source or str(source.get("platform", "") or "").strip().lower() != "pixiv":
+            return None
+        extra = source.get("extra", {}) if isinstance(source.get("extra"), dict) else {}
+        raw_tags = self._dedupe_texts(source.get("raw_tags", []))
+        translated_tags = self._dedupe_texts(extra.get("translated_tags", []))
+
+        source_terms: list[dict[str, Any]] = []
+        seen_terms: set[str] = set()
+        for origin, terms in (("raw", raw_tags), ("translated", translated_tags)):
+            for term in terms:
+                normalized = normalize_tag_name(term)
+                if not normalized or normalized in seen_terms:
+                    continue
+                seen_terms.add(normalized)
+                source_terms.append(self._build_source_term_payload(term, origin))
+
+        review_task_rows = self.db.get_review_tasks_for_image(image_id)
+        review_tasks = [
+            {
+                "id": int(row["id"]),
+                "status": str(row["status"]),
+                "reason": str(row["reason"] or ""),
+                "manual_result": str(row["manual_result"] or ""),
+                "model_result": str(row["model_result"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+                "tag_id": int(row["tag_id"]),
+                "tag_name": str(row["tag_name"]),
+                "is_character": bool(row["is_character"]),
+                "source_type": str(row["source_type"] or ""),
+            }
+            for row in review_task_rows
+        ]
+
+        current_tags = [
+            {
+                "name": str(tag.get("name", "") or ""),
+                "is_character": bool(tag.get("is_character", False)),
+                "source_type": str(tag.get("source_type", "") or ""),
+                "review_status": str(tag.get("review_status", "") or ""),
+                "review_reason": str(tag.get("review_reason", "") or ""),
+                "score": float(tag.get("score", 0.0) or 0.0),
+            }
+            for tag in detail.get("tags", [])
+            if str(tag.get("name", "") or "").strip()
+        ]
+
+        candidate_names: list[str] = []
+        seen_candidates: set[str] = set()
+
+        def push_candidate(name: str) -> None:
+            text = str(name or "").strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen_candidates:
+                return
+            seen_candidates.add(normalized)
+            candidate_names.append(text)
+
+        for task in review_tasks:
+            if task["status"] != "manual_rejected":
+                push_candidate(task["tag_name"])
+        for tag in current_tags:
+            if tag["review_status"] != "manual_rejected":
+                push_candidate(tag["name"])
+        for term in source_terms:
+            if term["resolved_tag_name"]:
+                push_candidate(term["resolved_tag_name"])
+            for candidate in term["candidate_tags"][:3]:
+                push_candidate(candidate)
+
+        candidate_tags: list[dict[str, Any]] = []
+        for name in candidate_names[:12]:
+            payload = self._build_candidate_tag_payload(name)
+            if payload:
+                candidate_tags.append(payload)
+
+        return {
+            "image_id": int(image.get("id") or image_id),
+            "file_name": str(image.get("file_name", "") or ""),
+            "width": int(image.get("width") or 0),
+            "height": int(image.get("height") or 0),
+            "format": str(image.get("format", "") or ""),
+            "phash": str(image.get("phash", "") or ""),
+            "updated_at": str(image.get("updated_at", "") or ""),
+            "author": str(source.get("author", "") or ""),
+            "post_url": str(source.get("post_url", "") or ""),
+            "image_url": str(source.get("image_url", "") or ""),
+            "title": str(extra.get("title") or extra.get("illust_title") or ""),
+            "raw_tags": raw_tags,
+            "translated_tags": translated_tags,
+            "source_terms": source_terms,
+            "candidate_tags": candidate_tags,
+            "review_tasks": review_tasks,
+            "current_tags": current_tags,
+        }
 
     async def ui_page(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
@@ -512,6 +992,60 @@ class GalleryWebUI:
             limit=min(max(int(args.get("limit", 20) or 20), 1), 100),
         )
         return self._json_response({"items": [dict(row) for row in rows]})
+
+    async def api_pixiv_review_images(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        args = request.query
+        statuses = [item.strip() for item in str(args.get("status", "") or "").split(",") if item.strip()]
+        rows = self.db.list_pixiv_review_images(
+            statuses=statuses or None,
+            limit=min(max(int(args.get("limit", 24) or 24), 1), 100),
+            offset=max(int(args.get("offset", 0) or 0), 0),
+        )
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._build_pixiv_review_item(int(row["image_id"]))
+            if item:
+                items.append(item)
+        return self._json_response({"items": items})
+
+    async def api_pixiv_review_image(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        image_id = int(request.query.get("image_id", 0) or 0)
+        item = self._build_pixiv_review_item(image_id)
+        if not item:
+            return self._json_response({"ok": False, "message": "pixiv_review_image_not_found"}, status=404)
+        return self._json_response({"ok": True, "item": item})
+
+    async def api_pixiv_review_submit(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        selected_tag_names = data.get("selected_tag_names", []) or []
+        if not isinstance(selected_tag_names, list):
+            selected_tag_names = [selected_tag_names]
+        source_terms = data.get("source_terms", []) or []
+        if not isinstance(source_terms, list):
+            source_terms = [source_terms]
+        ok, result = self.db.apply_image_review(
+            int(data.get("image_id", 0) or 0),
+            selected_tag_names=selected_tag_names,
+            source_terms=source_terms,
+            platform="pixiv",
+            reason=str(data.get("reason", "") or "").strip(),
+            reject_unselected=bool(data.get("reject_unselected", True)),
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
 
     async def api_review_decision(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)

@@ -123,7 +123,13 @@ class AutoCrawlService:
         for row in tags:
             tag_name = str(row["name"])
             tag_id = int(row["id"])
-            query_text = self.search_service.build_query(tag_name)
+            query_terms = self.db.get_platform_terms_for_tag(
+                tag_name=tag_name,
+                platform="pixiv",
+                purpose="query",
+            )
+            primary_query_term = query_terms[0] if query_terms else tag_name
+            query_text = self.search_service.build_query(primary_query_term)
             self.db.upsert_crawl_subscription(
                 platform="pixiv",
                 tag_id=tag_id,
@@ -149,12 +155,31 @@ class AutoCrawlService:
         if not tag_name:
             return {"queued": 0, "matched": 0, "skipped_existing": 0, "skipped_filtered": 0}
 
-        hits = await self.search_service.search_tag(
-            tag_name,
-            max_results=self.max_results_per_tag(),
-            max_pages=self.max_pages_per_tag(),
-            timeout_seconds=self.timeout_seconds(),
-        )
+        query_terms = self.db.get_platform_terms_for_tag(
+            tag_name=tag_name,
+            platform="pixiv",
+            purpose="query",
+        ) or [tag_name]
+        hits: list[PixivSearchHit] = []
+        seen_illust_ids: set[str] = set()
+        wanted = self.max_results_per_tag()
+        for query_term in query_terms[:5]:
+            remaining = max(1, wanted - len(hits))
+            query_hits = await self.search_service.search_tag(
+                query_term,
+                max_results=remaining,
+                max_pages=self.max_pages_per_tag(),
+                timeout_seconds=self.timeout_seconds(),
+            )
+            for hit in query_hits:
+                if hit.illust_id in seen_illust_ids:
+                    continue
+                seen_illust_ids.add(hit.illust_id)
+                hits.append(hit)
+                if len(hits) >= wanted:
+                    break
+            if len(hits) >= wanted:
+                break
         newest_source_uid = hits[0].illust_id if hits else str(row["last_seen_source_uid"] or "")
         last_seen_source_uid = str(row["last_seen_source_uid"] or "").strip()
 
@@ -195,7 +220,7 @@ class AutoCrawlService:
             last_success_at=datetime.utcnow().isoformat(timespec="seconds"),
             last_error="",
             last_seen_source_uid=newest_source_uid,
-            query_text=self.search_service.build_query(tag_name),
+            query_text=self.search_service.build_query(query_terms[0] if query_terms else tag_name),
         )
         return {
             "queued": queued,
@@ -204,11 +229,20 @@ class AutoCrawlService:
             "skipped_filtered": skipped_filtered,
         }
 
-    @staticmethod
-    def _matches_target_tag(tag_name: str, hit: PixivSearchHit) -> bool:
+    def _matches_target_tag(self, tag_name: str, hit: PixivSearchHit) -> bool:
         target = normalize_tag_name(tag_name)
         if not target:
             return False
+        target_terms = self.db.get_platform_terms_for_tag(
+            tag_name=tag_name,
+            platform="pixiv",
+            purpose="match",
+        ) or [tag_name]
+        normalized_target_terms = {
+            normalize_tag_name(term)
+            for term in target_terms
+            if normalize_tag_name(term)
+        }
         candidates = [*(hit.raw_tags or []), *(hit.translated_tags or [])]
         seen: set[str] = set()
         for tag in candidates:
@@ -216,6 +250,14 @@ class AutoCrawlService:
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
-            if target in normalized or normalized in target:
+            platform_match = self.db.resolve_platform_term("pixiv", tag)
+            if platform_match.matched and normalize_tag_name(platform_match.tag_name or "") == target:
+                return True
+            direct_match = self.db.resolve_tag(tag, allow_fuzzy=False)
+            if direct_match.matched and normalize_tag_name(direct_match.tag_name or "") == target:
+                return True
+            if normalized in normalized_target_terms:
+                return True
+            if any(normalized in candidate or candidate in normalized for candidate in normalized_target_terms):
                 return True
         return False
