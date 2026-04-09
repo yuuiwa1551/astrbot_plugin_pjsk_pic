@@ -907,6 +907,8 @@ class ImageIndexDB:
                 'aliases_migrated': 0,
                 'aliases_skipped': [],
                 'source_name_alias_added': False,
+                'subscriptions_migrated': 0,
+                'subscriptions_merged': 0,
                 'subscriptions_removed': 0,
             }
 
@@ -1056,8 +1058,73 @@ class ImageIndexDB:
             )
 
         source_name_alias_added = False
-        delete_cursor = conn.execute('DELETE FROM crawl_subscriptions WHERE tag_id = ?', (source_id,))
-        subscriptions_removed = max(0, int(delete_cursor.rowcount or 0))
+        subscriptions_migrated = 0
+        subscriptions_merged = 0
+        subscriptions_removed = 0
+        source_subscription_rows = conn.execute(
+            'SELECT * FROM crawl_subscriptions WHERE tag_id = ? ORDER BY id ASC',
+            (source_id,),
+        ).fetchall()
+        target_normalized = str(target['normalized_name'] or normalize_tag_name(str(target['name'] or '')))
+        for row in source_subscription_rows:
+            platform_text = str(row['platform'] or '').strip()
+            target_subscription = conn.execute(
+                """
+                SELECT *
+                FROM crawl_subscriptions
+                WHERE platform = ? AND normalized_tag = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (platform_text, target_normalized),
+            ).fetchone()
+            if target_subscription and int(target_subscription['id']) != int(row['id']):
+                merged_query_text = str(target_subscription['query_text'] or '').strip() or str(row['query_text'] or '').strip()
+                merged_enabled = bool(int(target_subscription['enabled'] or 0)) or bool(int(row['enabled'] or 0))
+                merged_last_seen_source_uid = str(target_subscription['last_seen_source_uid'] or '').strip() or str(row['last_seen_source_uid'] or '').strip()
+                merged_last_checked_at = max(
+                    str(target_subscription['last_checked_at'] or '').strip(),
+                    str(row['last_checked_at'] or '').strip(),
+                )
+                merged_last_success_at = max(
+                    str(target_subscription['last_success_at'] or '').strip(),
+                    str(row['last_success_at'] or '').strip(),
+                )
+                merged_last_error = str(target_subscription['last_error'] or '').strip() or str(row['last_error'] or '').strip()
+                conn.execute(
+                    """
+                    UPDATE crawl_subscriptions
+                    SET tag_id = ?, tag_name = ?, normalized_tag = ?, query_text = ?, enabled = ?,
+                        last_seen_source_uid = ?, last_checked_at = ?, last_success_at = ?, last_error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        target_id,
+                        target_name,
+                        target_normalized,
+                        merged_query_text,
+                        1 if merged_enabled else 0,
+                        merged_last_seen_source_uid,
+                        merged_last_checked_at,
+                        merged_last_success_at,
+                        merged_last_error,
+                        now,
+                        int(target_subscription['id']),
+                    ),
+                )
+                conn.execute('DELETE FROM crawl_subscriptions WHERE id = ?', (int(row['id']),))
+                subscriptions_removed += 1
+                subscriptions_merged += 1
+            else:
+                conn.execute(
+                    """
+                    UPDATE crawl_subscriptions
+                    SET tag_id = ?, tag_name = ?, normalized_tag = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (target_id, target_name, target_normalized, now, int(row['id'])),
+                )
+                subscriptions_migrated += 1
         conn.execute('DELETE FROM tags WHERE id = ?', (source_id,))
 
         ok, _ = self._insert_alias_conn(conn, tag_id=target_id, alias=str(source['name']), now=now)
@@ -1074,6 +1141,8 @@ class ImageIndexDB:
             'aliases_migrated': aliases_migrated,
             'aliases_skipped': aliases_skipped,
             'source_name_alias_added': source_name_alias_added,
+            'subscriptions_migrated': subscriptions_migrated,
+            'subscriptions_merged': subscriptions_merged,
             'subscriptions_removed': subscriptions_removed,
         }
 
@@ -1649,6 +1718,649 @@ class ImageIndexDB:
             for normalized, count in suggestions[: max(1, int(limit or 1))]
         ]
 
+    @staticmethod
+    def _dedupe_terms(values: Iterable[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for raw in values:
+            text = str(raw or '').strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(text)
+        return result
+
+    def _collect_platform_term_usage_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        platform: str,
+        terms: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        normalized_terms = {
+            normalize_tag_name(item)
+            for item in terms
+            if normalize_tag_name(item)
+        }
+        if not normalized_terms:
+            return {}
+        rows = conn.execute(
+            """
+            SELECT s.post_url, s.author, s.raw_tags, s.extra_json
+            FROM sources s
+            JOIN images i ON i.id = s.image_id
+            WHERE s.platform = ?
+              AND i.is_active = 1
+            ORDER BY s.id DESC
+            """,
+            (str(platform or 'pixiv').strip().lower() or 'pixiv',),
+        ).fetchall()
+        usage: dict[str, dict[str, Any]] = {
+            normalized: {
+                'count': 0,
+                'sample_post_urls': [],
+                'sample_authors': [],
+            }
+            for normalized in normalized_terms
+        }
+        for row in rows:
+            try:
+                raw_terms = json.loads(row['raw_tags'] or '[]') if row['raw_tags'] else []
+            except Exception:
+                raw_terms = []
+            try:
+                extra = json.loads(row['extra_json'] or '{}') if row['extra_json'] else {}
+            except Exception:
+                extra = {}
+            translated_terms = extra.get('translated_tags') if isinstance(extra, dict) else []
+            if not isinstance(translated_terms, list):
+                translated_terms = []
+            row_seen: set[str] = set()
+            for value in [*raw_terms, *translated_terms]:
+                normalized = normalize_tag_name(str(value or '').strip())
+                if not normalized or normalized in row_seen or normalized not in normalized_terms:
+                    continue
+                row_seen.add(normalized)
+                payload = usage[normalized]
+                payload['count'] = int(payload.get('count', 0) or 0) + 1
+                post_url = str(row['post_url'] or '').strip()
+                if post_url and post_url not in payload['sample_post_urls'] and len(payload['sample_post_urls']) < 3:
+                    payload['sample_post_urls'].append(post_url)
+                author = str(row['author'] or '').strip()
+                if author and author not in payload['sample_authors'] and len(payload['sample_authors']) < 3:
+                    payload['sample_authors'].append(author)
+        return usage
+
+    def _preview_review_term_mappings_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        platform: str,
+        requested_terms: Iterable[str],
+        resolved_rows: list[sqlite3.Row],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        selected_ids = {int(row['id']) for row in resolved_rows}
+        mapped_terms: list[dict[str, Any]] = []
+        skipped_terms: list[str] = []
+        for term in requested_terms:
+            if not self._looks_like_platform_term(term):
+                skipped_terms.append(f'{term}（看起来不是适合沉淀的平台角色词）')
+                continue
+            target_row: sqlite3.Row | None = None
+            existing = conn.execute(
+                """
+                SELECT p.id, p.tag_id, p.term_type, t.name AS tag_name
+                FROM platform_tag_terms p
+                JOIN tags t ON t.id = p.tag_id
+                WHERE p.platform = ? AND p.normalized_term = ?
+                LIMIT 1
+                """,
+                (platform_text, normalize_tag_name(term)),
+            ).fetchone()
+            if len(resolved_rows) == 1:
+                target_row = resolved_rows[0]
+            else:
+                if existing and int(existing['tag_id']) in selected_ids:
+                    target_row = next((row for row in resolved_rows if int(row['id']) == int(existing['tag_id'])), None)
+                if target_row is None:
+                    exact_row, _ = self._resolve_tag_exact_conn(conn, term)
+                    if exact_row and int(exact_row['id']) in selected_ids:
+                        target_row = next((row for row in resolved_rows if int(row['id']) == int(exact_row['id'])), None)
+            if target_row is None:
+                skipped_terms.append(f'{term}（多选主 tag 时无法自动判断映射目标）')
+                continue
+            if existing and int(existing['tag_id']) != int(target_row['id']):
+                skipped_terms.append(f'{term}（{platform_text} term 已映射到其他 tag：{str(existing["tag_name"])}）')
+                continue
+            mapped_terms.append(
+                {
+                    'term': term,
+                    'tag_name': str(target_row['name']),
+                    'action': ('already' if existing else 'add'),
+                }
+            )
+        return mapped_terms, skipped_terms
+
+    def preview_batch_image_review(
+        self,
+        items: Iterable[dict[str, Any]],
+        *,
+        platform: str = 'pixiv',
+        reject_unselected: bool = True,
+    ) -> tuple[bool, dict[str, Any]]:
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        normalized_items: list[dict[str, Any]] = []
+        seen_image_ids: set[int] = set()
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            image_id = int(raw.get('image_id', 0) or 0)
+            if image_id <= 0 or image_id in seen_image_ids:
+                continue
+            seen_image_ids.add(image_id)
+            normalized_items.append(
+                {
+                    'image_id': image_id,
+                    'selected_tag_names': self._dedupe_terms(raw.get('selected_tag_names', []) or []),
+                    'source_terms': self._dedupe_terms(raw.get('source_terms', []) or []),
+                }
+            )
+        if not normalized_items:
+            return False, {'message': '请至少选择一张图片。'}
+
+        preview_items: list[dict[str, Any]] = []
+        totals = {
+            'images': 0,
+            'approved_tag_links': 0,
+            'rejected_tag_links': 0,
+            'mapped_terms': 0,
+            'skipped_terms': 0,
+            'errors': 0,
+        }
+        with self._lock, self._connect() as conn:
+            for item in normalized_items:
+                image_id = int(item['image_id'])
+                requested_tags = list(item['selected_tag_names'])
+                requested_terms = list(item['source_terms'])
+                if not requested_tags:
+                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': '请至少选择一个主 tag。'})
+                    totals['errors'] += 1
+                    continue
+                image = conn.execute('SELECT id FROM images WHERE id = ? AND is_active = 1 LIMIT 1', (image_id,)).fetchone()
+                if not image:
+                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': f'图片不存在：{image_id}'})
+                    totals['errors'] += 1
+                    continue
+                source_exists = conn.execute(
+                    'SELECT 1 FROM sources WHERE image_id = ? AND platform = ? LIMIT 1',
+                    (image_id, platform_text),
+                ).fetchone()
+                if not source_exists:
+                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': f'图片 #{image_id} 没有 {platform_text} 来源记录。'})
+                    totals['errors'] += 1
+                    continue
+                resolved_rows: list[sqlite3.Row] = []
+                unresolved_tags: list[str] = []
+                for tag_name in requested_tags:
+                    row, _ = self._resolve_tag_exact_conn(conn, tag_name)
+                    if not row:
+                        unresolved_tags.append(tag_name)
+                    else:
+                        resolved_rows.append(row)
+                if unresolved_tags:
+                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': '以下主 tag 不存在：' + '、'.join(unresolved_tags)})
+                    totals['errors'] += 1
+                    continue
+                selected_ids = {int(row['id']) for row in resolved_rows}
+                selected_names = [str(row['name']) for row in resolved_rows]
+                tasks = conn.execute(
+                    """
+                    SELECT rt.tag_id, t.name AS tag_name
+                    FROM review_tasks rt
+                    JOIN tags t ON t.id = rt.tag_id
+                    WHERE rt.image_id = ?
+                    ORDER BY rt.id DESC
+                    """,
+                    (image_id,),
+                ).fetchall()
+                rejected_names = [
+                    str(row['tag_name'])
+                    for row in tasks
+                    if reject_unselected and int(row['tag_id']) not in selected_ids
+                ]
+                mapped_terms, skipped_terms = self._preview_review_term_mappings_conn(
+                    conn,
+                    platform=platform_text,
+                    requested_terms=requested_terms,
+                    resolved_rows=resolved_rows,
+                )
+                preview_items.append(
+                    {
+                        'image_id': image_id,
+                        'status': 'ok',
+                        'approved_tags': selected_names,
+                        'rejected_tags': rejected_names,
+                        'mapped_terms': mapped_terms,
+                        'skipped_terms': skipped_terms,
+                        'selected_source_terms': requested_terms,
+                    }
+                )
+                totals['images'] += 1
+                totals['approved_tag_links'] += len(selected_names)
+                totals['rejected_tag_links'] += len(rejected_names)
+                totals['mapped_terms'] += len(mapped_terms)
+                totals['skipped_terms'] += len(skipped_terms)
+        return True, {
+            'message': f'已生成 {totals["images"]} 张图片的批量审核预览',
+            'items': preview_items,
+            'totals': totals,
+        }
+
+    def apply_batch_image_review(
+        self,
+        items: Iterable[dict[str, Any]],
+        *,
+        platform: str = 'pixiv',
+        reject_unselected: bool = True,
+    ) -> tuple[bool, dict[str, Any]]:
+        normalized_items: list[dict[str, Any]] = []
+        seen_image_ids: set[int] = set()
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            image_id = int(raw.get('image_id', 0) or 0)
+            if image_id <= 0 or image_id in seen_image_ids:
+                continue
+            seen_image_ids.add(image_id)
+            normalized_items.append(
+                {
+                    'image_id': image_id,
+                    'selected_tag_names': self._dedupe_terms(raw.get('selected_tag_names', []) or []),
+                    'source_terms': self._dedupe_terms(raw.get('source_terms', []) or []),
+                    'reason': str(raw.get('reason', '') or '').strip(),
+                }
+            )
+        if not normalized_items:
+            return False, {'message': '请至少选择一张图片。'}
+
+        results: list[dict[str, Any]] = []
+        success_count = 0
+        failure_count = 0
+        mapped_terms_count = 0
+        for item in normalized_items:
+            ok, result = self.apply_image_review(
+                int(item['image_id']),
+                selected_tag_names=item['selected_tag_names'],
+                source_terms=item['source_terms'],
+                platform=platform,
+                reason=item['reason'],
+                reject_unselected=reject_unselected,
+            )
+            payload = {'ok': ok, 'image_id': int(item['image_id'])}
+            if isinstance(result, dict):
+                payload.update(result)
+            else:
+                payload['message'] = str(result)
+            results.append(payload)
+            if ok:
+                success_count += 1
+                mapped_terms_count += len(payload.get('mapped_terms', []) or [])
+            else:
+                failure_count += 1
+        return success_count > 0, {
+            'message': f'批量审核完成：成功 {success_count} 张，失败 {failure_count} 张',
+            'items': results,
+            'success_count': success_count,
+            'failure_count': failure_count,
+            'mapped_terms_count': mapped_terms_count,
+        }
+
+    def preview_batch_platform_terms(
+        self,
+        *,
+        tag_name: str,
+        terms: Iterable[str],
+        platform: str = 'pixiv',
+        term_type: str = 'both',
+    ) -> tuple[bool, dict[str, Any]]:
+        requested_terms = self._dedupe_terms(terms)
+        if not requested_terms:
+            return False, {'message': '请至少提供一个 Pixiv 词。'}
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        normalized_term_type = self._normalize_platform_term_type(term_type)
+        target_row = self.get_tag_row(tag_name)
+        if not target_row:
+            return False, {'message': f'tag 不存在：{tag_name}'}
+
+        with self._lock, self._connect() as conn:
+            usage = self._collect_platform_term_usage_conn(conn, platform=platform_text, terms=requested_terms)
+            items: list[dict[str, Any]] = []
+            summary = {'add': 0, 'update': 0, 'already': 0, 'conflict': 0, 'invalid': 0}
+            for term in requested_terms:
+                normalized = normalize_tag_name(term)
+                payload = usage.get(normalized, {'count': 0, 'sample_post_urls': [], 'sample_authors': []})
+                item = {
+                    'term': term,
+                    'count': int(payload.get('count', 0) or 0),
+                    'sample_post_urls': list(payload.get('sample_post_urls', []) or []),
+                    'sample_authors': list(payload.get('sample_authors', []) or []),
+                    'target_tag': str(target_row['name']),
+                    'status': '',
+                    'message': '',
+                }
+                if not self._looks_like_platform_term(term):
+                    item['status'] = 'invalid'
+                    item['message'] = '看起来不是适合沉淀的平台角色词'
+                    summary['invalid'] += 1
+                    items.append(item)
+                    continue
+                existing = conn.execute(
+                    """
+                    SELECT p.id, p.tag_id, p.term_type, p.source, p.confidence, t.name AS tag_name
+                    FROM platform_tag_terms p
+                    JOIN tags t ON t.id = p.tag_id
+                    WHERE p.platform = ? AND p.normalized_term = ?
+                    LIMIT 1
+                    """,
+                    (platform_text, normalized),
+                ).fetchone()
+                if existing and int(existing['tag_id']) != int(target_row['id']):
+                    item['status'] = 'conflict'
+                    item['message'] = f'已映射到其他 tag：{str(existing["tag_name"])}'
+                    summary['conflict'] += 1
+                elif existing:
+                    merged_type = self._platform_term_type_union(str(existing['term_type'] or ''), normalized_term_type)
+                    if merged_type != str(existing['term_type'] or 'both'):
+                        item['status'] = 'update'
+                        item['message'] = f'将扩展 term_type：{str(existing["term_type"])} -> {merged_type}'
+                        summary['update'] += 1
+                    else:
+                        item['status'] = 'already'
+                        item['message'] = '当前目标 tag 已存在该平台词'
+                        summary['already'] += 1
+                else:
+                    item['status'] = 'add'
+                    item['message'] = '将新增到目标 tag'
+                    summary['add'] += 1
+                items.append(item)
+
+        return True, {
+            'message': f'已生成 {len(items)} 个 Pixiv 词的批量映射预览',
+            'target_tag': str(target_row['name']),
+            'items': items,
+            'summary': summary,
+        }
+
+    def apply_batch_platform_terms(
+        self,
+        *,
+        tag_name: str,
+        terms: Iterable[str],
+        platform: str = 'pixiv',
+        term_type: str = 'both',
+        source: str = 'manual_review',
+        confidence: float = 1.0,
+    ) -> tuple[bool, dict[str, Any]]:
+        requested_terms = self._dedupe_terms(terms)
+        if not requested_terms:
+            return False, {'message': '请至少提供一个 Pixiv 词。'}
+        target_row = self.get_tag_row(tag_name)
+        if not target_row:
+            return False, {'message': f'tag 不存在：{tag_name}'}
+        normalized_term_type = self._normalize_platform_term_type(term_type)
+        results: list[dict[str, Any]] = []
+        summary = {'added': 0, 'updated': 0, 'failed': 0}
+        with self._lock, self._connect() as conn:
+            for term in requested_terms:
+                if not self._looks_like_platform_term(term):
+                    results.append({'term': term, 'ok': False, 'message': '看起来不是适合沉淀的平台角色词'})
+                    summary['failed'] += 1
+                    continue
+                existing = conn.execute(
+                    """
+                    SELECT id, tag_id, term_type
+                    FROM platform_tag_terms
+                    WHERE platform = ? AND normalized_term = ?
+                    LIMIT 1
+                    """,
+                    (str(platform or 'pixiv').strip().lower() or 'pixiv', normalize_tag_name(term)),
+                ).fetchone()
+                ok, message = self._upsert_platform_term_conn(
+                    conn,
+                    tag_id=int(target_row['id']),
+                    platform=platform,
+                    term=term,
+                    term_type=normalized_term_type,
+                    source=source,
+                    confidence=confidence,
+                    now=utcnow_str(),
+                )
+                results.append({'term': term, 'ok': ok, 'message': message})
+                if ok:
+                    if existing and int(existing['tag_id']) == int(target_row['id']):
+                        summary['updated'] += 1
+                    else:
+                        summary['added'] += 1
+                else:
+                    summary['failed'] += 1
+        return summary['added'] + summary['updated'] > 0, {
+            'message': f'批量平台词提交完成：新增 {summary["added"]}，更新 {summary["updated"]}，失败 {summary["failed"]}',
+            'target_tag': str(target_row['name']),
+            'items': results,
+            'summary': summary,
+        }
+
+    def list_tag_merge_candidates(
+        self,
+        *,
+        keyword: str = '',
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        keyword_text = str(keyword or '').strip()
+        with self._lock, self._connect() as conn:
+            tag_rows = conn.execute(
+                """
+                SELECT t.id, t.name, t.normalized_name, t.is_character,
+                       COUNT(DISTINCT CASE WHEN it.review_status IN ('approved', 'manual_approved') AND i.is_active = 1 THEN i.id END) AS image_count
+                FROM tags t
+                LEFT JOIN image_tags it ON it.tag_id = t.id
+                LEFT JOIN images i ON i.id = it.image_id
+                WHERE t.is_character = 1
+                GROUP BY t.id, t.name, t.normalized_name, t.is_character
+                ORDER BY image_count DESC, t.name ASC
+                LIMIT 240
+                """
+            ).fetchall()
+            candidates: dict[tuple[int, int], dict[str, Any]] = {}
+            for target_row in tag_rows:
+                target_id = int(target_row['id'])
+                target_name = str(target_row['name'])
+                terms: list[tuple[str, str, int]] = []
+                for platform_row in self.list_platform_terms(tag_id=target_id, platform='pixiv', limit=80):
+                    terms.append((str(platform_row['term'] or ''), 'platform_term', 8))
+                for suggestion in self.suggest_platform_terms_for_tag(tag_name=target_name, platform='pixiv', limit=15):
+                    terms.append((str(suggestion.get('term', '') or ''), 'history_term', min(7, int(suggestion.get('count', 0) or 0))))
+                seen_term_keys: set[str] = set()
+                for term, reason, weight in terms:
+                    normalized_term = normalize_tag_name(term)
+                    if not normalized_term or normalized_term in seen_term_keys:
+                        continue
+                    seen_term_keys.add(normalized_term)
+                    matched_row, match_type = self._resolve_tag_exact_conn(conn, term)
+                    if not matched_row or int(matched_row['id']) == target_id:
+                        continue
+                    source_id = int(matched_row['id'])
+                    source_name = str(matched_row['name'])
+                    key = (source_id, target_id)
+                    entry = candidates.setdefault(
+                        key,
+                        {
+                            'source_tag': source_name,
+                            'target_tag': target_name,
+                            'source_tag_id': source_id,
+                            'target_tag_id': target_id,
+                            'source_is_character': bool(matched_row['is_character']),
+                            'target_is_character': bool(target_row['is_character']),
+                            'source_image_count': int(conn.execute(
+                                """
+                                SELECT COUNT(DISTINCT i.id) AS c
+                                FROM image_tags it
+                                JOIN images i ON i.id = it.image_id
+                                WHERE it.tag_id = ? AND i.is_active = 1 AND it.review_status IN ('approved', 'manual_approved')
+                                """,
+                                (source_id,),
+                            ).fetchone()['c']),
+                            'target_image_count': int(target_row['image_count'] or 0),
+                            'score': 0,
+                            'reasons': [],
+                            'example_terms': [],
+                        },
+                    )
+                    entry['score'] += int(weight)
+                    reason_text = f'{reason}:{match_type or "exact"}'
+                    if reason_text not in entry['reasons']:
+                        entry['reasons'].append(reason_text)
+                    if term not in entry['example_terms']:
+                        entry['example_terms'].append(term)
+            items = list(candidates.values())
+        if keyword_text:
+            keyword_normalized = normalize_tag_name(keyword_text)
+            items = [
+                item
+                for item in items
+                if keyword_text in str(item['source_tag'])
+                or keyword_text in str(item['target_tag'])
+                or any(keyword_text in str(term) for term in item.get('example_terms', []))
+                or keyword_normalized in normalize_tag_name(str(item['source_tag']))
+                or keyword_normalized in normalize_tag_name(str(item['target_tag']))
+            ]
+        items.sort(
+            key=lambda item: (
+                -int(item.get('score', 0) or 0),
+                -int(item.get('target_is_character', False)),
+                -int(item.get('target_image_count', 0) or 0),
+                int(item.get('source_image_count', 0) or 0),
+                str(item.get('source_tag', '')),
+            )
+        )
+        return items[: max(1, int(limit or 1))]
+
+    def preview_merge_tags(
+        self,
+        *,
+        target_tag_name: str,
+        source_tag_names: Iterable[str],
+    ) -> tuple[bool, dict[str, Any]]:
+        requested_sources = self._dedupe_terms(source_tag_names)
+        if not requested_sources:
+            return False, {'message': '请至少提供一个来源 tag。'}
+        with self._lock, self._connect() as conn:
+            target_row, target_match_type = self._resolve_tag_exact_conn(conn, target_tag_name)
+            if not target_row:
+                return False, {'message': f'目标 tag 不存在：{target_tag_name}'}
+            target_id = int(target_row['id'])
+            target_name = str(target_row['name'])
+            target_aliases = [str(row['alias']) for row in conn.execute('SELECT alias FROM tag_aliases WHERE tag_id = ? ORDER BY alias ASC', (target_id,)).fetchall()]
+            items: list[dict[str, Any]] = []
+            totals = {
+                'image_links': 0,
+                'image_link_collisions': 0,
+                'review_tasks': 0,
+                'review_task_collisions': 0,
+                'aliases': 0,
+                'platform_terms': 0,
+                'subscriptions': 0,
+            }
+            for source_text in requested_sources:
+                source_row, source_match_type = self._resolve_tag_exact_conn(conn, source_text)
+                if not source_row:
+                    items.append({'source_tag': source_text, 'status': 'error', 'message': f'来源 tag 不存在：{source_text}'})
+                    continue
+                source_id = int(source_row['id'])
+                source_name = str(source_row['name'])
+                if source_id == target_id:
+                    items.append({'source_tag': source_name, 'status': 'skip', 'message': '来源 tag 与目标 tag 相同'})
+                    continue
+                image_links = int(conn.execute('SELECT COUNT(*) AS c FROM image_tags WHERE tag_id = ?', (source_id,)).fetchone()['c'])
+                image_link_collisions = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM image_tags s
+                        JOIN image_tags t
+                          ON t.image_id = s.image_id
+                         AND t.tag_id = ?
+                         AND t.source_type = s.source_type
+                        WHERE s.tag_id = ?
+                        """,
+                        (target_id, source_id),
+                    ).fetchone()['c']
+                )
+                review_tasks = int(conn.execute('SELECT COUNT(*) AS c FROM review_tasks WHERE tag_id = ?', (source_id,)).fetchone()['c'])
+                review_task_collisions = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM review_tasks s
+                        JOIN review_tasks t
+                          ON t.image_id = s.image_id
+                         AND t.tag_id = ?
+                        WHERE s.tag_id = ?
+                        """,
+                        (target_id, source_id),
+                    ).fetchone()['c']
+                )
+                alias_rows = conn.execute('SELECT alias FROM tag_aliases WHERE tag_id = ? ORDER BY alias ASC', (source_id,)).fetchall()
+                platform_rows = conn.execute('SELECT term FROM platform_tag_terms WHERE tag_id = ? ORDER BY id ASC', (source_id,)).fetchall()
+                subscription_rows = conn.execute(
+                    'SELECT platform, query_text, enabled FROM crawl_subscriptions WHERE tag_id = ? ORDER BY platform ASC',
+                    (source_id,),
+                ).fetchall()
+                item = {
+                    'source_tag': source_name,
+                    'source_match_type': source_match_type,
+                    'target_tag': target_name,
+                    'target_match_type': target_match_type,
+                    'source_is_character': bool(source_row['is_character']),
+                    'target_is_character': bool(target_row['is_character']),
+                    'image_links': image_links,
+                    'image_link_collisions': image_link_collisions,
+                    'review_tasks': review_tasks,
+                    'review_task_collisions': review_task_collisions,
+                    'aliases': [str(row['alias']) for row in alias_rows[:10]],
+                    'alias_count': len(alias_rows),
+                    'platform_terms': [str(row['term']) for row in platform_rows[:10]],
+                    'platform_term_count': len(platform_rows),
+                    'subscriptions': [
+                        {
+                            'platform': str(row['platform'] or ''),
+                            'query_text': str(row['query_text'] or ''),
+                            'enabled': bool(row['enabled']),
+                        }
+                        for row in subscription_rows
+                    ],
+                    'subscription_count': len(subscription_rows),
+                    'status': 'ok',
+                    'message': '可执行归并',
+                }
+                totals['image_links'] += image_links
+                totals['image_link_collisions'] += image_link_collisions
+                totals['review_tasks'] += review_tasks
+                totals['review_task_collisions'] += review_task_collisions
+                totals['aliases'] += len(alias_rows)
+                totals['platform_terms'] += len(platform_rows)
+                totals['subscriptions'] += len(subscription_rows)
+                items.append(item)
+        return True, {
+            'message': f'已生成 {len(items)} 个来源 tag 的归并预览',
+            'target_tag': target_name,
+            'target_aliases': target_aliases,
+            'items': items,
+            'totals': totals,
+        }
+
     def get_tag_id(self, tag_name: str) -> int | None:
         normalized = normalize_tag_name(tag_name)
         with self._lock, self._connect() as conn:
@@ -1769,6 +2481,8 @@ class ImageIndexDB:
                 'review_tasks_migrated': 0,
                 'review_tasks_merged': 0,
                 'aliases_migrated': 0,
+                'subscriptions_migrated': 0,
+                'subscriptions_merged': 0,
                 'subscriptions_removed': 0,
                 'aliases_skipped': [],
             }
@@ -1802,6 +2516,8 @@ class ImageIndexDB:
                 summary['review_tasks_migrated'] += int(result['review_tasks_migrated'])
                 summary['review_tasks_merged'] += int(result['review_tasks_merged'])
                 summary['aliases_migrated'] += int(result['aliases_migrated'])
+                summary['subscriptions_migrated'] += int(result.get('subscriptions_migrated') or 0)
+                summary['subscriptions_merged'] += int(result.get('subscriptions_merged') or 0)
                 summary['subscriptions_removed'] += int(result['subscriptions_removed'])
                 summary['aliases_skipped'].extend(list(result.get('aliases_skipped') or []))
 

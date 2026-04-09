@@ -51,6 +51,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .empty { padding: 20px 0; text-align: center; color: #666; }
     .pixiv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
     .pixiv-card { border: 1px solid #eceef2; border-radius: 12px; overflow: hidden; background: #fff; }
+    .pixiv-card.selected { box-shadow: 0 0 0 2px #3c65f5 inset; }
     .pixiv-thumb-wrap { position: relative; }
     .pixiv-thumb-wrap img { width: 100%; height: 250px; object-fit: cover; background: #ddd; cursor: zoom-in; }
     .preview-btn { position: absolute; right: 10px; bottom: 10px; background: rgba(0,0,0,.65); }
@@ -66,11 +67,15 @@ HTML_PAGE = """<!DOCTYPE html>
     .split-grid { display: grid; grid-template-columns: minmax(380px, 1.15fr) minmax(320px, 0.85fr); gap: 16px; }
     .stack { display: grid; gap: 16px; }
     .term-item { border: 1px solid #eceef2; border-radius: 10px; padding: 12px; display: grid; gap: 6px; }
+    .term-item.selected { box-shadow: 0 0 0 2px #3c65f5 inset; }
     .term-head { display: flex; justify-content: space-between; gap: 10px; align-items: start; flex-wrap: wrap; }
     .term-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .mini-btn { padding: 6px 10px; font-size: 12px; }
     button.danger { background: #dc2626; }
     .sample-links { display: grid; gap: 4px; }
+    .toolbar-box { border: 1px dashed #d8def5; border-radius: 12px; padding: 12px; margin-bottom: 14px; background: #f8faff; }
+    .preview-box { border: 1px solid #eceef2; border-radius: 10px; padding: 12px; background: #fbfcff; }
+    .merge-arrow { font-weight: bold; color: #3c65f5; }
     pre.json { background: #0f172a; color: #d7e2ff; padding: 10px; border-radius: 12px; overflow: auto; font-size: 12px; }
     @media (max-width: 1000px) {
       main { grid-template-columns: 1fr; }
@@ -162,6 +167,25 @@ HTML_PAGE = """<!DOCTYPE html>
       <button onclick="loadPixivReviewImages()">刷新 Pixiv 审批</button>
       <span class="muted">点击来源 tag 可勾选本次要沉淀的 Pixiv 词；点击候选主 tag 可确认最终入库 tag。</span>
     </div>
+    <div class="toolbar-box">
+      <div class="row">
+        <strong>批量审核</strong>
+        <span class="muted" id="pixivBatchSelectionHint">当前已选 0 张图片。</span>
+        <button class="secondary" onclick="selectAllPixivReviewImages()">全选当前页</button>
+        <button class="secondary" onclick="clearSelectedPixivReviewImages()">清空已选</button>
+      </div>
+      <div class="row">
+        <input id="pixivBatchTags" placeholder="批量主 tag，逗号分隔；留空时使用每张图当前已选主 tag" style="flex:1;" />
+        <input id="pixivBatchSourceTerms" placeholder="批量来源词，逗号分隔；留空时使用每张图当前已选来源词" style="flex:1;" />
+        <label class="muted"><input id="pixivBatchRejectUnselected" type="checkbox" checked /> 拒绝未选 tag</label>
+      </div>
+      <div class="row">
+        <button class="secondary" onclick="applyBatchTagsToSelectedImages()">将上面输入应用到已选图片</button>
+        <button onclick="previewPixivBatchReview()">批量预览审核</button>
+        <button onclick="submitPixivBatchReview()">批量确认审核</button>
+      </div>
+      <div class="list" id="pixivBatchPreview"></div>
+    </div>
     <div class="pixiv-grid" id="pixivReviewImages"></div>
   </section>
   <section class="wide">
@@ -205,8 +229,54 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div>
           <div class="subheading">未解决词 / 待确认词</div>
+          <div class="toolbar-box">
+            <div class="row">
+              <strong>批量确认 Pixiv 词映射</strong>
+              <span class="muted" id="pixivBulkMapSelectionHint">当前已选 0 个词。</span>
+              <button class="secondary" onclick="clearPixivBulkMapSelection()">清空已选</button>
+            </div>
+            <div class="row">
+              <input id="pixivBulkMapTag" placeholder="目标主 tag" />
+              <input id="pixivBulkMapTerms" placeholder="额外 Pixiv 词，逗号分隔；可与勾选未解决词一起提交" style="flex:1;" />
+              <select id="pixivBulkMapType">
+                <option value="both">both</option>
+                <option value="query">query</option>
+                <option value="match">match</option>
+              </select>
+              <input id="pixivBulkMapSource" placeholder="来源" value="pixiv_history" />
+              <input id="pixivBulkMapConfidence" type="number" step="0.01" min="0" max="1" value="0.8" style="width:110px;" />
+            </div>
+            <div class="row">
+              <button onclick="previewPixivBulkMap()">批量映射预览</button>
+              <button onclick="submitPixivBulkMap()">批量确认映射</button>
+            </div>
+            <div class="list" id="pixivBulkMapPreview"></div>
+          </div>
           <div class="list" id="pixivPlatformUnresolved"></div>
         </div>
+      </div>
+    </div>
+  </section>
+  <section class="wide">
+    <h2>历史 tag 归并助手</h2>
+    <div class="row">
+      <input id="tagMergeKeyword" placeholder="按 source / target / 词搜索候选" style="flex:1;" />
+      <button onclick="loadTagMergeCandidates()">刷新候选</button>
+    </div>
+    <div class="row">
+      <input id="tagMergeTarget" placeholder="目标主 tag" />
+      <input id="tagMergeSources" placeholder="来源 tag，逗号分隔" style="flex:1;" />
+      <button onclick="previewTagMerge()">预览归并</button>
+      <button onclick="executeTagMerge()">执行归并</button>
+    </div>
+    <div class="split-grid">
+      <div>
+        <div class="subheading">候选归并对</div>
+        <div class="list" id="tagMergeCandidates"></div>
+      </div>
+      <div>
+        <div class="subheading">归并影响预览</div>
+        <div class="list" id="tagMergePreview"></div>
       </div>
     </div>
   </section>
@@ -248,7 +318,9 @@ const pixivReviewState = {
   items: {},
   selectedTagsByImage: {},
   selectedTermsByImage: {},
+  selectedImages: {},
   previewImageId: null,
+  batchPreview: [],
 };
 
 const pixivPlatformState = {
@@ -256,7 +328,14 @@ const pixivPlatformState = {
   suggestionsTag: '',
   suggestions: [],
   unresolved: [],
+  selectedBulkTerms: {},
   editingTermId: 0,
+  bulkPreview: null,
+};
+
+const tagMergeState = {
+  candidates: [],
+  preview: null,
 };
 
 function normalizeKey(value) {
@@ -459,14 +538,18 @@ function renderPixivReviewCard(item) {
   const imageId = item.image_id;
   const selectedTags = pixivReviewState.selectedTagsByImage[imageId] || [];
   const selectedTerms = pixivReviewState.selectedTermsByImage[imageId] || [];
+  const selectedImage = !!pixivReviewState.selectedImages[imageId];
   return `
-    <div class="pixiv-card">
+    <div class="pixiv-card ${selectedImage ? 'selected' : ''}">
       <div class="pixiv-thumb-wrap">
         <img src="${api(`/api/image-file?image_id=${imageId}`)}" loading="lazy" onclick="openPixivPreview(${imageId})" />
         <button class="preview-btn" onclick="openPixivPreview(${imageId})">预览</button>
       </div>
       <div class="pixiv-body">
-        <div><strong>#${imageId}</strong> ${escapeHtml(item.file_name || '')}</div>
+        <div class="row" style="margin:0;">
+          <label><input type="checkbox" ${selectedImage ? 'checked' : ''} onchange="togglePixivReviewImageSelection(${imageId})" /> 选中</label>
+          <strong>#${imageId}</strong> ${escapeHtml(item.file_name || '')}
+        </div>
         <div class="muted">${item.width}x${item.height} · ${escapeHtml(item.author || '-')}</div>
         <div class="muted">标题：${escapeHtml(item.title || '-')}</div>
         <div class="muted">来源：${item.post_url ? `<a href="${escapeAttr(item.post_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.post_url)}</a>` : '-'}</div>
@@ -491,6 +574,7 @@ function renderPixivReviewCard(item) {
 function renderPixivReviewList() {
   const items = Object.values(pixivReviewState.items).sort((a, b) => (b.image_id || 0) - (a.image_id || 0));
   document.getElementById('pixivReviewImages').innerHTML = items.length ? items.map(renderPixivReviewCard).join('') : '<div class="empty">暂无 Pixiv 待审图片</div>';
+  renderPixivBatchSelectionHint();
 }
 
 async function loadPixivReviewImages() {
@@ -503,6 +587,126 @@ async function loadPixivReviewImages() {
   }
   renderPixivReviewList();
   renderPixivPreview();
+}
+
+function parseCsvInput(value) {
+  return uniqueTexts(String(value || '').split(/[,\n，]/g));
+}
+
+function selectedPixivReviewImageIds() {
+  return Object.keys(pixivReviewState.selectedImages || {}).filter(key => pixivReviewState.selectedImages[key]).map(key => Number(key));
+}
+
+function renderPixivBatchSelectionHint() {
+  document.getElementById('pixivBatchSelectionHint').textContent = `当前已选 ${selectedPixivReviewImageIds().length} 张图片。`;
+}
+
+function togglePixivReviewImageSelection(imageId) {
+  if (pixivReviewState.selectedImages[imageId]) delete pixivReviewState.selectedImages[imageId];
+  else pixivReviewState.selectedImages[imageId] = true;
+  renderPixivBatchSelectionHint();
+  renderPixivReviewList();
+}
+
+function selectAllPixivReviewImages() {
+  for (const imageId of Object.keys(pixivReviewState.items || {})) {
+    pixivReviewState.selectedImages[imageId] = true;
+  }
+  renderPixivBatchSelectionHint();
+  renderPixivReviewList();
+}
+
+function clearSelectedPixivReviewImages() {
+  pixivReviewState.selectedImages = {};
+  pixivReviewState.batchPreview = [];
+  renderPixivBatchSelectionHint();
+  renderPixivReviewList();
+  renderPixivBatchPreview();
+}
+
+function applyBatchTagsToSelectedImages() {
+  const imageIds = selectedPixivReviewImageIds();
+  if (!imageIds.length) {
+    alert('请先勾选至少一张图片。');
+    return;
+  }
+  const tags = parseCsvInput(document.getElementById('pixivBatchTags').value);
+  const terms = parseCsvInput(document.getElementById('pixivBatchSourceTerms').value);
+  if (!tags.length && !terms.length) {
+    alert('请至少填写批量主 tag 或批量来源词。');
+    return;
+  }
+  for (const imageId of imageIds) {
+    if (tags.length) pixivReviewState.selectedTagsByImage[imageId] = [...tags];
+    if (terms.length) pixivReviewState.selectedTermsByImage[imageId] = [...terms];
+  }
+  renderPixivReviewList();
+  renderPixivPreview();
+}
+
+function buildPixivBatchReviewItems() {
+  const imageIds = selectedPixivReviewImageIds();
+  const overrideTags = parseCsvInput(document.getElementById('pixivBatchTags').value);
+  const overrideTerms = parseCsvInput(document.getElementById('pixivBatchSourceTerms').value);
+  return imageIds.map(imageId => ({
+    image_id: imageId,
+    selected_tag_names: overrideTags.length ? overrideTags : uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []),
+    source_terms: overrideTerms.length ? overrideTerms : uniqueTexts(pixivReviewState.selectedTermsByImage[imageId] || []),
+  }));
+}
+
+function renderPixivBatchPreview() {
+  const items = pixivReviewState.batchPreview || [];
+  document.getElementById('pixivBatchPreview').innerHTML = items.length ? items.map(item => {
+    if (item.status && item.status !== 'ok') {
+      return `<div class="item"><strong>#${item.image_id}</strong><div class="muted">${escapeHtml(item.message || '预览失败')}</div></div>`;
+    }
+    return `
+      <div class="item">
+        <div><strong>#${item.image_id}</strong></div>
+        <div class="muted">通过：${(item.approved_tags || []).map(escapeHtml).join('、') || '无'}；拒绝：${(item.rejected_tags || []).map(escapeHtml).join('、') || '无'}</div>
+        <div class="muted">映射：${(item.mapped_terms || []).map(term => `${escapeHtml(term.term)}→${escapeHtml(term.tag_name)}${term.action === 'already' ? '(已存在)' : ''}`).join('、') || '无'}</div>
+        <div class="muted">跳过：${(item.skipped_terms || []).map(escapeHtml).join('；') || '无'}</div>
+      </div>
+    `;
+  }).join('') : '<div class="muted">暂无批量审核预览</div>';
+}
+
+async function previewPixivBatchReview() {
+  const items = buildPixivBatchReviewItems();
+  if (!items.length) {
+    alert('请先勾选至少一张图片。');
+    return;
+  }
+  const result = await fetchJson('/api/pixiv-review/batch-preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      items,
+      reject_unselected: document.getElementById('pixivBatchRejectUnselected').checked,
+    }),
+  });
+  pixivReviewState.batchPreview = result.items || [];
+  renderPixivBatchPreview();
+}
+
+async function submitPixivBatchReview() {
+  const items = buildPixivBatchReviewItems();
+  if (!items.length) {
+    alert('请先勾选至少一张图片。');
+    return;
+  }
+  if (!confirm(`确认批量审核这 ${items.length} 张图片吗？`)) return;
+  const result = await fetchJson('/api/pixiv-review/batch-submit', {
+    method: 'POST',
+    body: JSON.stringify({
+      items,
+      reject_unselected: document.getElementById('pixivBatchRejectUnselected').checked,
+    }),
+  });
+  pixivReviewState.batchPreview = result.items || [];
+  renderPixivBatchPreview();
+  alert(result.message || '批量审核完成');
+  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions(), loadTagMergeCandidates()]);
 }
 
 function buildCandidateMappingsHtml(item) {
@@ -597,7 +801,7 @@ async function submitPixivReview(imageId) {
   delete pixivReviewState.selectedTagsByImage[imageId];
   delete pixivReviewState.selectedTermsByImage[imageId];
   closePixivPreview();
-  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions()]);
+  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions(), loadTagMergeCandidates()]);
 }
 
 document.getElementById('pixivPreviewModal').addEventListener('click', (event) => {
@@ -635,6 +839,7 @@ function currentPixivPlatformSuggestionTag() {
 function selectPixivPlatformTag(tagName) {
   document.getElementById('pixivPlatformTagFilter').value = tagName || '';
   document.getElementById('pixivPlatformTagInput').value = tagName || '';
+  document.getElementById('pixivBulkMapTag').value = tagName || '';
   loadPixivPlatformTerms();
   loadPixivPlatformSuggestions(tagName || '');
 }
@@ -698,12 +903,44 @@ function renderPixivPlatformSuggestions() {
     : '<div class="muted">暂无建议词</div>';
 }
 
+function selectedPixivBulkMapTerms() {
+  return Object.keys(pixivPlatformState.selectedBulkTerms || {}).filter(key => pixivPlatformState.selectedBulkTerms[key]);
+}
+
+function renderPixivBulkMapSelectionHint() {
+  document.getElementById('pixivBulkMapSelectionHint').textContent = `当前已选 ${selectedPixivBulkMapTerms().length} 个词。`;
+}
+
+function togglePixivBulkMapTermSelection(term) {
+  const key = normalizeKey(term);
+  if (pixivPlatformState.selectedBulkTerms[key]) delete pixivPlatformState.selectedBulkTerms[key];
+  else pixivPlatformState.selectedBulkTerms[key] = term;
+  renderPixivBulkMapSelectionHint();
+  renderPixivPlatformUnresolved();
+}
+
+function clearPixivBulkMapSelection() {
+  pixivPlatformState.selectedBulkTerms = {};
+  pixivPlatformState.bulkPreview = null;
+  renderPixivBulkMapSelectionHint();
+  renderPixivPlatformUnresolved();
+  renderPixivBulkMapPreview();
+}
+
+function currentPixivBulkMapTerms() {
+  return uniqueTexts([
+    ...selectedPixivBulkMapTerms().map(key => pixivPlatformState.selectedBulkTerms[key]),
+    ...parseCsvInput(document.getElementById('pixivBulkMapTerms').value),
+  ]);
+}
+
 function renderPixivPlatformUnresolvedItem(item) {
+  const selected = !!pixivPlatformState.selectedBulkTerms[normalizeKey(item.term)];
   return `
-    <div class="term-item">
+    <div class="term-item ${selected ? 'selected' : ''}">
       <div class="term-head">
         <div>
-          <div><strong>${escapeHtml(item.term)}</strong> <span class="pill">待确认</span></div>
+          <div><label><input type="checkbox" ${selected ? 'checked' : ''} onchange='togglePixivBulkMapTermSelection(${JSON.stringify(item.term)})' /> <strong>${escapeHtml(item.term)}</strong></label> <span class="pill">待确认</span></div>
           <div class="muted">出现 ${item.count || 0} 次 · 候选主 tag：${(item.candidate_tags || []).map(escapeHtml).join('、') || '无'}</div>
         </div>
         <div class="term-actions">
@@ -721,6 +958,23 @@ function renderPixivPlatformUnresolved() {
   document.getElementById('pixivPlatformUnresolved').innerHTML = (pixivPlatformState.unresolved || []).length
     ? pixivPlatformState.unresolved.map(renderPixivPlatformUnresolvedItem).join('')
     : '<div class="muted">暂无未解决词</div>';
+  renderPixivBulkMapSelectionHint();
+}
+
+function renderPixivBulkMapPreview() {
+  const payload = pixivPlatformState.bulkPreview;
+  const box = document.getElementById('pixivBulkMapPreview');
+  if (!payload || !(payload.items || []).length) {
+    box.innerHTML = '<div class="muted">暂无批量映射预览</div>';
+    return;
+  }
+  box.innerHTML = (payload.items || []).map(item => `
+    <div class="item">
+      <div><strong>${escapeHtml(item.term)}</strong> → ${escapeHtml(item.target_tag || payload.target_tag || '-')}</div>
+      <div class="muted">状态：${escapeHtml(item.status || '-')} · 次数：${item.count || 0} · ${escapeHtml(item.message || '')}</div>
+      <div class="muted">作者：${(item.sample_authors || []).map(escapeHtml).join('、') || '无'}</div>
+    </div>
+  `).join('');
 }
 
 async function loadPixivPlatformTerms() {
@@ -748,6 +1002,7 @@ async function loadPixivPlatformSuggestions(tagName = '') {
   pixivPlatformState.suggestionsTag = canonicalTag;
   pixivPlatformState.suggestions = data.items || [];
   document.getElementById('pixivPlatformTagFilter').value = canonicalTag;
+  document.getElementById('pixivBulkMapTag').value = canonicalTag;
   if (!document.getElementById('pixivPlatformTagInput').value.trim()) {
     document.getElementById('pixivPlatformTagInput').value = canonicalTag;
   }
@@ -764,6 +1019,50 @@ async function loadPixivPlatformUnresolved() {
   const data = await fetchJson(`/api/pixiv-platform-unresolved?${q.toString()}`);
   pixivPlatformState.unresolved = data.items || [];
   renderPixivPlatformUnresolved();
+}
+
+async function previewPixivBulkMap() {
+  const tagName = document.getElementById('pixivBulkMapTag').value.trim();
+  const terms = currentPixivBulkMapTerms();
+  if (!tagName || !terms.length) {
+    alert('请先填写目标主 tag，并勾选或输入至少一个 Pixiv 词。');
+    return;
+  }
+  const result = await fetchJson('/api/pixiv-platform/batch-preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      tag_name: tagName,
+      terms,
+      term_type: document.getElementById('pixivBulkMapType').value,
+    }),
+  });
+  pixivPlatformState.bulkPreview = result;
+  renderPixivBulkMapPreview();
+}
+
+async function submitPixivBulkMap() {
+  const tagName = document.getElementById('pixivBulkMapTag').value.trim();
+  const terms = currentPixivBulkMapTerms();
+  if (!tagName || !terms.length) {
+    alert('请先填写目标主 tag，并勾选或输入至少一个 Pixiv 词。');
+    return;
+  }
+  if (!confirm(`确认将 ${terms.length} 个 Pixiv 词批量映射到 ${tagName} 吗？`)) return;
+  const confidence = Number(document.getElementById('pixivBulkMapConfidence').value || '0.8');
+  const result = await fetchJson('/api/pixiv-platform/batch-submit', {
+    method: 'POST',
+    body: JSON.stringify({
+      tag_name: tagName,
+      terms,
+      term_type: document.getElementById('pixivBulkMapType').value,
+      source: document.getElementById('pixivBulkMapSource').value,
+      confidence,
+    }),
+  });
+  alert(result.message || '批量映射完成');
+  clearPixivBulkMapSelection();
+  document.getElementById('pixivBulkMapTag').value = tagName;
+  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(tagName), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
 }
 
 async function savePixivPlatformTerm() {
@@ -793,7 +1092,7 @@ async function savePixivPlatformTerm() {
   alert(result.message || '已保存平台词');
   document.getElementById('pixivPlatformTagFilter').value = tagName;
   resetPixivPlatformForm();
-  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(tagName), loadPixivPlatformUnresolved(), loadPixivReviewImages()]);
+  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(tagName), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
 }
 
 async function deletePixivPlatformTerm(termId) {
@@ -804,7 +1103,7 @@ async function deletePixivPlatformTerm(termId) {
   });
   alert(result.message || '已删除平台词');
   if (pixivPlatformState.editingTermId === Number(termId || 0)) resetPixivPlatformForm();
-  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(), loadPixivPlatformUnresolved(), loadPixivReviewImages()]);
+  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
 }
 
 async function quickSavePixivPlatformTerm(tagName, term, termType = 'both', source = 'pixiv_history') {
@@ -826,11 +1125,132 @@ async function quickSavePixivPlatformTerm(tagName, term, termType = 'both', sour
   });
   alert(result.message || '已保存平台词');
   document.getElementById('pixivPlatformTagFilter').value = resolvedTag;
-  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(resolvedTag), loadPixivPlatformUnresolved(), loadPixivReviewImages()]);
+  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(resolvedTag), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
+}
+
+function currentTagMergeSources() {
+  return parseCsvInput(document.getElementById('tagMergeSources').value);
+}
+
+function useTagMergeCandidate(sourceTag, targetTag) {
+  document.getElementById('tagMergeTarget').value = targetTag || '';
+  const current = currentTagMergeSources();
+  if (!current.some(item => normalizeKey(item) === normalizeKey(sourceTag))) current.push(sourceTag);
+  document.getElementById('tagMergeSources').value = current.join(', ');
+  previewTagMerge();
+}
+
+function renderTagMergeCandidateItem(item) {
+  return `
+    <div class="term-item">
+      <div class="term-head">
+        <div>
+          <div><strong>${escapeHtml(item.source_tag)}</strong> <span class="merge-arrow">→</span> <strong>${escapeHtml(item.target_tag)}</strong></div>
+          <div class="muted">分数：${item.score || 0} · source图数：${item.source_image_count || 0} · target图数：${item.target_image_count || 0}</div>
+        </div>
+        <div class="term-actions">
+          <button onclick='useTagMergeCandidate(${JSON.stringify(item.source_tag)}, ${JSON.stringify(item.target_tag)})'>使用并预览</button>
+        </div>
+      </div>
+      <div class="muted">原因：${(item.reasons || []).map(escapeHtml).join('、') || '无'}；示例词：${(item.example_terms || []).map(escapeHtml).join('、') || '无'}</div>
+    </div>
+  `;
+}
+
+function renderTagMergeCandidates() {
+  document.getElementById('tagMergeCandidates').innerHTML = (tagMergeState.candidates || []).length
+    ? tagMergeState.candidates.map(renderTagMergeCandidateItem).join('')
+    : '<div class="muted">暂无候选归并对</div>';
+}
+
+function renderTagMergePreview() {
+  const payload = tagMergeState.preview;
+  const box = document.getElementById('tagMergePreview');
+  if (!payload || !(payload.items || []).length) {
+    box.innerHTML = '<div class="muted">暂无归并预览</div>';
+    return;
+  }
+  const totals = payload.totals || {};
+  box.innerHTML = `
+    <div class="preview-box">
+      <div><strong>目标主 tag：</strong>${escapeHtml(payload.target_tag || '-')}</div>
+      <div class="muted">target alias：${(payload.target_aliases || []).map(escapeHtml).join('、') || '无'}</div>
+      <div class="muted">总计：图片关联 ${totals.image_links || 0}（冲突 ${totals.image_link_collisions || 0}）；
+      审核任务 ${totals.review_tasks || 0}（冲突 ${totals.review_task_collisions || 0}）；
+      alias ${totals.aliases || 0}；平台词 ${totals.platform_terms || 0}；自动订阅 ${totals.subscriptions || 0}</div>
+    </div>
+    ${(payload.items || []).map(item => `
+      <div class="item">
+        <div><strong>${escapeHtml(item.source_tag || '-')}</strong> <span class="merge-arrow">→</span> ${escapeHtml(item.target_tag || payload.target_tag || '-')}</div>
+        <div class="muted">${escapeHtml(item.message || '-')}</div>
+        <div class="muted">图片关联 ${item.image_links || 0}（冲突 ${item.image_link_collisions || 0}）；
+        审核任务 ${item.review_tasks || 0}（冲突 ${item.review_task_collisions || 0}）；
+        alias ${item.alias_count || 0}；平台词 ${item.platform_term_count || 0}；自动订阅 ${item.subscription_count || 0}</div>
+        <div class="muted">alias：${(item.aliases || []).map(escapeHtml).join('、') || '无'}</div>
+        <div class="muted">平台词：${(item.platform_terms || []).map(escapeHtml).join('、') || '无'}</div>
+      </div>
+    `).join('')}
+  `;
+}
+
+async function loadTagMergeCandidates() {
+  const q = new URLSearchParams({
+    keyword: document.getElementById('tagMergeKeyword').value,
+    limit: '40',
+  });
+  const data = await fetchJson(`/api/tag-merge/candidates?${q.toString()}`);
+  tagMergeState.candidates = data.items || [];
+  renderTagMergeCandidates();
+}
+
+async function previewTagMerge() {
+  const targetTag = document.getElementById('tagMergeTarget').value.trim();
+  const sourceTags = currentTagMergeSources();
+  if (!targetTag || !sourceTags.length) {
+    alert('请先填写目标主 tag 和来源 tag。');
+    return;
+  }
+  const data = await fetchJson('/api/tag-merge/preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      target_tag: targetTag,
+      source_tags: sourceTags,
+    }),
+  });
+  tagMergeState.preview = data;
+  renderTagMergePreview();
+}
+
+async function executeTagMerge() {
+  const targetTag = document.getElementById('tagMergeTarget').value.trim();
+  const sourceTags = currentTagMergeSources();
+  if (!targetTag || !sourceTags.length) {
+    alert('请先填写目标主 tag 和来源 tag。');
+    return;
+  }
+  if (!confirm(`确认将 ${sourceTags.join('、')} 归并到 ${targetTag} 吗？`)) return;
+  const data = await fetchJson('/api/tag-merge/execute', {
+    method: 'POST',
+    body: JSON.stringify({
+      target_tag: targetTag,
+      source_tags: sourceTags,
+    }),
+  });
+  const lines = [data.message || '归并完成'];
+  if ((data.merged_tags || []).length) lines.push(`已归并：${data.merged_tags.join('、')}`);
+  if ((data.aliases_added || []).length) lines.push(`直接挂 alias：${data.aliases_added.join('、')}`);
+  alert(lines.join('\\n'));
+  tagMergeState.preview = null;
+  renderTagMergePreview();
+  await Promise.all([loadTags(), loadSummary(), loadTagMergeCandidates(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions(), loadPixivReviewImages()]);
 }
 
 resetPixivPlatformForm();
-Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags(), loadPixivReviewImages(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved()]).catch(err => { console.error(err); alert(err.message || err); });
+clearPixivBulkMapSelection();
+renderPixivBatchSelectionHint();
+renderPixivBatchPreview();
+renderTagMergePreview();
+Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags(), loadPixivReviewImages(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadTagMergeCandidates()]).catch(err => { console.error(err); alert(err.message || err); });
 </script>
 </body>
 </html>
@@ -876,11 +1296,18 @@ class GalleryWebUI:
                 web.get("/api/pixiv-review-images", self.api_pixiv_review_images),
                 web.get("/api/pixiv-review-image", self.api_pixiv_review_image),
                 web.post("/api/pixiv-review/submit", self.api_pixiv_review_submit),
+                web.post("/api/pixiv-review/batch-preview", self.api_pixiv_review_batch_preview),
+                web.post("/api/pixiv-review/batch-submit", self.api_pixiv_review_batch_submit),
                 web.get("/api/pixiv-platform-terms", self.api_pixiv_platform_terms),
                 web.post("/api/pixiv-platform-terms/save", self.api_pixiv_platform_terms_save),
                 web.delete("/api/pixiv-platform-terms", self.api_pixiv_platform_terms_delete),
                 web.get("/api/pixiv-platform-suggestions", self.api_pixiv_platform_suggestions),
                 web.get("/api/pixiv-platform-unresolved", self.api_pixiv_platform_unresolved),
+                web.post("/api/pixiv-platform/batch-preview", self.api_pixiv_platform_batch_preview),
+                web.post("/api/pixiv-platform/batch-submit", self.api_pixiv_platform_batch_submit),
+                web.get("/api/tag-merge/candidates", self.api_tag_merge_candidates),
+                web.post("/api/tag-merge/preview", self.api_tag_merge_preview),
+                web.post("/api/tag-merge/execute", self.api_tag_merge_execute),
                 web.post("/api/reviews/decision", self.api_review_decision),
                 web.post("/api/tag/alias", self.api_tag_alias),
                 web.delete("/api/tag/alias", self.api_tag_alias),
@@ -1399,6 +1826,40 @@ class GalleryWebUI:
             payload["message"] = str(result)
         return self._json_response(payload, status=(200 if ok else 400))
 
+    async def api_pixiv_review_batch_preview(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        ok, result = self.db.preview_batch_image_review(
+            data.get("items", []) or [],
+            platform="pixiv",
+            reject_unselected=bool(data.get("reject_unselected", True)),
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
+
+    async def api_pixiv_review_batch_submit(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        ok, result = self.db.apply_batch_image_review(
+            data.get("items", []) or [],
+            platform="pixiv",
+            reject_unselected=bool(data.get("reject_unselected", True)),
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
+
     async def api_pixiv_platform_terms(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
         if denied is not None:
@@ -1506,6 +1967,110 @@ class GalleryWebUI:
             )
         ]
         return self._json_response({"items": items})
+
+    async def api_pixiv_platform_batch_preview(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        terms_raw = data.get("terms", []) or []
+        if isinstance(terms_raw, str):
+            terms = parse_tag_csv(terms_raw)
+        else:
+            terms = parse_tag_csv([str(item or "") for item in terms_raw])
+        ok, result = self.db.preview_batch_platform_terms(
+            tag_name=str(data.get("tag_name", "") or "").strip(),
+            terms=terms,
+            platform="pixiv",
+            term_type=str(data.get("term_type", "") or "").strip() or "both",
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
+
+    async def api_pixiv_platform_batch_submit(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        terms_raw = data.get("terms", []) or []
+        if isinstance(terms_raw, str):
+            terms = parse_tag_csv(terms_raw)
+        else:
+            terms = parse_tag_csv([str(item or "") for item in terms_raw])
+        try:
+            confidence = float(data.get("confidence", 0.8) or 0.8)
+        except (TypeError, ValueError):
+            return self._json_response({"ok": False, "message": "confidence_invalid"}, status=400)
+        ok, result = self.db.apply_batch_platform_terms(
+            tag_name=str(data.get("tag_name", "") or "").strip(),
+            terms=terms,
+            platform="pixiv",
+            term_type=str(data.get("term_type", "") or "").strip() or "both",
+            source=str(data.get("source", "") or "").strip() or "pixiv_history",
+            confidence=confidence,
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
+
+    async def api_tag_merge_candidates(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        items = self.db.list_tag_merge_candidates(
+            keyword=str(request.query.get("keyword", "") or "").strip(),
+            limit=min(max(int(request.query.get("limit", 40) or 40), 1), 120),
+        )
+        return self._json_response({"items": items})
+
+    async def api_tag_merge_preview(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        source_tags_raw = data.get("source_tags", []) or []
+        if isinstance(source_tags_raw, str):
+            source_tags = parse_tag_csv(source_tags_raw)
+        else:
+            source_tags = parse_tag_csv([str(item or "") for item in source_tags_raw])
+        ok, result = self.db.preview_merge_tags(
+            target_tag_name=str(data.get("target_tag", "") or "").strip(),
+            source_tag_names=source_tags,
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
+
+    async def api_tag_merge_execute(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        source_tags_raw = data.get("source_tags", []) or []
+        if isinstance(source_tags_raw, str):
+            source_tags = parse_tag_csv(source_tags_raw)
+        else:
+            source_tags = parse_tag_csv([str(item or "") for item in source_tags_raw])
+        ok, result = self.db.merge_tags(
+            str(data.get("target_tag", "") or "").strip(),
+            source_tags,
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
 
     async def api_review_decision(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)

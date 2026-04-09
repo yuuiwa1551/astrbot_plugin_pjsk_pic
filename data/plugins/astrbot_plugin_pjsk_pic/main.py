@@ -872,6 +872,8 @@ class PJSKPicPlugin(Star):
             f"审核任务迁移 {int(summary.get('review_tasks_migrated') or 0)}",
             f"审核任务合并 {int(summary.get('review_tasks_merged') or 0)}",
             f"alias 迁移 {int(summary.get('aliases_migrated') or 0)}",
+            f"订阅迁移 {int(summary.get('subscriptions_migrated') or 0)}",
+            f"订阅合并 {int(summary.get('subscriptions_merged') or 0)}",
             f"订阅移除 {int(summary.get('subscriptions_removed') or 0)}",
         ]
         lines.append("；".join(metrics))
