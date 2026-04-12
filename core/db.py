@@ -4,7 +4,7 @@ from collections import Counter
 import json
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -23,7 +23,7 @@ IMAGE_TAG_STATUS_PRIORITY = {
 
 
 def utcnow_str() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class ImageIndexDB:
@@ -2776,11 +2776,20 @@ class ImageIndexDB:
                    rt.created_at, rt.updated_at,
                    i.id AS image_id, i.file_path,
                    t.id AS tag_id, t.name AS tag_name,
-                   it.source_type AS source_type
+                   COALESCE((
+                       SELECT it.source_type
+                       FROM image_tags it
+                       WHERE it.image_id = rt.image_id AND it.tag_id = rt.tag_id
+                       ORDER BY CASE
+                           WHEN it.source_type LIKE 'crawl:%' THEN 0
+                           WHEN it.source_type LIKE 'manual:%' THEN 1
+                           ELSE 2
+                       END, it.id DESC
+                       LIMIT 1
+                   ), '') AS source_type
             FROM review_tasks rt
             JOIN images i ON i.id = rt.image_id
             JOIN tags t ON t.id = rt.tag_id
-            LEFT JOIN image_tags it ON it.image_id = rt.image_id AND it.tag_id = rt.tag_id
         """
         params: list[Any] = []
         normalized_statuses = [str(item).strip() for item in (statuses or []) if str(item).strip()]
@@ -2803,35 +2812,75 @@ class ImageIndexDB:
                 SELECT rt.id, rt.status, rt.reason, rt.model_result, rt.manual_result,
                        i.id AS image_id, i.file_path,
                        t.id AS tag_id, t.name AS tag_name,
-                       it.source_type AS source_type
+                       COALESCE((
+                           SELECT it.source_type
+                           FROM image_tags it
+                           WHERE it.image_id = rt.image_id AND it.tag_id = rt.tag_id
+                           ORDER BY CASE
+                               WHEN it.source_type LIKE 'crawl:%' THEN 0
+                               WHEN it.source_type LIKE 'manual:%' THEN 1
+                               ELSE 2
+                           END, it.id DESC
+                           LIMIT 1
+                       ), '') AS source_type
                 FROM review_tasks rt
                 JOIN images i ON i.id = rt.image_id
                 JOIN tags t ON t.id = rt.tag_id
-                LEFT JOIN image_tags it ON it.image_id = rt.image_id AND it.tag_id = rt.tag_id
                 WHERE rt.id = ?
                 """,
                 (review_id,),
             ).fetchone()
 
     def apply_manual_review(self, review_id: int, *, approved: bool, reason: str = '') -> tuple[bool, str]:
-        task = self.get_review_task(review_id)
-        if not task:
-            return False, f'审核任务不存在：{review_id}'
         new_status = 'manual_approved' if approved else 'manual_rejected'
+        now = utcnow_str()
+        review_reason = reason or ('人工通过' if approved else '人工拒绝')
         with self._lock, self._connect() as conn:
+            task = conn.execute(
+                """
+                SELECT rt.id, rt.image_id, rt.tag_id,
+                       COALESCE((
+                           SELECT it.source_type
+                           FROM image_tags it
+                           WHERE it.image_id = rt.image_id AND it.tag_id = rt.tag_id
+                           ORDER BY CASE
+                               WHEN it.source_type LIKE 'crawl:%' THEN 0
+                               WHEN it.source_type LIKE 'manual:%' THEN 1
+                               ELSE 2
+                           END, it.id DESC
+                           LIMIT 1
+                       ), '') AS source_type
+                FROM review_tasks rt
+                WHERE rt.id = ?
+                LIMIT 1
+                """,
+                (review_id,),
+            ).fetchone()
+            if not task:
+                return False, f'审核任务不存在：{review_id}'
             conn.execute(
                 "UPDATE review_tasks SET status = ?, manual_result = ?, reason = ?, updated_at = ? WHERE id = ?",
-                (new_status, 'approved' if approved else 'rejected', reason, utcnow_str(), review_id),
+                (new_status, 'approved' if approved else 'rejected', reason, now, review_id),
             )
-        source_type = str(task['source_type'] or '')
-        source_prefix = source_type.split(':', 1)[0] if source_type else None
-        self.update_image_tag_review(
-            int(task['image_id']),
-            int(task['tag_id']),
-            new_status,
-            reason=reason or ('人工通过' if approved else '人工拒绝'),
-            source_type_prefix=source_prefix,
-        )
+            source_type = str(task['source_type'] or '').strip()
+            if source_type:
+                conn.execute(
+                    """
+                    UPDATE image_tags
+                    SET review_status = ?, review_reason = ?, updated_at = ?
+                    WHERE image_id = ? AND tag_id = ? AND source_type = ?
+                    """,
+                    (new_status, review_reason, now, int(task['image_id']), int(task['tag_id']), source_type),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE image_tags
+                    SET review_status = ?, review_reason = ?, updated_at = ?
+                    WHERE image_id = ? AND tag_id = ? AND source_type = ''
+                    """,
+                    (new_status, review_reason, now, int(task['image_id']), int(task['tag_id'])),
+                )
         return True, f"已{'通过' if approved else '拒绝'}审核任务 #{review_id}"
 
 
@@ -2845,10 +2894,19 @@ class ImageIndexDB:
             SELECT rt.id, rt.status, rt.reason, rt.model_result, rt.manual_result,
                    rt.created_at, rt.updated_at,
                    t.id AS tag_id, t.name AS tag_name, t.is_character,
-                   COALESCE(it.source_type, '') AS source_type
+                   COALESCE((
+                       SELECT it.source_type
+                       FROM image_tags it
+                       WHERE it.image_id = rt.image_id AND it.tag_id = rt.tag_id
+                       ORDER BY CASE
+                           WHEN it.source_type LIKE 'crawl:%' THEN 0
+                           WHEN it.source_type LIKE 'manual:%' THEN 1
+                           ELSE 2
+                       END, it.id DESC
+                       LIMIT 1
+                   ), '') AS source_type
             FROM review_tasks rt
             JOIN tags t ON t.id = rt.tag_id
-            LEFT JOIN image_tags it ON it.image_id = rt.image_id AND it.tag_id = rt.tag_id
             WHERE rt.image_id = ?
         """
         params: list[Any] = [image_id]
@@ -2957,14 +3015,24 @@ class ImageIndexDB:
             tasks = conn.execute(
                 """
                 SELECT rt.id, rt.tag_id, rt.status, t.name AS tag_name,
-                       COALESCE(it.source_type, '') AS source_type
+                       COALESCE((
+                           SELECT it.source_type
+                           FROM image_tags it
+                           WHERE it.image_id = rt.image_id AND it.tag_id = rt.tag_id
+                           ORDER BY CASE
+                               WHEN it.source_type = ? THEN 0
+                               WHEN it.source_type LIKE 'crawl:%' THEN 1
+                               WHEN it.source_type LIKE 'manual:%' THEN 2
+                               ELSE 3
+                           END, it.id DESC
+                           LIMIT 1
+                       ), '') AS source_type
                 FROM review_tasks rt
                 JOIN tags t ON t.id = rt.tag_id
-                LEFT JOIN image_tags it ON it.image_id = rt.image_id AND it.tag_id = rt.tag_id
                 WHERE rt.image_id = ?
                 ORDER BY rt.id DESC
                 """,
-                (image_id,),
+                (f'crawl:{platform_text}', image_id),
             ).fetchall()
             task_by_tag_id = {int(row['tag_id']): row for row in tasks}
 
@@ -3050,8 +3118,8 @@ class ImageIndexDB:
                         )
                     else:
                         conn.execute(
-                            'UPDATE image_tags SET review_status = ?, review_reason = ?, updated_at = ? WHERE image_id = ? AND tag_id = ?',
-                            ('manual_rejected', rejected_reason, now, image_id, tag_id),
+                            'UPDATE image_tags SET review_status = ?, review_reason = ?, updated_at = ? WHERE image_id = ? AND tag_id = ? AND source_type = ?',
+                            ('manual_rejected', rejected_reason, now, image_id, tag_id, ''),
                         )
                     rejected_names.append(str(task['tag_name']))
 

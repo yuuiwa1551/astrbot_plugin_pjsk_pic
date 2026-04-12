@@ -88,7 +88,10 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1 style="margin:0;">PJSK 图片库管理台</h1>
+  <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;">
+    <h1 style="margin:0;">PJSK 图片库管理台</h1>
+    <button class="secondary" onclick="logoutWebUi()">退出登录</button>
+  </div>
   <div class="muted" style="color:#dce4ff;">独立 WebUI：支持图库检索、Pixiv 图片审批、Pixiv 平台词管理、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
   <div class="notice" id="notice"></div>
 </header>
@@ -296,22 +299,26 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 <script>
-const params = new URLSearchParams(location.search);
-const token = params.get('token') || '';
-document.getElementById('notice').textContent = token ? '当前已附带访问令牌。' : '当前未附带访问令牌。';
+document.getElementById('notice').textContent = '当前使用站点会话访问；如需切换账户，可点击右上角退出登录。';
 
 function api(path) {
-  const url = new URL(path, location.origin);
-  if (token) url.searchParams.set('token', token);
-  return url.toString();
+  return new URL(path, location.origin).toString();
 }
 
 async function fetchJson(path, options = {}) {
   const headers = {'Content-Type': 'application/json', ...(options.headers || {})};
-  if (token) headers['X-PJSK-Token'] = token;
-  const resp = await fetch(api(path), {...options, headers});
+  const resp = await fetch(api(path), {...options, headers, credentials: 'same-origin'});
   if (!resp.ok) throw new Error(await resp.text());
   return await resp.json();
+}
+
+async function logoutWebUi() {
+  try {
+    await fetchJson('/api/auth/logout', {method: 'POST'});
+  } catch (err) {
+    console.warn(err);
+  }
+  location.reload();
 }
 
 const pixivReviewState = {
@@ -1256,6 +1263,66 @@ Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags(),
 </html>
 """
 
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>PJSK 图片库登录</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #eef2ff; font-family: Arial, sans-serif; color: #1f2937; }
+    .panel { width: min(420px, calc(100vw - 32px)); background: white; border-radius: 16px; padding: 24px; box-shadow: 0 18px 48px rgba(37, 99, 235, .18); }
+    h1 { margin: 0 0 10px; font-size: 24px; }
+    p { margin: 0 0 18px; color: #4b5563; line-height: 1.6; }
+    input, button { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 10px; border: 1px solid #cfd8ff; font-size: 14px; }
+    input { margin-bottom: 12px; }
+    button { border: none; background: #3c65f5; color: white; cursor: pointer; }
+    .hint { margin-top: 12px; font-size: 12px; color: #6b7280; }
+    .error { min-height: 20px; margin-top: 10px; color: #dc2626; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>PJSK 图片库登录</h1>
+    <p>当前 WebUI 已启用访问令牌保护。请输入 <code>webui_access_token</code> 完成登录，浏览器会建立站点会话，不再通过 URL 传递令牌。</p>
+    <form id="loginForm">
+      <input id="tokenInput" type="password" placeholder="输入访问令牌" autocomplete="current-password" />
+      <button type="submit">登录</button>
+    </form>
+    <div class="error" id="errorText"></div>
+    <div class="hint">仍可继续使用 <code>X-PJSK-Token</code> 或 <code>Authorization: Bearer</code> 直接调用 API。</div>
+  </div>
+  <script>
+    const form = document.getElementById('loginForm');
+    const input = document.getElementById('tokenInput');
+    const errorText = document.getElementById('errorText');
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      errorText.textContent = '';
+      const token = input.value.trim();
+      if (!token) {
+        errorText.textContent = '请输入访问令牌。';
+        return;
+      }
+      try {
+        const resp = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          credentials: 'same-origin',
+          body: JSON.stringify({token}),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data.ok === false) throw new Error(data.message || '登录失败');
+        location.href = '/';
+      } catch (err) {
+        errorText.textContent = err.message || String(err);
+      }
+    });
+    input.focus();
+  </script>
+</body>
+</html>
+"""
+
 
 class GalleryWebUI:
     def __init__(self, db: ImageIndexDB, crawl_service) -> None:
@@ -1264,6 +1331,7 @@ class GalleryWebUI:
         self.host = "0.0.0.0"
         self.port = 9099
         self.access_token = ""
+        self._access_cookie_name = "pjsk_pic_webui_token"
         self._runner: web.AppRunner | None = None
         self._site: web.BaseSite | None = None
         self._actual_port: int | None = None
@@ -1284,6 +1352,8 @@ class GalleryWebUI:
         app.add_routes(
             [
                 web.get("/", self.ui_page),
+                web.post("/api/auth/login", self.api_auth_login),
+                web.post("/api/auth/logout", self.api_auth_logout),
                 web.get("/api/summary", self.api_summary),
                 web.get("/api/images", self.api_images),
                 web.get("/api/image", self.api_image_detail),
@@ -1345,15 +1415,14 @@ class GalleryWebUI:
 
     def get_access_urls(self) -> list[str]:
         port = self._actual_port or self.port
-        token_suffix = f"?token={self.access_token}" if self.access_token else ""
 
         if self.host in {"0.0.0.0", "::"}:
-            urls = [f"http://127.0.0.1:{port}/{token_suffix}"]
+            urls = [f"http://127.0.0.1:{port}/"]
             lan_ip = self._detect_lan_ip()
             if lan_ip:
-                urls.insert(0, f"http://{lan_ip}:{port}/{token_suffix}")
+                urls.insert(0, f"http://{lan_ip}:{port}/")
             return urls
-        return [f"http://{self.host}:{port}/{token_suffix}"]
+        return [f"http://{self.host}:{port}/"]
 
     @staticmethod
     def _detect_lan_ip() -> str:
@@ -1368,15 +1437,20 @@ class GalleryWebUI:
             if sock:
                 sock.close()
 
-    def _check_access(self, request: web.Request) -> web.Response | None:
-        if not self.access_token:
-            return None
-        token = (
-            request.query.get("token", "")
+    def _request_token(self, request: web.Request) -> str:
+        return (
+            request.cookies.get(self._access_cookie_name, "")
             or request.headers.get("X-PJSK-Token", "")
             or self._bearer_token(request.headers.get("Authorization", ""))
         )
-        if token == self.access_token:
+
+    def _is_authorized(self, request: web.Request) -> bool:
+        if not self.access_token:
+            return True
+        return self._request_token(request) == self.access_token
+
+    def _check_access(self, request: web.Request) -> web.Response | None:
+        if self._is_authorized(request):
             return None
         return self._json_response({"ok": False, "message": "forbidden"}, status=403)
 
@@ -1393,6 +1467,19 @@ class GalleryWebUI:
             status=status,
             content_type="application/json",
             charset="utf-8",
+        )
+
+    def _apply_access_cookie(self, response: web.StreamResponse, *, token: str | None = None, clear: bool = False) -> None:
+        if clear:
+            response.del_cookie(self._access_cookie_name, path="/")
+            return
+        response.set_cookie(
+            self._access_cookie_name,
+            token or "",
+            path="/",
+            httponly=True,
+            samesite="Lax",
+            max_age=30 * 24 * 60 * 60,
         )
 
     async def _json_body(self, request: web.Request) -> dict:
@@ -1639,10 +1726,27 @@ class GalleryWebUI:
         }
 
     async def ui_page(self, request: web.Request) -> web.Response:
-        denied = self._check_access(request)
-        if denied is not None:
-            return denied
+        if self.access_token and not self._is_authorized(request):
+            return web.Response(text=LOGIN_PAGE, content_type="text/html", charset="utf-8")
         return web.Response(text=HTML_PAGE, content_type="text/html", charset="utf-8")
+
+    async def api_auth_login(self, request: web.Request) -> web.Response:
+        if not self.access_token:
+            response = self._json_response({"ok": True, "message": "当前未启用访问令牌。"})
+            self._apply_access_cookie(response, clear=True)
+            return response
+        data = await self._json_body(request)
+        token = str(data.get("token", "") or "").strip()
+        if token != self.access_token:
+            return self._json_response({"ok": False, "message": "访问令牌错误。"}, status=403)
+        response = self._json_response({"ok": True, "message": "登录成功。"})
+        self._apply_access_cookie(response, token=self.access_token)
+        return response
+
+    async def api_auth_logout(self, request: web.Request) -> web.Response:
+        response = self._json_response({"ok": True, "message": "已退出登录。"})
+        self._apply_access_cookie(response, clear=True)
+        return response
 
     async def api_summary(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)

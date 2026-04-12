@@ -287,9 +287,11 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 
 若配置了 `webui_access_token`，可通过以下任一方式访问：
 
-- URL 查询参数：`?token=你的令牌`
+- 浏览器访问根页面后，在登录页输入访问令牌建立站点会话（HttpOnly Cookie）
 - 请求头：`X-PJSK-Token: 你的令牌`
 - 请求头：`Authorization: Bearer 你的令牌`
+
+> 从 `v0.12.2` 起，不再支持通过 `?token=` URL 查询参数传递 WebUI 访问令牌，以避免令牌进入浏览器历史、日志或 Referrer。
 
 管理员可通过命令查看当前访问地址：
 
@@ -346,9 +348,16 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 
 ## 8. 当前版本
 
-- 当前插件版本：`0.12.1`
+- 当前插件版本：`0.12.2`
 
 ## 9. 更新记录
+
+### v0.12.2
+
+- 修复图片级人工审核在同一 `(image_id, tag_id)` 存在多来源记录时，`reject_unselected` 可能误伤非当前来源 tag 的问题
+- 修复手动审核的事务边界，将任务读取、任务更新与图片 tag 状态更新收口到单次数据库事务中
+- 调整独立 WebUI 访问控制：移除 `?token=` URL 访问方案，改为登录页 + HttpOnly Cookie 会话，同时保留 `X-PJSK-Token` / `Authorization: Bearer`
+- 修复 `datetime.utcnow()` 兼容性告警，统一改为带时区 UTC 时间
 
 ### v0.12.1
 
