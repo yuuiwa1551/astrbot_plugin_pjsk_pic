@@ -597,7 +597,7 @@ async function loadPixivReviewImages() {
 }
 
 function parseCsvInput(value) {
-  return uniqueTexts(String(value || '').split(/[,\n，]/g));
+  return uniqueTexts(String(value || '').split(/[,\\n，]/g));
 }
 
 function selectedPixivReviewImageIds() {
