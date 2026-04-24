@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .pixiv_app_api import PixivAppAPIError, extract_offset_from_next_url, search_illusts
+from .pixiv_tag_safety import append_pixiv_safety_tags
 
 
 @dataclass
@@ -127,6 +128,8 @@ class PixivSearchService:
                 if translated_name and lowered_translated not in seen_translated and lowered_translated not in seen_raw:
                     seen_translated.add(lowered_translated)
                     translated_tags.append(translated_name)
+
+        append_pixiv_safety_tags(illust, raw_tags, translated_tags)
 
         return PixivSearchHit(
             illust_id=illust_id,

@@ -20,9 +20,14 @@ HTML_PAGE = """<!DOCTYPE html>
   <style>
     body { font-family: Arial, sans-serif; margin: 0; background: #f5f6f8; color: #222; }
     header { padding: 16px 20px; background: #3c65f5; color: white; }
-    main { padding: 16px; display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 16px; }
+    main { padding: 16px; display: block; max-width: 1280px; margin: 0 auto; }
+    main > div { display: contents; }
     section { background: white; border-radius: 10px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
-    section.wide { grid-column: 1 / -1; }
+    .page-section { display: none; }
+    .page-section.active { display: block; }
+    .page-nav { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+    .page-nav button { background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.28); }
+    .page-nav button.active { background: white; color: #2f52d6; }
     h2, h3 { margin-top: 0; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
     input, select, button { padding: 8px; border: 1px solid #d5d8df; border-radius: 8px; }
@@ -83,8 +88,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .merge-arrow { font-weight: bold; color: #3c65f5; }
     pre.json { background: #0f172a; color: #d7e2ff; padding: 10px; border-radius: 12px; overflow: auto; font-size: 12px; }
     @media (max-width: 1000px) {
-      main { grid-template-columns: 1fr; }
-      section.wide { grid-column: auto; }
+      main { padding: 12px; }
       .modal-body { grid-template-columns: 1fr; }
       .pixiv-grid { grid-template-columns: 1fr; }
       .split-grid { grid-template-columns: 1fr; }
@@ -99,14 +103,24 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
   <div class="muted" style="color:#dce4ff;">独立 WebUI：支持图库检索、Pixiv 图片审批、Pixiv 平台词管理、tag/别名管理、审核任务、采集任务与平台来源信息查看</div>
   <div class="notice" id="notice"></div>
+  <nav class="page-nav" aria-label="功能导航">
+    <button class="active" data-page-button="overview" onclick="showPage('overview')">概览</button>
+    <button data-page-button="gallery" onclick="showPage('gallery')">图片检索</button>
+    <button data-page-button="reviews" onclick="showPage('reviews')">审核任务</button>
+    <button data-page-button="jobs" onclick="showPage('jobs')">采集任务</button>
+    <button data-page-button="tags" onclick="showPage('tags')">tag 管理</button>
+    <button data-page-button="pixiv-review" onclick="showPage('pixiv-review')">Pixiv 审批</button>
+    <button data-page-button="pixiv-platform" onclick="showPage('pixiv-platform')">Pixiv 平台词</button>
+    <button data-page-button="tag-merge" onclick="showPage('tag-merge')">tag 归并</button>
+  </nav>
 </header>
 <main>
   <div>
-    <section>
+    <section class="page-section active" data-page="overview">
       <h2>概览</h2>
       <div class="stats" id="stats"></div>
     </section>
-    <section>
+    <section class="page-section" data-page="gallery">
       <h2>图片检索</h2>
       <div class="row">
         <input id="keyword" placeholder="关键词 / tag / alias" style="flex:1;" />
@@ -119,7 +133,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </section>
   </div>
   <div>
-    <section>
+    <section class="page-section" data-page="jobs">
       <h2>采集任务</h2>
       <div class="row">
         <select id="jobPlatform"><option>pixiv</option><option>x</option><option>xiaohongshu</option><option>generic</option></select>
@@ -135,7 +149,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
       <div class="list" id="jobs"></div>
     </section>
-    <section>
+    <section class="page-section" data-page="reviews">
       <h2>审核任务</h2>
       <div class="row">
         <select id="reviewStatus"><option value="">全部</option><option>pending</option><option>uncertain</option><option>rejected</option><option>approved</option><option>manual_approved</option><option>manual_rejected</option></select>
@@ -143,7 +157,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
       <div class="list" id="reviews"></div>
     </section>
-    <section>
+    <section class="page-section" data-page="tags">
       <h2>tag 管理</h2>
       <div class="row">
         <input id="tagSearch" placeholder="搜索 tag" style="flex:1;" />
@@ -163,7 +177,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="list" id="tags"></div>
     </section>
   </div>
-  <section class="wide">
+  <section class="page-section" data-page="pixiv-review">
     <h2>Pixiv 审批页</h2>
     <div class="row">
       <select id="pixivReviewStatus">
@@ -196,7 +210,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="pixiv-grid" id="pixivReviewImages"></div>
   </section>
-  <section class="wide">
+  <section class="page-section" data-page="pixiv-platform">
     <h2>Pixiv 平台词管理</h2>
     <div class="row">
       <input id="pixivPlatformTagFilter" placeholder="按主 tag 筛选，例如 初音未来" />
@@ -265,7 +279,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
   </section>
-  <section class="wide">
+  <section class="page-section" data-page="tag-merge">
     <h2>历史 tag 归并助手</h2>
     <div class="row">
       <input id="tagMergeKeyword" placeholder="按 source / target / 词搜索候选" style="flex:1;" />
@@ -354,6 +368,71 @@ const tagMergeState = {
   candidates: [],
   preview: null,
 };
+
+let currentPage = 'overview';
+const loadedPages = {};
+
+const pageLoaders = {
+  overview: [loadSummary],
+  gallery: [loadImages],
+  reviews: [loadReviews],
+  jobs: [loadJobs],
+  tags: [loadTags],
+  'pixiv-review': [loadPixivReviewImages],
+  'pixiv-platform': [loadPixivPlatformTerms, loadPixivPlatformUnresolved],
+  'tag-merge': [loadTagMergeCandidates],
+};
+
+function normalizePageName(page) {
+  return Object.prototype.hasOwnProperty.call(pageLoaders, page) ? page : 'overview';
+}
+
+function markPagesDirty(pages) {
+  for (const page of pages || []) delete loadedPages[page];
+}
+
+async function loadPageData(page, {force = false} = {}) {
+  const normalized = normalizePageName(page);
+  if (!force && loadedPages[normalized]) return;
+  const loaders = pageLoaders[normalized] || [];
+  await Promise.all(loaders.map(loader => loader()));
+  loadedPages[normalized] = true;
+}
+
+async function showPage(page, {force = false, updateHash = true} = {}) {
+  const normalized = normalizePageName(page);
+  currentPage = normalized;
+  document.querySelectorAll('.page-section').forEach(section => {
+    section.classList.toggle('active', section.dataset.page === normalized);
+  });
+  document.querySelectorAll('[data-page-button]').forEach(button => {
+    button.classList.toggle('active', button.dataset.pageButton === normalized);
+  });
+  if (updateHash && location.hash !== `#${normalized}`) {
+    history.replaceState(null, '', `#${normalized}`);
+  }
+  await loadPageData(normalized, {force});
+}
+
+async function refreshAfterReviewMutation() {
+  markPagesDirty(['overview', 'gallery', 'reviews', 'pixiv-review', 'pixiv-platform', 'tag-merge']);
+  await loadPageData(currentPage, {force: true});
+}
+
+async function refreshAfterPlatformMutation(tagName = '') {
+  markPagesDirty(['pixiv-platform', 'pixiv-review', 'tag-merge']);
+  if (currentPage === 'pixiv-platform') {
+    await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(tagName), loadPixivPlatformUnresolved()]);
+    loadedPages['pixiv-platform'] = true;
+    return;
+  }
+  await loadPageData(currentPage, {force: true});
+}
+
+async function refreshAfterTagMergeMutation() {
+  markPagesDirty(['overview', 'tags', 'pixiv-platform', 'pixiv-review', 'tag-merge']);
+  await loadPageData(currentPage, {force: true});
+}
 
 function normalizeKey(value) {
   return String(value || '').normalize('NFKC').trim().toLowerCase().replace(/\\s+/g, '');
@@ -515,7 +594,7 @@ async function loadReviews() {
 
 async function reviewDecision(reviewId, approved) {
   await fetchJson('/api/reviews/decision', {method: 'POST', body: JSON.stringify({review_id: reviewId, approved})});
-  await Promise.all([loadReviews(), loadImages(), loadSummary(), loadPixivReviewImages()]);
+  await refreshAfterReviewMutation();
   if (imagePreviewState.imageId) await refreshImagePreview();
 }
 
@@ -776,7 +855,7 @@ async function submitPixivBatchReview() {
   pixivReviewState.batchPreview = result.items || [];
   renderPixivBatchPreview();
   alert(result.message || '批量审核完成');
-  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions(), loadTagMergeCandidates()]);
+  await refreshAfterReviewMutation();
 }
 
 function buildCandidateMappingsHtml(item) {
@@ -941,7 +1020,7 @@ async function submitPixivReview(imageId) {
   delete pixivReviewState.selectedTagsByImage[imageId];
   delete pixivReviewState.selectedTermsByImage[imageId];
   closePixivPreview();
-  await Promise.all([loadPixivReviewImages(), loadImages(), loadReviews(), loadSummary(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions(), loadTagMergeCandidates()]);
+  await refreshAfterReviewMutation();
 }
 
 document.getElementById('pixivPreviewModal').addEventListener('click', (event) => {
@@ -1202,7 +1281,7 @@ async function submitPixivBulkMap() {
   alert(result.message || '批量映射完成');
   clearPixivBulkMapSelection();
   document.getElementById('pixivBulkMapTag').value = tagName;
-  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(tagName), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
+  await refreshAfterPlatformMutation(tagName);
 }
 
 async function savePixivPlatformTerm() {
@@ -1232,7 +1311,7 @@ async function savePixivPlatformTerm() {
   alert(result.message || '已保存平台词');
   document.getElementById('pixivPlatformTagFilter').value = tagName;
   resetPixivPlatformForm();
-  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(tagName), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
+  await refreshAfterPlatformMutation(tagName);
 }
 
 async function deletePixivPlatformTerm(termId) {
@@ -1243,7 +1322,7 @@ async function deletePixivPlatformTerm(termId) {
   });
   alert(result.message || '已删除平台词');
   if (pixivPlatformState.editingTermId === Number(termId || 0)) resetPixivPlatformForm();
-  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
+  await refreshAfterPlatformMutation();
 }
 
 async function quickSavePixivPlatformTerm(tagName, term, termType = 'both', source = 'pixiv_history') {
@@ -1265,7 +1344,7 @@ async function quickSavePixivPlatformTerm(tagName, term, termType = 'both', sour
   });
   alert(result.message || '已保存平台词');
   document.getElementById('pixivPlatformTagFilter').value = resolvedTag;
-  await Promise.all([loadPixivPlatformTerms(), loadPixivPlatformSuggestions(resolvedTag), loadPixivPlatformUnresolved(), loadPixivReviewImages(), loadTagMergeCandidates()]);
+  await refreshAfterPlatformMutation(resolvedTag);
 }
 
 function currentTagMergeSources() {
@@ -1382,7 +1461,7 @@ async function executeTagMerge() {
   alert(lines.join('\\n'));
   tagMergeState.preview = null;
   renderTagMergePreview();
-  await Promise.all([loadTags(), loadSummary(), loadTagMergeCandidates(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadPixivPlatformSuggestions(), loadPixivReviewImages()]);
+  await refreshAfterTagMergeMutation();
 }
 
 resetPixivPlatformForm();
@@ -1390,7 +1469,15 @@ clearPixivBulkMapSelection();
 renderPixivBatchSelectionHint();
 renderPixivBatchPreview();
 renderTagMergePreview();
-Promise.all([loadSummary(), loadImages(), loadJobs(), loadReviews(), loadTags(), loadPixivReviewImages(), loadPixivPlatformTerms(), loadPixivPlatformUnresolved(), loadTagMergeCandidates()]).catch(err => { console.error(err); alert(err.message || err); });
+renderPixivBulkMapSelectionHint();
+renderPixivBulkMapPreview();
+window.addEventListener('hashchange', () => {
+  showPage(normalizePageName(location.hash.replace(/^#/, '') || 'overview'), {updateHash: false}).catch(err => {
+    console.error(err);
+    alert(err.message || err);
+  });
+});
+showPage(normalizePageName(location.hash.replace(/^#/, '') || 'overview'), {updateHash: false}).catch(err => { console.error(err); alert(err.message || err); });
 </script>
 </body>
 </html>

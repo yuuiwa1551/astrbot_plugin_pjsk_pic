@@ -111,8 +111,8 @@
   },
   "crawl_exclude_tags": {
     "type": "string",
-    "description": "抓取时附加的 exclude tag 条件，多个值用英文逗号分隔，例如 R-18,AI。",
-    "default": "R-18,AI"
+    "description": "抓取时附加的 exclude tag 条件，多个值用英文逗号分隔，例如 R-18,R-18G,AI生成。",
+    "default": "R-18,R-18G,AI,AI生成,AI-generated"
   },
   "crawl_keep_primary_tags_only": {
     "type": "bool",

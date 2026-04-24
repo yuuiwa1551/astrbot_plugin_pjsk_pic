@@ -7,6 +7,7 @@ import urllib.parse
 from .common import BaseCrawlAdapter
 from ..models import CrawlCandidate
 from ..pixiv_app_api import PixivAppAPIError, fetch_illust_detail
+from ..pixiv_tag_safety import append_pixiv_safety_tags
 
 PIXIV_ID_PATTERN = re.compile(r"(?:artworks/|illust_id=)(\d+)")
 PIXIV_IMAGE_PATTERN = re.compile(r"https://i\.pximg\.net/[^\s\"'<>\\]+")
@@ -126,6 +127,8 @@ class PixivAdapter(BaseCrawlAdapter):
                     seen_translated.add(lowered_translated)
                     translated_tags.append(translated_name)
 
+        safety_info = append_pixiv_safety_tags(illust, raw_tags, translated_tags)
+
         all_image_urls = self._extract_api_image_urls(illust)
         image_urls = all_image_urls[: max(1, max_candidates)]
         if not image_urls:
@@ -150,6 +153,7 @@ class PixivAdapter(BaseCrawlAdapter):
                         "via": "pixiv_app_api",
                         "source_id": str(illust.get("id", illust_id) or illust_id),
                         "translated_tags": translated_tags,
+                        "pixiv_safety": safety_info,
                         "page_index": index,
                         "page_count": page_count,
                         "request_headers": self.image_request_headers(normalized_post_url, image_url),
