@@ -33,11 +33,16 @@ HTML_PAGE = """<!DOCTYPE html>
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
     .card { border: 1px solid #eceef2; border-radius: 10px; overflow: hidden; background: #fff; }
     .card img { width: 100%; height: 180px; object-fit: cover; background: #ddd; }
+    .card-thumb-wrap { position: relative; }
+    .card-thumb-wrap img { display: block; cursor: zoom-in; }
     .card .body { padding: 10px; font-size: 13px; }
     .list { display: grid; gap: 10px; }
     .item { border: 1px solid #eceef2; border-radius: 8px; padding: 10px; }
     .review-item { display: grid; grid-template-columns: 92px 1fr; gap: 10px; align-items: start; }
     .review-item img { width: 92px; height: 92px; object-fit: cover; border-radius: 8px; background: #ddd; }
+    .review-actions { display: grid; gap: 6px; margin-top: 8px; }
+    .review-action { border-top: 1px dashed #e5e7eb; padding-top: 6px; }
+    .review-action .row { margin: 6px 0 0; }
     .muted { color: #666; font-size: 12px; }
     .pill { display: inline-block; background: #eef2ff; color: #2f52d6; border-radius: 999px; padding: 2px 8px; margin: 2px 4px 2px 0; }
     .chip-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -330,6 +335,11 @@ const pixivReviewState = {
   batchPreview: [],
 };
 
+const imagePreviewState = {
+  imageId: null,
+  item: null,
+};
+
 const pixivPlatformState = {
   items: [],
   suggestionsTag: '',
@@ -370,6 +380,50 @@ function escapeAttr(value) {
   return escapeHtml(value).replace(/`/g, '&#96;');
 }
 
+const ACTIONABLE_REVIEW_STATUSES = new Set(['pending', 'uncertain', 'rejected']);
+
+function isActionableReviewTask(task) {
+  return ACTIONABLE_REVIEW_STATUSES.has(String((task || {}).status || ''));
+}
+
+function renderImageTags(tags) {
+  return (tags || []).map(tag => `<span class="pill">${escapeHtml(tag.name)}(${escapeHtml(tag.review_status)})</span>`).join('') || '<span class="muted">无</span>';
+}
+
+function renderReviewTaskActions(tasks) {
+  const activeTasks = (tasks || []).filter(isActionableReviewTask);
+  if (!activeTasks.length) return '<div class="muted">暂无待审批任务</div>';
+  return `<div class="review-actions">${activeTasks.map(task => {
+    const reviewId = Number(task.id || 0);
+    return `
+      <div class="review-action">
+        <div><strong>${escapeHtml(task.tag_name || '-')}</strong> <span class="pill">${escapeHtml(task.status || '-')}</span></div>
+        <div class="muted">${escapeHtml(task.reason || task.source_type || '')}</div>
+        <div class="row">
+          <button class="mini-btn" onclick="reviewDecision(${reviewId}, true)">通过</button>
+          <button class="mini-btn danger" onclick="reviewDecision(${reviewId}, false)">拒绝</button>
+        </div>
+      </div>
+    `;
+  }).join('')}</div>`;
+}
+
+function renderImageSources(sources) {
+  return (sources || []).map((source, index) => {
+    const extra = source.extra || {};
+    const postUrl = String(source.post_url || '');
+    const title = String(extra.title || extra.illust_title || '');
+    return `
+      <div class="item">
+        <div><strong>${escapeHtml(source.platform || `来源 ${index + 1}`)}</strong>${title ? ` · ${escapeHtml(title)}` : ''}</div>
+        <div class="muted">${escapeHtml(source.author || '-')}</div>
+        <div>${postUrl ? `<a href="${escapeAttr(postUrl)}" target="_blank" rel="noreferrer">${escapeHtml(postUrl)}</a>` : '-'}</div>
+        <div class="muted">原始 tag：${(source.raw_tags || []).map(escapeHtml).join('、') || '无'}</div>
+      </div>
+    `;
+  }).join('') || '<div class="muted">无来源</div>';
+}
+
 function renderStats(stats) {
   const items = [['图片', stats.images], ['tag', stats.tags], ['alias', stats.aliases], ['采集任务', stats.crawl_jobs], ['待审核', stats.pending_reviews]];
   document.getElementById('stats').innerHTML = items.map(([k,v]) => `<div class="stat"><div class="muted">${k}</div><div style="font-size:22px;font-weight:bold;">${v}</div></div>`).join('');
@@ -386,19 +440,27 @@ async function loadImages() {
     limit: '30'
   });
   const data = await fetchJson(`/api/images?${q.toString()}`);
-  document.getElementById('images').innerHTML = (data.items || []).map(item => `
-    <div class="card">
-      <img src="${api(`/api/image-file?image_id=${item.id}`)}" loading="lazy" />
-      <div class="body">
-        <div><strong>#${item.id}</strong> ${item.file_name}</div>
-        <div class="muted">${item.width}x${item.height} · ${item.format} · ${item.platform || 'local'}</div>
-        <div class="muted">phash: ${item.phash || '-'}</div>
-        <div class="muted">来源: ${item.post_url || '-'}</div>
-        <div class="muted">疑似重复: ${(item.similar_image_ids || []).join(', ') || '无'}</div>
-        <div>${(item.tags || []).map(t => `<span class="pill">${t.name}(${t.review_status})</span>`).join('')}</div>
+  document.getElementById('images').innerHTML = (data.items || []).map(item => {
+    const imageId = Number(item.id || 0);
+    return `
+      <div class="card">
+        <div class="card-thumb-wrap">
+          <img src="${api(`/api/image-file?image_id=${imageId}`)}" loading="lazy" onclick="openImagePreview(${imageId})" />
+          <button class="preview-btn" onclick="openImagePreview(${imageId})">预览</button>
+        </div>
+        <div class="body">
+          <div><strong>#${imageId}</strong> ${escapeHtml(item.file_name || '')}</div>
+          <div class="muted">${escapeHtml(item.width || 0)}x${escapeHtml(item.height || 0)} · ${escapeHtml(item.format || '')} · ${escapeHtml(item.platform || 'local')}</div>
+          <div class="muted">phash: ${escapeHtml(item.phash || '-')}</div>
+          <div class="muted">来源: ${item.post_url ? `<a href="${escapeAttr(item.post_url)}" target="_blank" rel="noreferrer">${escapeHtml(item.post_url)}</a>` : '-'}</div>
+          <div class="muted">疑似重复: ${(item.similar_image_ids || []).map(escapeHtml).join(', ') || '无'}</div>
+          <div>${renderImageTags(item.tags || [])}</div>
+          <div class="subheading">待审批</div>
+          ${renderReviewTaskActions(item.review_tasks || [])}
+        </div>
       </div>
-    </div>
-  `).join('') || '<div class="muted">暂无结果</div>';
+    `;
+  }).join('') || '<div class="muted">暂无结果</div>';
 }
 
 async function loadJobs() {
@@ -454,6 +516,7 @@ async function loadReviews() {
 async function reviewDecision(reviewId, approved) {
   await fetchJson('/api/reviews/decision', {method: 'POST', body: JSON.stringify({review_id: reviewId, approved})});
   await Promise.all([loadReviews(), loadImages(), loadSummary(), loadPixivReviewImages()]);
+  if (imagePreviewState.imageId) await refreshImagePreview();
 }
 
 async function loadTags() {
@@ -727,7 +790,73 @@ function buildCandidateMappingsHtml(item) {
   `).join('') || '<div class="muted">暂无候选 tag 细节</div>';
 }
 
+function renderImagePreview() {
+  const modal = document.getElementById('pixivPreviewModal');
+  const body = document.getElementById('pixivPreviewBody');
+  if (!modal.classList.contains('show') || !imagePreviewState.imageId) {
+    body.innerHTML = '';
+    return;
+  }
+  const detail = imagePreviewState.item;
+  if (!detail) {
+    body.innerHTML = '<div class="empty">正在加载图片详情...</div>';
+    return;
+  }
+  const image = detail.image || {};
+  const imageId = Number(image.id || imagePreviewState.imageId);
+  const sources = detail.sources || [];
+  const source0 = sources[0] || {};
+  const extra = source0.extra || {};
+  const title = String(extra.title || extra.illust_title || '');
+  document.getElementById('pixivPreviewTitle').textContent = `#${imageId} ${image.file_name || ''}`;
+  document.getElementById('pixivPreviewSubtitle').textContent = `${image.width || 0}x${image.height || 0} · ${source0.platform || 'local'} · ${source0.author || title || '-'}`;
+  body.innerHTML = `
+    <div class="modal-image">
+      <img src="${api(`/api/image-file?image_id=${imageId}`)}" alt="preview" />
+      <div class="subheading">文件</div>
+      <div class="item">
+        <div>${escapeHtml(image.file_name || '')}</div>
+        <div class="muted">${escapeHtml(image.format || '')} · phash: ${escapeHtml(image.phash || '-')}</div>
+        <div class="muted">疑似重复: ${(detail.similar_image_ids || []).map(escapeHtml).join(', ') || '无'}</div>
+      </div>
+    </div>
+    <div>
+      <div class="subheading">待审批</div>
+      ${renderReviewTaskActions(detail.review_tasks || [])}
+      <div class="subheading">当前 tag</div>
+      <div class="item">${renderImageTags(detail.tags || [])}</div>
+      <div class="subheading">来源</div>
+      ${renderImageSources(sources)}
+    </div>
+  `;
+}
+
+async function refreshImagePreview() {
+  const imageId = imagePreviewState.imageId;
+  if (!imageId) return;
+  imagePreviewState.item = await fetchJson(`/api/image?image_id=${imageId}`);
+  renderImagePreview();
+}
+
+async function openImagePreview(imageId) {
+  imagePreviewState.imageId = imageId;
+  imagePreviewState.item = null;
+  pixivReviewState.previewImageId = null;
+  document.getElementById('pixivPreviewModal').classList.add('show');
+  renderImagePreview();
+  try {
+    await refreshImagePreview();
+  } catch (err) {
+    closePixivPreview();
+    alert(err.message || err);
+  }
+}
+
 function renderPixivPreview() {
+  if (imagePreviewState.imageId) {
+    renderImagePreview();
+    return;
+  }
   const modal = document.getElementById('pixivPreviewModal');
   const body = document.getElementById('pixivPreviewBody');
   if (!modal.classList.contains('show') || !pixivReviewState.previewImageId) {
@@ -772,6 +901,8 @@ function renderPixivPreview() {
 }
 
 async function openPixivPreview(imageId) {
+  imagePreviewState.imageId = null;
+  imagePreviewState.item = null;
   let item = pixivReviewState.items[imageId];
   const detail = await fetchJson(`/api/pixiv-review-image?image_id=${imageId}`);
   item = detail.item || item;
@@ -785,6 +916,8 @@ async function openPixivPreview(imageId) {
 
 function closePixivPreview() {
   pixivReviewState.previewImageId = null;
+  imagePreviewState.imageId = null;
+  imagePreviewState.item = null;
   document.getElementById('pixivPreviewModal').classList.remove('show');
   renderPixivPreview();
 }
@@ -1623,6 +1756,29 @@ class GalleryWebUI:
             "sample_authors": self._dedupe_texts(list(item.get("sample_authors", []) or [])),
         }
 
+    def _build_review_task_payloads(
+        self,
+        image_id: int,
+        *,
+        statuses: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": int(row["id"]),
+                "status": str(row["status"]),
+                "reason": str(row["reason"] or ""),
+                "manual_result": str(row["manual_result"] or ""),
+                "model_result": str(row["model_result"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+                "tag_id": int(row["tag_id"]),
+                "tag_name": str(row["tag_name"]),
+                "is_character": bool(row["is_character"]),
+                "source_type": str(row["source_type"] or ""),
+            }
+            for row in self.db.get_review_tasks_for_image(image_id, statuses=statuses)
+        ]
+
     def _build_pixiv_review_item(self, image_id: int) -> dict[str, Any] | None:
         detail = self.db.get_image_detail(image_id)
         if not detail:
@@ -1645,23 +1801,7 @@ class GalleryWebUI:
                 seen_terms.add(normalized)
                 source_terms.append(self._build_source_term_payload(term, origin))
 
-        review_task_rows = self.db.get_review_tasks_for_image(image_id)
-        review_tasks = [
-            {
-                "id": int(row["id"]),
-                "status": str(row["status"]),
-                "reason": str(row["reason"] or ""),
-                "manual_result": str(row["manual_result"] or ""),
-                "model_result": str(row["model_result"] or ""),
-                "created_at": str(row["created_at"] or ""),
-                "updated_at": str(row["updated_at"] or ""),
-                "tag_id": int(row["tag_id"]),
-                "tag_name": str(row["tag_name"]),
-                "is_character": bool(row["is_character"]),
-                "source_type": str(row["source_type"] or ""),
-            }
-            for row in review_task_rows
-        ]
+        review_tasks = self._build_review_task_payloads(image_id)
 
         current_tags = [
             {
@@ -1769,12 +1909,13 @@ class GalleryWebUI:
         )
         items: list[dict] = []
         for row in rows:
-            detail = self.db.get_image_detail(int(row["id"])) or {}
+            image_id = int(row["id"])
+            detail = self.db.get_image_detail(image_id) or {}
             sources = detail.get("sources", [])
             source0 = sources[0] if sources else {}
             items.append(
                 {
-                    "id": int(row["id"]),
+                    "id": image_id,
                     "file_name": str(row["file_name"]),
                     "width": int(row["width"] or 0),
                     "height": int(row["height"] or 0),
@@ -1786,6 +1927,10 @@ class GalleryWebUI:
                     "platform": source0.get("platform", ""),
                     "post_url": source0.get("post_url", ""),
                     "similar_image_ids": source0.get("extra", {}).get("similar_image_ids", []),
+                    "review_tasks": self._build_review_task_payloads(
+                        image_id,
+                        statuses=("pending", "uncertain", "rejected"),
+                    ),
                 }
             )
         return self._json_response({"items": items})
@@ -1798,7 +1943,15 @@ class GalleryWebUI:
         detail = self.db.get_image_detail(image_id)
         if not detail:
             return self._json_response({"error": "image_not_found"}, status=404)
-        return self._json_response(detail)
+        payload = dict(detail)
+        sources = payload.get("sources", [])
+        source0 = sources[0] if sources else {}
+        payload["similar_image_ids"] = source0.get("extra", {}).get("similar_image_ids", [])
+        payload["review_tasks"] = self._build_review_task_payloads(
+            image_id,
+            statuses=("pending", "uncertain", "rejected"),
+        )
+        return self._json_response(payload)
 
     async def api_image_file(self, request: web.Request) -> web.StreamResponse:
         denied = self._check_access(request)
