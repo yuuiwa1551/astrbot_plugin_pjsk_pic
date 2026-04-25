@@ -2,6 +2,7 @@
 
 from collections import Counter
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -199,6 +200,19 @@ class ImageIndexDB:
                     FOREIGN KEY(tag_id) REFERENCES tags(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS rejected_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    post_url TEXT NOT NULL,
+                    normalized_post_url TEXT NOT NULL,
+                    source_uid TEXT DEFAULT '',
+                    image_id INTEGER DEFAULT 0,
+                    reason TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(platform, normalized_post_url)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_images_active ON images(is_active);
                 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
                 CREATE INDEX IF NOT EXISTS idx_image_files_image_id ON image_files(image_id);
@@ -211,6 +225,7 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 CREATE INDEX IF NOT EXISTS idx_platform_tag_terms_tag_id ON platform_tag_terms(tag_id, platform);
+                CREATE INDEX IF NOT EXISTS idx_rejected_sources_platform ON rejected_sources(platform, normalized_post_url);
                 """
             )
             try:
@@ -770,6 +785,8 @@ class ImageIndexDB:
 
     def get_or_create_tag(self, tag_name: str, is_character: bool | None = None) -> int:
         normalized = normalize_tag_name(tag_name)
+        if not normalized:
+            raise ValueError('tag 不能为空')
         now = utcnow_str()
         with self._lock, self._connect() as conn:
             row = conn.execute('SELECT id, is_character FROM tags WHERE normalized_name = ?', (normalized,)).fetchone()
@@ -782,6 +799,38 @@ class ImageIndexDB:
                 (tag_name.strip(), normalized, 1 if is_character else 0, now),
             )
             return int(cursor.lastrowid)
+
+    def create_or_get_tag(self, tag_name: str, is_character: bool | None = None) -> tuple[bool, dict[str, Any]]:
+        tag_text = str(tag_name or '').strip()
+        normalized = normalize_tag_name(tag_text)
+        if not tag_text or not normalized:
+            return False, {'message': 'tag 不能为空'}
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            row = conn.execute('SELECT * FROM tags WHERE normalized_name = ? LIMIT 1', (normalized,)).fetchone()
+            created = False
+            if row:
+                if is_character is True and int(row['is_character'] or 0) != 1:
+                    conn.execute('UPDATE tags SET is_character = 1 WHERE id = ?', (int(row['id']),))
+                    row = conn.execute('SELECT * FROM tags WHERE id = ? LIMIT 1', (int(row['id']),)).fetchone()
+            else:
+                cursor = conn.execute(
+                    'INSERT INTO tags(name, normalized_name, is_character, created_at) VALUES(?, ?, ?, ?)',
+                    (tag_text, normalized, 1 if is_character else 0, now),
+                )
+                row = conn.execute('SELECT * FROM tags WHERE id = ? LIMIT 1', (int(cursor.lastrowid),)).fetchone()
+                created = True
+        if not row:
+            return False, {'message': 'tag 创建失败'}
+        return True, {
+            'message': ('已新增主 tag' if created else '已复用已有主 tag'),
+            'tag': {
+                'id': int(row['id']),
+                'name': str(row['name']),
+                'is_character': bool(int(row['is_character'] or 0)),
+            },
+            'created': created,
+        }
 
     def set_tag_character(self, tag_name: str, is_character: bool) -> tuple[bool, str]:
         tag_id = self.get_tag_id(tag_name)
@@ -2640,6 +2689,85 @@ class ImageIndexDB:
                 (image_id, platform, post_url, image_url, author, json.dumps(raw_tags or [], ensure_ascii=False), json.dumps(extra_json or {}, ensure_ascii=False), utcnow_str()),
             )
 
+    @staticmethod
+    def normalize_source_post_url(platform: str, post_url: str) -> str:
+        raw_post_url = str(post_url or '').strip()
+        if not raw_post_url:
+            return ''
+        platform_text = str(platform or '').strip().lower()
+        if platform_text == 'pixiv':
+            match = re.search(r'(?:artworks/|illust_id=)(\d+)', raw_post_url)
+            if match:
+                return f'https://www.pixiv.net/artworks/{match.group(1)}'
+        return raw_post_url.rstrip('/')
+
+    @staticmethod
+    def _source_uid_from_post_url(platform: str, post_url: str) -> str:
+        platform_text = str(platform or '').strip().lower()
+        if platform_text == 'pixiv':
+            match = re.search(r'(?:artworks/|illust_id=)(\d+)', str(post_url or ''))
+            if match:
+                return match.group(1)
+        return ''
+
+    def is_rejected_source_post_url(self, post_url: str, *, platform: str = '') -> bool:
+        platform_text = str(platform or '').strip().lower()
+        normalized_post_url = self.normalize_source_post_url(platform_text, post_url)
+        if not normalized_post_url:
+            return False
+        sql = 'SELECT 1 FROM rejected_sources WHERE normalized_post_url = ?'
+        params: list[Any] = [normalized_post_url]
+        if platform_text:
+            sql += ' AND platform = ?'
+            params.append(platform_text)
+        sql += ' LIMIT 1'
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchone() is not None
+
+    def _upsert_rejected_source_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        platform: str,
+        post_url: str,
+        image_id: int = 0,
+        reason: str = '',
+        now: str | None = None,
+    ) -> sqlite3.Row:
+        platform_text = str(platform or '').strip().lower() or 'pixiv'
+        post_url_text = str(post_url or '').strip()
+        normalized_post_url = self.normalize_source_post_url(platform_text, post_url_text)
+        if not normalized_post_url:
+            raise ValueError('来源链接不能为空')
+        current_time = now or utcnow_str()
+        source_uid = self._source_uid_from_post_url(platform_text, normalized_post_url)
+        conn.execute(
+            """
+            INSERT INTO rejected_sources(platform, post_url, normalized_post_url, source_uid, image_id, reason, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, normalized_post_url) DO UPDATE SET
+                post_url = excluded.post_url,
+                source_uid = excluded.source_uid,
+                image_id = CASE WHEN excluded.image_id > 0 THEN excluded.image_id ELSE rejected_sources.image_id END,
+                reason = excluded.reason,
+                updated_at = excluded.updated_at
+            """,
+            (
+                platform_text,
+                post_url_text or normalized_post_url,
+                normalized_post_url,
+                source_uid,
+                int(image_id or 0),
+                str(reason or '').strip(),
+                current_time,
+                current_time,
+            ),
+        )
+        return conn.execute(
+            'SELECT * FROM rejected_sources WHERE platform = ? AND normalized_post_url = ? LIMIT 1',
+            (platform_text, normalized_post_url),
+        ).fetchone()
+
     def has_source_post_url(self, post_url: str, *, platform: str = '') -> bool:
         raw_post_url = str(post_url or '').strip()
         if not raw_post_url:
@@ -2653,6 +2781,75 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             row = conn.execute(sql, params).fetchone()
             return row is not None
+
+    def reject_image_source(
+        self,
+        image_id: int,
+        *,
+        platform: str = 'pixiv',
+        reason: str = '',
+    ) -> tuple[bool, dict[str, Any]]:
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        now = utcnow_str()
+        rejected_reason = str(reason or '').strip() or f'{platform_text} 人工拒绝图片'
+        with self._lock, self._connect() as conn:
+            image = conn.execute('SELECT id FROM images WHERE id = ? AND is_active = 1 LIMIT 1', (int(image_id),)).fetchone()
+            if not image:
+                return False, {'message': f'图片不存在：{image_id}'}
+            source = conn.execute(
+                """
+                SELECT post_url
+                FROM sources
+                WHERE image_id = ? AND platform = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(image_id), platform_text),
+            ).fetchone()
+            if not source:
+                return False, {'message': f'图片 #{image_id} 没有 {platform_text} 来源记录。'}
+
+            rejected_source = self._upsert_rejected_source_conn(
+                conn,
+                platform=platform_text,
+                post_url=str(source['post_url'] or ''),
+                image_id=int(image_id),
+                reason=rejected_reason,
+                now=now,
+            )
+            tasks = conn.execute(
+                """
+                SELECT rt.id, t.name AS tag_name
+                FROM review_tasks rt
+                JOIN tags t ON t.id = rt.tag_id
+                WHERE rt.image_id = ?
+                """,
+                (int(image_id),),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE review_tasks
+                SET status = 'manual_rejected', manual_result = 'rejected', reason = ?, updated_at = ?
+                WHERE image_id = ?
+                """,
+                (rejected_reason, now, int(image_id)),
+            )
+            cursor = conn.execute(
+                """
+                UPDATE image_tags
+                SET review_status = 'manual_rejected', review_reason = ?, updated_at = ?
+                WHERE image_id = ?
+                """,
+                (rejected_reason, now, int(image_id)),
+            )
+
+        return True, {
+            'message': f'已拒绝图片 #{image_id}，后续 Pixiv 来源搜图会跳过该作品',
+            'image_id': int(image_id),
+            'post_url': str(rejected_source['normalized_post_url'] or source['post_url']),
+            'rejected_tasks': [str(row['tag_name']) for row in tasks],
+            'rejected_tag_links': int(cursor.rowcount if cursor.rowcount is not None else 0),
+        }
 
     def create_crawl_job(
         self,

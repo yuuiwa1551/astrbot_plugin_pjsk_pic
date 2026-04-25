@@ -72,6 +72,7 @@ class AutoCrawlService:
                 "queued": 0,
                 "matched": 0,
                 "skipped_existing": 0,
+                "skipped_rejected": 0,
                 "skipped_filtered": 0,
                 "errors": 0,
             }
@@ -99,7 +100,7 @@ class AutoCrawlService:
                     )
                     logger.warning(f"[PJSKPic] Pixiv ?????? #{row['id']} ????: {exc}", exc_info=True)
                     continue
-                for key in ("queued", "matched", "skipped_existing", "skipped_filtered"):
+                for key in ("queued", "matched", "skipped_existing", "skipped_rejected", "skipped_filtered"):
                     summary[key] += int(result.get(key, 0) or 0)
                 remaining_jobs -= int(result.get("queued", 0) or 0)
             return summary
@@ -153,7 +154,7 @@ class AutoCrawlService:
     async def _process_subscription(self, row, *, remaining_jobs: int) -> dict[str, int]:
         tag_name = str(row["tag_name"] or "").strip()
         if not tag_name:
-            return {"queued": 0, "matched": 0, "skipped_existing": 0, "skipped_filtered": 0}
+            return {"queued": 0, "matched": 0, "skipped_existing": 0, "skipped_rejected": 0, "skipped_filtered": 0}
 
         query_terms = self.db.get_platform_terms_for_tag(
             tag_name=tag_name,
@@ -187,6 +188,7 @@ class AutoCrawlService:
         matched = 0
         skipped_filtered = 0
         skipped_existing = 0
+        skipped_rejected = 0
 
         for hit in hits:
             if last_seen_source_uid and hit.illust_id == last_seen_source_uid:
@@ -195,6 +197,9 @@ class AutoCrawlService:
                 skipped_filtered += 1
                 continue
             matched += 1
+            if self.db.is_rejected_source_post_url(hit.post_url, platform="pixiv"):
+                skipped_rejected += 1
+                continue
             if self.db.has_source_post_url(hit.post_url, platform="pixiv"):
                 skipped_existing += 1
                 continue
@@ -226,6 +231,7 @@ class AutoCrawlService:
             "queued": queued,
             "matched": matched,
             "skipped_existing": skipped_existing,
+            "skipped_rejected": skipped_rejected,
             "skipped_filtered": skipped_filtered,
         }
 

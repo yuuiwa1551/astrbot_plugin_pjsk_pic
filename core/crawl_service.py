@@ -61,6 +61,8 @@ class CrawlService:
         normalized_platform = CrawlAdapterFactory.normalize_platform(platform)
         if not CrawlAdapterFactory.supports(normalized_platform):
             raise ValueError(f"暂不支持的平台：{platform}")
+        if self.db.is_rejected_source_post_url(source_url, platform=normalized_platform):
+            raise ValueError(f"该来源已被人工拒绝，已跳过：{source_url}")
         job_id = self.db.create_crawl_job(
             normalized_platform,
             source_url,

@@ -57,6 +57,9 @@ HTML_PAGE = """<!DOCTYPE html>
     .chip.unresolved { border-style: dashed; }
     .notice { margin-top: 8px; font-size: 12px; color: #dce4ff; }
     .subheading { font-size: 12px; color: #666; margin: 10px 0 6px; }
+    .subheading-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 0 6px; }
+    .subheading-row .subheading { margin: 0; }
+    .inline-form { border: 1px dashed #d8def5; border-radius: 10px; padding: 8px; background: #f8faff; }
     .tag-block { border: 1px dashed #e5e7eb; border-radius: 10px; padding: 10px; }
     .empty { padding: 20px 0; text-align: center; color: #666; }
     .pixiv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
@@ -363,6 +366,7 @@ const pixivReviewState = {
   selectedImages: {},
   previewImageId: null,
   batchPreview: [],
+  manualTagFormImageId: null,
 };
 
 const imagePreviewState = {
@@ -698,6 +702,73 @@ function resetPixivReviewSelection(imageId) {
   renderPixivPreview();
 }
 
+function togglePixivManualTagForm(imageId) {
+  pixivReviewState.manualTagFormImageId = pixivReviewState.manualTagFormImageId === imageId ? null : imageId;
+  renderPixivReviewList();
+  renderPixivPreview();
+}
+
+function renderPixivManualTagForm(imageId) {
+  if (pixivReviewState.manualTagFormImageId !== imageId) return '';
+  return `
+    <div class="row inline-form">
+      <input id="pixivNewTagName-${imageId}" placeholder="新增主 tag" style="flex:1;" />
+      <label class="muted"><input id="pixivNewTagCharacter-${imageId}" type="checkbox" checked /> 角色</label>
+      <button class="mini-btn" onclick="createPixivReviewMainTag(${imageId})">添加</button>
+      <button class="secondary mini-btn" onclick="togglePixivManualTagForm(${imageId})">取消</button>
+    </div>
+  `;
+}
+
+function renderCandidateTagSection(item, selectedTags) {
+  const imageId = item.image_id;
+  const chips = (item.candidate_tags || [])
+    .map(tag => renderCandidateTagChip(imageId, tag, selectedTags.some(name => normalizeKey(name) === normalizeKey(tag.name))))
+    .join('') || '<span class="muted">暂无候选主 tag</span>';
+  return `
+    <div class="subheading-row">
+      <div class="subheading">候选主 tag</div>
+      <button class="secondary mini-btn" title="新增主 tag" onclick="togglePixivManualTagForm(${imageId})">+</button>
+    </div>
+    ${renderPixivManualTagForm(imageId)}
+    <div class="chip-row">${chips}</div>
+  `;
+}
+
+async function createPixivReviewMainTag(imageId) {
+  const input = document.getElementById(`pixivNewTagName-${imageId}`);
+  const checkbox = document.getElementById(`pixivNewTagCharacter-${imageId}`);
+  const tagName = input ? input.value.trim() : '';
+  if (!tagName) {
+    showToast('请先填写主 tag');
+    return;
+  }
+  const result = await fetchJson('/api/tag/create', {
+    method: 'POST',
+    body: JSON.stringify({
+      tag_name: tagName,
+      is_character: checkbox ? checkbox.checked : true,
+    }),
+  });
+  const tag = result.tag || {name: tagName, is_character: checkbox ? checkbox.checked : true};
+  const item = pixivReviewState.items[imageId];
+  if (item) {
+    const currentCandidates = item.candidate_tags || [];
+    if (!currentCandidates.some(candidate => normalizeKey(candidate.name) === normalizeKey(tag.name))) {
+      item.candidate_tags = [...currentCandidates, tag];
+    }
+  }
+  pixivReviewState.selectedTagsByImage[imageId] = uniqueTexts([
+    ...(pixivReviewState.selectedTagsByImage[imageId] || []),
+    tag.name,
+  ]);
+  pixivReviewState.manualTagFormImageId = null;
+  markPagesDirty(['tags', 'pixiv-platform']);
+  renderPixivReviewList();
+  renderPixivPreview();
+  showToast(result.message || '已添加主 tag', tag.name || tagName);
+}
+
 function toggleCandidateTag(imageId, tagName) {
   const current = uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []);
   const key = normalizeKey(tagName);
@@ -756,14 +827,14 @@ function renderPixivReviewCard(item) {
         <div class="tag-block">
           <div class="subheading">当前审核项</div>
           <div>${(item.review_tasks || []).map(task => `<span class="pill">${escapeHtml(task.tag_name)}(${escapeHtml(task.status)})</span>`).join('') || '<span class="muted">无</span>'}</div>
-          <div class="subheading">候选主 tag</div>
-          <div class="chip-row">${(item.candidate_tags || []).map(tag => renderCandidateTagChip(imageId, tag, selectedTags.some(name => normalizeKey(name) === normalizeKey(tag.name)))).join('') || '<span class="muted">暂无候选主 tag</span>'}</div>
+          ${renderCandidateTagSection(item, selectedTags)}
           <div class="subheading">Pixiv 来源 tag</div>
           <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
           <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
         </div>
         <div class="pixiv-actions">
           <button onclick="submitPixivReview(${imageId})">确认审核</button>
+          <button class="danger" onclick="rejectPixivReviewImage(${imageId})">拒绝图片</button>
           <button class="secondary" onclick="resetPixivReviewSelection(${imageId})">重置</button>
         </div>
       </div>
@@ -1020,13 +1091,13 @@ function renderPixivPreview() {
       <pre class="json">${escapeHtml(JSON.stringify({raw_tags: item.raw_tags || [], translated_tags: item.translated_tags || []}, null, 2))}</pre>
     </div>
     <div>
-      <div class="subheading">候选主 tag</div>
-      <div class="chip-row">${(item.candidate_tags || []).map(tag => renderCandidateTagChip(imageId, tag, selectedTags.some(name => normalizeKey(name) === normalizeKey(tag.name)))).join('') || '<span class="muted">暂无候选主 tag</span>'}</div>
+      ${renderCandidateTagSection(item, selectedTags)}
       <div class="subheading">Pixiv 来源 tag</div>
       <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
       <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
       <div class="row">
         <button onclick="submitPixivReview(${imageId})">确认审核</button>
+        <button class="danger" onclick="rejectPixivReviewImage(${imageId})">拒绝图片</button>
         <button class="secondary" onclick="resetPixivReviewSelection(${imageId})">重置</button>
       </div>
       <div class="subheading">Pixiv 映射信息</div>
@@ -1079,6 +1150,23 @@ async function submitPixivReview(imageId) {
     removePixivImageIds: [imageId],
     toastMessage: result.message || '已完成审核',
     toastDetail: [mappedText ? `已沉淀：${mappedText}` : '', skippedText ? `未沉淀：${skippedText}` : '已从当前审批队列移除。'].filter(Boolean).join('；'),
+  });
+}
+
+async function rejectPixivReviewImage(imageId) {
+  if (!confirm(`确认拒绝图片 #${imageId} 吗？该 Pixiv 来源后续自动搜图会跳过。`)) return;
+  const result = await fetchJson('/api/pixiv-review/reject-image', {
+    method: 'POST',
+    body: JSON.stringify({image_id: imageId}),
+  });
+  delete pixivReviewState.selectedTagsByImage[imageId];
+  delete pixivReviewState.selectedTermsByImage[imageId];
+  delete pixivReviewState.selectedImages[imageId];
+  closePixivPreview();
+  await refreshAfterReviewMutation({
+    removePixivImageIds: [imageId],
+    toastMessage: result.message || '已拒绝图片',
+    toastDetail: result.post_url ? `已记录跳过来源：${result.post_url}` : '已从当前审批队列移除。',
   });
 }
 
@@ -1645,6 +1733,7 @@ class GalleryWebUI:
                 web.get("/api/pixiv-review-images", self.api_pixiv_review_images),
                 web.get("/api/pixiv-review-image", self.api_pixiv_review_image),
                 web.post("/api/pixiv-review/submit", self.api_pixiv_review_submit),
+                web.post("/api/pixiv-review/reject-image", self.api_pixiv_review_reject_image),
                 web.post("/api/pixiv-review/batch-preview", self.api_pixiv_review_batch_preview),
                 web.post("/api/pixiv-review/batch-submit", self.api_pixiv_review_batch_submit),
                 web.get("/api/pixiv-platform-terms", self.api_pixiv_platform_terms),
@@ -1658,6 +1747,7 @@ class GalleryWebUI:
                 web.post("/api/tag-merge/preview", self.api_tag_merge_preview),
                 web.post("/api/tag-merge/execute", self.api_tag_merge_execute),
                 web.post("/api/reviews/decision", self.api_review_decision),
+                web.post("/api/tag/create", self.api_tag_create),
                 web.post("/api/tag/alias", self.api_tag_alias),
                 web.delete("/api/tag/alias", self.api_tag_alias),
                 web.post("/api/tag/character", self.api_tag_character),
@@ -2235,6 +2325,23 @@ class GalleryWebUI:
             payload["message"] = str(result)
         return self._json_response(payload, status=(200 if ok else 400))
 
+    async def api_pixiv_review_reject_image(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        ok, result = self.db.reject_image_source(
+            int(data.get("image_id", 0) or 0),
+            platform="pixiv",
+            reason=str(data.get("reason", "") or "").strip(),
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        return self._json_response(payload, status=(200 if ok else 400))
+
     async def api_pixiv_review_batch_preview(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
         if denied is not None:
@@ -2491,6 +2598,26 @@ class GalleryWebUI:
             approved=bool(data.get("approved", False)),
         )
         return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
+
+    async def api_tag_create(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        ok, result = self.db.create_or_get_tag(
+            str(data.get("tag_name", "") or "").strip(),
+            is_character=bool(data.get("is_character", True)),
+        )
+        payload = {"ok": ok}
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["message"] = str(result)
+        if ok and payload.get("tag"):
+            tag_payload = self._build_candidate_tag_payload(str(payload["tag"].get("name", "")))
+            if tag_payload:
+                payload["tag"] = tag_payload
+        return self._json_response(payload, status=(200 if ok else 400))
 
     async def api_tag_alias(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
