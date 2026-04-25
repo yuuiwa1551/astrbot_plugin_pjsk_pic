@@ -2926,13 +2926,13 @@ class ImageIndexDB:
         limit: int = 20,
         offset: int = 0,
     ) -> list[sqlite3.Row]:
-        normalized_statuses = [str(item).strip() for item in (statuses or ['pending', 'uncertain', 'rejected']) if str(item).strip()]
+        normalized_statuses = [str(item).strip() for item in (statuses or ['pending', 'uncertain']) if str(item).strip()]
         sql = """
             SELECT i.id AS image_id,
                    MAX(rt.id) AS latest_review_id,
                    MAX(rt.updated_at) AS latest_updated_at,
                    COUNT(DISTINCT rt.id) AS review_task_count,
-                   COUNT(DISTINCT CASE WHEN rt.status IN ('pending', 'uncertain', 'rejected') THEN rt.id END) AS pending_task_count
+                   COUNT(DISTINCT CASE WHEN rt.status IN ('pending', 'uncertain') THEN rt.id END) AS pending_task_count
             FROM review_tasks rt
             JOIN images i ON i.id = rt.image_id
             WHERE i.is_active = 1

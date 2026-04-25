@@ -86,6 +86,9 @@ HTML_PAGE = """<!DOCTYPE html>
     .toolbar-box { border: 1px dashed #d8def5; border-radius: 12px; padding: 12px; margin-bottom: 14px; background: #f8faff; }
     .preview-box { border: 1px solid #eceef2; border-radius: 10px; padding: 12px; background: #fbfcff; }
     .merge-arrow { font-weight: bold; color: #3c65f5; }
+    .toast { position: fixed; right: 18px; bottom: 18px; z-index: 1200; max-width: min(420px, calc(100vw - 36px)); background: #15223b; color: white; border-radius: 10px; padding: 12px 14px; box-shadow: 0 12px 32px rgba(15,23,42,.26); opacity: 0; transform: translateY(8px); pointer-events: none; transition: opacity .16s ease, transform .16s ease; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast .muted { color: #c9d5ef; }
     pre.json { background: #0f172a; color: #d7e2ff; padding: 10px; border-radius: 12px; overflow: auto; font-size: 12px; }
     @media (max-width: 1000px) {
       main { padding: 12px; }
@@ -181,10 +184,11 @@ HTML_PAGE = """<!DOCTYPE html>
     <h2>Pixiv 审批页</h2>
     <div class="row">
       <select id="pixivReviewStatus">
-        <option value="">全部待处理</option>
-        <option value="pending">pending</option>
-        <option value="uncertain">uncertain</option>
-        <option value="rejected">rejected</option>
+        <option value="pending,uncertain">待处理（pending / uncertain）</option>
+        <option value="pending">仅 pending</option>
+        <option value="uncertain">仅 uncertain</option>
+        <option value="rejected">仅 rejected</option>
+        <option value="pending,uncertain,rejected">待处理 + rejected</option>
       </select>
       <button onclick="loadPixivReviewImages()">刷新 Pixiv 审批</button>
       <span class="muted">点击来源 tag 可勾选本次要沉淀的 Pixiv 词；点击候选主 tag 可确认最终入库 tag。</span>
@@ -317,8 +321,20 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="modal-body" id="pixivPreviewBody"></div>
   </div>
 </div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script>
 document.getElementById('notice').textContent = '当前使用站点会话访问；如需切换账户，可点击右上角退出登录。';
+
+let toastTimer = null;
+
+function showToast(message, detail = '') {
+  const toast = document.getElementById('toast');
+  if (!toast) return;
+  if (toastTimer) clearTimeout(toastTimer);
+  toast.innerHTML = `<div>${escapeHtml(message || '')}</div>${detail ? `<div class="muted">${escapeHtml(detail)}</div>` : ''}`;
+  toast.classList.add('show');
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 3600);
+}
 
 function api(path) {
   return new URL(path, location.origin).toString();
@@ -414,8 +430,43 @@ async function showPage(page, {force = false, updateHash = true} = {}) {
   await loadPageData(normalized, {force});
 }
 
-async function refreshAfterReviewMutation() {
+function removePixivReviewImageFromQueue(imageId) {
+  const key = Number(imageId || 0);
+  if (!key || !pixivReviewState.items[key]) return false;
+  delete pixivReviewState.items[key];
+  delete pixivReviewState.selectedTagsByImage[key];
+  delete pixivReviewState.selectedTermsByImage[key];
+  delete pixivReviewState.selectedImages[key];
+  if (pixivReviewState.previewImageId === key) closePixivPreview();
+  renderPixivReviewList();
+  renderPixivBatchPreview();
+  return true;
+}
+
+function prunePixivReviewSelections() {
+  const currentIds = new Set(Object.keys(pixivReviewState.items || {}).map(Number));
+  for (const key of Object.keys(pixivReviewState.selectedImages || {})) {
+    if (!currentIds.has(Number(key))) delete pixivReviewState.selectedImages[key];
+  }
+  for (const key of Object.keys(pixivReviewState.selectedTagsByImage || {})) {
+    if (!currentIds.has(Number(key))) delete pixivReviewState.selectedTagsByImage[key];
+  }
+  for (const key of Object.keys(pixivReviewState.selectedTermsByImage || {})) {
+    if (!currentIds.has(Number(key))) delete pixivReviewState.selectedTermsByImage[key];
+  }
+}
+
+async function refreshAfterReviewMutation({removePixivImageIds = [], toastMessage = '', toastDetail = ''} = {}) {
+  const removed = [];
+  for (const imageId of removePixivImageIds || []) {
+    if (removePixivReviewImageFromQueue(imageId)) removed.push(Number(imageId));
+  }
+  if (toastMessage) showToast(toastMessage, toastDetail);
   markPagesDirty(['overview', 'gallery', 'reviews', 'pixiv-review', 'pixiv-platform', 'tag-merge']);
+  if (currentPage === 'pixiv-review' && removed.length) {
+    loadSummary().catch(err => console.error(err));
+    return;
+  }
   await loadPageData(currentPage, {force: true});
 }
 
@@ -593,8 +644,8 @@ async function loadReviews() {
 }
 
 async function reviewDecision(reviewId, approved) {
-  await fetchJson('/api/reviews/decision', {method: 'POST', body: JSON.stringify({review_id: reviewId, approved})});
-  await refreshAfterReviewMutation();
+  const result = await fetchJson('/api/reviews/decision', {method: 'POST', body: JSON.stringify({review_id: reviewId, approved})});
+  await refreshAfterReviewMutation({toastMessage: result.message || '审核任务已更新'});
   if (imagePreviewState.imageId) await refreshImagePreview();
 }
 
@@ -722,7 +773,7 @@ function renderPixivReviewCard(item) {
 
 function renderPixivReviewList() {
   const items = Object.values(pixivReviewState.items).sort((a, b) => (b.image_id || 0) - (a.image_id || 0));
-  document.getElementById('pixivReviewImages').innerHTML = items.length ? items.map(renderPixivReviewCard).join('') : '<div class="empty">暂无 Pixiv 待审图片</div>';
+  document.getElementById('pixivReviewImages').innerHTML = items.length ? items.map(renderPixivReviewCard).join('') : '<div class="empty">当前筛选没有 Pixiv 待审图片</div>';
   renderPixivBatchSelectionHint();
 }
 
@@ -734,6 +785,7 @@ async function loadPixivReviewImages() {
     pixivReviewState.items[item.image_id] = item;
     ensurePixivReviewSelection(item);
   }
+  prunePixivReviewSelections();
   renderPixivReviewList();
   renderPixivPreview();
 }
@@ -852,10 +904,14 @@ async function submitPixivBatchReview() {
       reject_unselected: document.getElementById('pixivBatchRejectUnselected').checked,
     }),
   });
+  const reviewedImageIds = items.map(item => Number(item.image_id || 0)).filter(Boolean);
   pixivReviewState.batchPreview = result.items || [];
   renderPixivBatchPreview();
-  alert(result.message || '批量审核完成');
-  await refreshAfterReviewMutation();
+  await refreshAfterReviewMutation({
+    removePixivImageIds: reviewedImageIds,
+    toastMessage: result.message || '批量审核完成',
+    toastDetail: '已从当前审批队列移除。',
+  });
 }
 
 function buildCandidateMappingsHtml(item) {
@@ -1016,11 +1072,14 @@ async function submitPixivReview(imageId) {
   const result = await fetchJson('/api/pixiv-review/submit', {method: 'POST', body: JSON.stringify(payload)});
   const mappedText = (result.mapped_terms || []).map(item => `${item.term}→${item.tag_name}`).join('、');
   const skippedText = (result.skipped_terms || []).join('；');
-  alert([result.message || '已完成审核', mappedText ? `已沉淀：${mappedText}` : '', skippedText ? `未沉淀：${skippedText}` : ''].filter(Boolean).join('\\n'));
   delete pixivReviewState.selectedTagsByImage[imageId];
   delete pixivReviewState.selectedTermsByImage[imageId];
   closePixivPreview();
-  await refreshAfterReviewMutation();
+  await refreshAfterReviewMutation({
+    removePixivImageIds: [imageId],
+    toastMessage: result.message || '已完成审核',
+    toastDetail: [mappedText ? `已沉淀：${mappedText}` : '', skippedText ? `未沉淀：${skippedText}` : '已从当前审批队列移除。'].filter(Boolean).join('；'),
+  });
 }
 
 document.getElementById('pixivPreviewModal').addEventListener('click', (event) => {
@@ -1866,7 +1925,12 @@ class GalleryWebUI:
             for row in self.db.get_review_tasks_for_image(image_id, statuses=statuses)
         ]
 
-    def _build_pixiv_review_item(self, image_id: int) -> dict[str, Any] | None:
+    def _build_pixiv_review_item(
+        self,
+        image_id: int,
+        *,
+        review_statuses: tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
         detail = self.db.get_image_detail(image_id)
         if not detail:
             return None
@@ -1888,7 +1952,7 @@ class GalleryWebUI:
                 seen_terms.add(normalized)
                 source_terms.append(self._build_source_term_payload(term, origin))
 
-        review_tasks = self._build_review_task_payloads(image_id)
+        review_tasks = self._build_review_task_payloads(image_id, statuses=review_statuses)
 
         current_tags = [
             {
@@ -2122,14 +2186,15 @@ class GalleryWebUI:
             return denied
         args = request.query
         statuses = [item.strip() for item in str(args.get("status", "") or "").split(",") if item.strip()]
+        effective_statuses = tuple(statuses or ["pending", "uncertain"])
         rows = self.db.list_pixiv_review_images(
-            statuses=statuses or None,
+            statuses=effective_statuses,
             limit=min(max(int(args.get("limit", 24) or 24), 1), 100),
             offset=max(int(args.get("offset", 0) or 0), 0),
         )
         items: list[dict[str, Any]] = []
         for row in rows:
-            item = self._build_pixiv_review_item(int(row["image_id"]))
+            item = self._build_pixiv_review_item(int(row["image_id"]), review_statuses=effective_statuses)
             if item:
                 items.append(item)
         return self._json_response({"items": items})
