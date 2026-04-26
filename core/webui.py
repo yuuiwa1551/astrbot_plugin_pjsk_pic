@@ -1161,7 +1161,6 @@ async function submitPixivReview(imageId) {
 }
 
 async function rejectPixivReviewImage(imageId) {
-  if (!confirm(`确认拒绝图片 #${imageId} 吗？该 Pixiv 来源后续自动搜图会跳过。`)) return;
   const result = await fetchJson('/api/pixiv-review/reject-image', {
     method: 'POST',
     body: JSON.stringify({image_id: imageId}),
