@@ -194,7 +194,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <option value="pending,uncertain,rejected">待处理 + rejected</option>
       </select>
       <button onclick="loadPixivReviewImages()">刷新 Pixiv 审批</button>
-      <span class="muted">点击来源 tag 可勾选本次要沉淀的 Pixiv 词；点击候选主 tag 可确认最终入库 tag。</span>
+      <span class="muted">先单选归入主 tag；再多选来源 tag 作为 alias / Pixiv 搜索词沉淀。</span>
     </div>
     <div class="toolbar-box">
       <div class="row">
@@ -204,8 +204,8 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="secondary" onclick="clearSelectedPixivReviewImages()">清空已选</button>
       </div>
       <div class="row">
-        <input id="pixivBatchTags" placeholder="批量主 tag，逗号分隔；留空时使用每张图当前已选主 tag" style="flex:1;" />
-        <input id="pixivBatchSourceTerms" placeholder="批量来源词，逗号分隔；留空时使用每张图当前已选来源词" style="flex:1;" />
+        <input id="pixivBatchTags" placeholder="批量归入主 tag；多个时第 1 个为主 tag，其余作为别名词" style="flex:1;" />
+        <input id="pixivBatchSourceTerms" placeholder="批量 alias / Pixiv 来源词，逗号分隔；留空时使用每张图当前已选来源词" style="flex:1;" />
         <label class="muted"><input id="pixivBatchRejectUnselected" type="checkbox" checked /> 拒绝未选 tag</label>
       </div>
       <div class="row">
@@ -685,7 +685,9 @@ function ensurePixivReviewSelection(item) {
   const imageId = item.image_id;
   if (!pixivReviewState.selectedTagsByImage[imageId]) {
     const defaults = uniqueTexts((item.review_tasks || []).filter(task => task.status !== 'manual_rejected').map(task => task.tag_name));
-    pixivReviewState.selectedTagsByImage[imageId] = defaults.length ? defaults : uniqueTexts((item.candidate_tags || []).slice(0, 1).map(tag => tag.name));
+    const candidates = uniqueTexts((item.candidate_tags || []).slice(0, 1).map(tag => tag.name));
+    const canonical = defaults.length ? defaults[0] : (candidates[0] || '');
+    pixivReviewState.selectedTagsByImage[imageId] = canonical ? [canonical] : [];
   }
   if (!pixivReviewState.selectedTermsByImage[imageId]) {
     pixivReviewState.selectedTermsByImage[imageId] = [];
@@ -727,12 +729,13 @@ function renderPixivManualTagForm(imageId, surface) {
 
 function renderCandidateTagSection(item, selectedTags, surface = 'card') {
   const imageId = item.image_id;
+  const canonicalTag = uniqueTexts(selectedTags || [])[0] || '';
   const chips = (item.candidate_tags || [])
-    .map(tag => renderCandidateTagChip(imageId, tag, selectedTags.some(name => normalizeKey(name) === normalizeKey(tag.name))))
-    .join('') || '<span class="muted">暂无候选主 tag</span>';
+    .map(tag => renderCandidateTagChip(imageId, tag, normalizeKey(canonicalTag) === normalizeKey(tag.name)))
+    .join('') || '<span class="muted">暂无可归入主 tag</span>';
   return `
     <div class="subheading-row">
-      <div class="subheading">候选主 tag</div>
+      <div class="subheading">归入主 tag（单选）</div>
       <button class="secondary mini-btn" title="新增主 tag" onclick="togglePixivManualTagForm(${imageId})">+</button>
     </div>
     ${renderPixivManualTagForm(imageId, surface)}
@@ -765,10 +768,7 @@ async function createPixivReviewMainTag(imageId, surface = 'card') {
       item.candidate_tags = [...currentCandidates, tag];
     }
   }
-  pixivReviewState.selectedTagsByImage[imageId] = uniqueTexts([
-    ...(pixivReviewState.selectedTagsByImage[imageId] || []),
-    tag.name,
-  ]);
+  pixivReviewState.selectedTagsByImage[imageId] = [tag.name];
   pixivReviewState.manualTagFormImageId = null;
   markPagesDirty(['tags', 'pixiv-platform']);
   renderPixivReviewList();
@@ -779,8 +779,9 @@ async function createPixivReviewMainTag(imageId, surface = 'card') {
 function toggleCandidateTag(imageId, tagName) {
   const current = uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []);
   const key = normalizeKey(tagName);
-  const exists = current.some(item => normalizeKey(item) === key);
-  pixivReviewState.selectedTagsByImage[imageId] = exists ? current.filter(item => normalizeKey(item) !== key) : [...current, tagName];
+  const canonical = current[0] || '';
+  const exists = normalizeKey(canonical) === key;
+  pixivReviewState.selectedTagsByImage[imageId] = exists ? [] : [tagName];
   renderPixivReviewList();
   renderPixivPreview();
 }
@@ -792,8 +793,8 @@ function toggleSourceTerm(imageId, term, resolvedTagName) {
   pixivReviewState.selectedTermsByImage[imageId] = exists ? current.filter(item => normalizeKey(item) !== key) : [...current, term];
   if (!exists && resolvedTagName) {
     const selectedTags = uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []);
-    if (!selectedTags.some(item => normalizeKey(item) === normalizeKey(resolvedTagName))) {
-      pixivReviewState.selectedTagsByImage[imageId] = [...selectedTags, resolvedTagName];
+    if (!selectedTags.length) {
+      pixivReviewState.selectedTagsByImage[imageId] = [resolvedTagName];
     }
   }
   renderPixivReviewList();
@@ -835,9 +836,9 @@ function renderPixivReviewCard(item) {
           <div class="subheading">当前审核项</div>
           <div>${(item.review_tasks || []).map(task => `<span class="pill">${escapeHtml(task.tag_name)}(${escapeHtml(task.status)})</span>`).join('') || '<span class="muted">无</span>'}</div>
           ${renderCandidateTagSection(item, selectedTags, 'card')}
-          <div class="subheading">Pixiv 来源 tag</div>
+          <div class="subheading">alias / Pixiv 来源词</div>
           <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
-          <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
+          <div class="muted">归入主 tag：${escapeHtml((uniqueTexts(selectedTags)[0] || '无'))}；alias / 搜索词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
         </div>
         <div class="pixiv-actions">
           <button onclick="submitPixivReview(${imageId})">确认审核</button>
@@ -912,7 +913,7 @@ function applyBatchTagsToSelectedImages() {
   const tags = parseCsvInput(document.getElementById('pixivBatchTags').value);
   const terms = parseCsvInput(document.getElementById('pixivBatchSourceTerms').value);
   if (!tags.length && !terms.length) {
-    alert('请至少填写批量主 tag 或批量来源词。');
+    alert('请至少填写批量归入主 tag 或 alias / 来源词。');
     return;
   }
   for (const imageId of imageIds) {
@@ -943,8 +944,8 @@ function renderPixivBatchPreview() {
     return `
       <div class="item">
         <div><strong>#${item.image_id}</strong></div>
-        <div class="muted">通过：${(item.approved_tags || []).map(escapeHtml).join('、') || '无'}；拒绝：${(item.rejected_tags || []).map(escapeHtml).join('、') || '无'}</div>
-        <div class="muted">映射：${(item.mapped_terms || []).map(term => `${escapeHtml(term.term)}→${escapeHtml(term.tag_name)}${term.action === 'already' ? '(已存在)' : ''}`).join('、') || '无'}</div>
+        <div class="muted">归入：${(item.approved_tags || []).map(escapeHtml).join('、') || '无'}；拒绝：${(item.rejected_tags || []).map(escapeHtml).join('、') || '无'}</div>
+        <div class="muted">alias / 搜索词：${(item.mapped_terms || []).map(term => `${escapeHtml(term.term)}→${escapeHtml(term.tag_name)}${term.action === 'already' ? '(已存在)' : term.action === 'merge_tag' ? '(合并 tag)' : term.action === 'alias_added' ? '(alias)' : ''}`).join('、') || '无'}</div>
         <div class="muted">跳过：${(item.skipped_terms || []).map(escapeHtml).join('；') || '无'}</div>
       </div>
     `;
@@ -1099,9 +1100,9 @@ function renderPixivPreview() {
     </div>
     <div>
       ${renderCandidateTagSection(item, selectedTags, 'preview')}
-      <div class="subheading">Pixiv 来源 tag</div>
+      <div class="subheading">alias / Pixiv 来源词</div>
       <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
-      <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
+      <div class="muted">归入主 tag：${escapeHtml((uniqueTexts(selectedTags)[0] || '无'))}；alias / 搜索词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
       <div class="row">
         <button onclick="submitPixivReview(${imageId})">确认审核</button>
         <button class="danger" onclick="rejectPixivReviewImage(${imageId})">拒绝图片</button>
@@ -1138,17 +1139,21 @@ function closePixivPreview() {
 async function submitPixivReview(imageId) {
   const selectedTags = uniqueTexts(pixivReviewState.selectedTagsByImage[imageId] || []);
   if (!selectedTags.length) {
-    alert('请至少选择一个主 tag。');
+    alert('请至少选择一个归入主 tag。');
     return;
   }
+  const sourceTerms = uniqueTexts(pixivReviewState.selectedTermsByImage[imageId] || []);
   const payload = {
     image_id: imageId,
     selected_tag_names: selectedTags,
-    source_terms: uniqueTexts(pixivReviewState.selectedTermsByImage[imageId] || []),
+    source_terms: sourceTerms,
     reject_unselected: true,
   };
   const result = await fetchJson('/api/pixiv-review/submit', {method: 'POST', body: JSON.stringify(payload)});
-  const mappedText = (result.mapped_terms || []).map(item => `${item.term}→${item.tag_name}`).join('、');
+  const mappedText = (result.mapped_terms || []).map(item => {
+    const suffix = item.action === 'merge_tag' ? '(合并 tag)' : item.action === 'alias_added' ? '(alias)' : item.action === 'already' ? '(已存在)' : '';
+    return `${item.term}→${item.tag_name}${suffix}`;
+  }).join('、');
   const skippedText = (result.skipped_terms || []).join('；');
   delete pixivReviewState.selectedTagsByImage[imageId];
   delete pixivReviewState.selectedTermsByImage[imageId];

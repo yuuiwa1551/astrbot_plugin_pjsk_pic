@@ -1841,53 +1841,154 @@ class ImageIndexDB:
                     payload['sample_authors'].append(author)
         return usage
 
+    def _build_review_alias_term_plan_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        platform: str,
+        target_row: sqlite3.Row,
+        term: str,
+    ) -> dict[str, Any]:
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        term_text = str(term or '').strip()
+        target_id = int(target_row['id'])
+        target_name = str(target_row['name'])
+        target_normalized = str(target_row['normalized_name'] or normalize_tag_name(target_name))
+        normalized_term = normalize_tag_name(term_text)
+        if not term_text or not normalized_term:
+            return {'status': 'skipped', 'term': term_text, 'message': '空词'}
+        if not self._looks_like_platform_term(term_text):
+            return {'status': 'skipped', 'term': term_text, 'message': '看起来不是适合沉淀的平台角色词'}
+        if normalized_term == target_normalized:
+            return {'status': 'mapped', 'term': term_text, 'tag_name': target_name, 'action': 'already'}
+
+        source_row, source_match_type = self._resolve_tag_exact_conn(conn, term_text)
+        if source_row and int(source_row['id']) != target_id and source_match_type == 'exact_alias':
+            return {
+                'status': 'skipped',
+                'term': term_text,
+                'message': f'alias 已被 {str(source_row["name"])} 使用',
+            }
+
+        platform_match = self._resolve_platform_term_exact_conn(conn, platform_text, term_text)
+        if platform_match and int(platform_match['tag_id']) != target_id:
+            conflict = conn.execute('SELECT name FROM tags WHERE id = ? LIMIT 1', (int(platform_match['tag_id']),)).fetchone()
+            conflict_name = str(conflict['name']) if conflict else str(platform_match['tag_id'])
+            return {
+                'status': 'skipped',
+                'term': term_text,
+                'message': f'{platform_text} term 已映射到其他 tag：{conflict_name}',
+            }
+
+        source_tag_id = int(source_row['id']) if source_row else 0
+        action = 'add'
+        if source_row and source_tag_id == target_id:
+            action = 'already'
+        elif source_row and source_match_type == 'exact_tag':
+            action = 'merge_tag'
+        elif platform_match:
+            action = 'already'
+        return {
+            'status': 'mapped',
+            'term': term_text,
+            'tag_name': target_name,
+            'action': action,
+            'source_tag_id': source_tag_id,
+            'source_match_type': source_match_type,
+            'platform_already': bool(platform_match),
+        }
+
+    def _apply_review_alias_term_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        platform: str,
+        target_row: sqlite3.Row,
+        term: str,
+        now: str,
+    ) -> dict[str, Any]:
+        plan = self._build_review_alias_term_plan_conn(conn, platform=platform, target_row=target_row, term=term)
+        if plan.get('status') != 'mapped':
+            return plan
+
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        target_id = int(target_row['id'])
+        target_name = str(target_row['name'])
+        action = str(plan.get('action') or '')
+
+        if action == 'merge_tag':
+            if not bool(plan.get('platform_already')):
+                ok, message = self._upsert_platform_term_conn(
+                    conn,
+                    tag_id=target_id,
+                    platform=platform_text,
+                    term=str(plan['term']),
+                    term_type='both',
+                    source='manual_review',
+                    confidence=1.0,
+                    now=now,
+                )
+                if not ok and '已被 alias 覆盖' not in message and '与主 tag 相同' not in message:
+                    return {'status': 'skipped', 'term': str(plan['term']), 'message': message}
+            merge_result = self._merge_tag_into_conn(
+                conn,
+                target_id=target_id,
+                target_name=target_name,
+                source_id=int(plan.get('source_tag_id') or 0),
+                now=now,
+            )
+            plan['action'] = 'merge_tag'
+            plan['merged_tag'] = str(merge_result.get('source_name') or '')
+            plan['merge_result'] = merge_result
+            return plan
+
+        if action == 'add':
+            if not bool(plan.get('platform_already')):
+                ok, message = self._upsert_platform_term_conn(
+                    conn,
+                    tag_id=target_id,
+                    platform=platform_text,
+                    term=str(plan['term']),
+                    term_type='both',
+                    source='manual_review',
+                    confidence=1.0,
+                    now=now,
+                )
+                if ok:
+                    plan['platform_term_added'] = True
+                elif '已被 alias 覆盖' not in message and '与主 tag 相同' not in message:
+                    return {'status': 'skipped', 'term': str(plan['term']), 'message': message}
+            ok, message = self._insert_alias_conn(conn, tag_id=target_id, alias=str(plan['term']), now=now)
+            if ok:
+                plan['action'] = 'alias_added'
+                plan['alias_added'] = True
+            elif '已存在' in message or '不能与主 tag 相同' in message:
+                plan['action'] = 'already'
+            else:
+                return {'status': 'skipped', 'term': str(plan['term']), 'message': message}
+        return plan
+
     def _preview_review_term_mappings_conn(
         self,
         conn: sqlite3.Connection,
         *,
         platform: str,
         requested_terms: Iterable[str],
-        resolved_rows: list[sqlite3.Row],
+        target_row: sqlite3.Row,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
-        selected_ids = {int(row['id']) for row in resolved_rows}
         mapped_terms: list[dict[str, Any]] = []
         skipped_terms: list[str] = []
         for term in requested_terms:
-            if not self._looks_like_platform_term(term):
-                skipped_terms.append(f'{term}（看起来不是适合沉淀的平台角色词）')
-                continue
-            target_row: sqlite3.Row | None = None
-            existing = conn.execute(
-                """
-                SELECT p.id, p.tag_id, p.term_type, t.name AS tag_name
-                FROM platform_tag_terms p
-                JOIN tags t ON t.id = p.tag_id
-                WHERE p.platform = ? AND p.normalized_term = ?
-                LIMIT 1
-                """,
-                (platform_text, normalize_tag_name(term)),
-            ).fetchone()
-            if len(resolved_rows) == 1:
-                target_row = resolved_rows[0]
-            else:
-                if existing and int(existing['tag_id']) in selected_ids:
-                    target_row = next((row for row in resolved_rows if int(row['id']) == int(existing['tag_id'])), None)
-                if target_row is None:
-                    exact_row, _ = self._resolve_tag_exact_conn(conn, term)
-                    if exact_row and int(exact_row['id']) in selected_ids:
-                        target_row = next((row for row in resolved_rows if int(row['id']) == int(exact_row['id'])), None)
-            if target_row is None:
-                skipped_terms.append(f'{term}（多选主 tag 时无法自动判断映射目标）')
-                continue
-            if existing and int(existing['tag_id']) != int(target_row['id']):
-                skipped_terms.append(f'{term}（{platform_text} term 已映射到其他 tag：{str(existing["tag_name"])}）')
+            plan = self._build_review_alias_term_plan_conn(conn, platform=platform, target_row=target_row, term=term)
+            if plan.get('status') != 'mapped':
+                skipped_terms.append(f'{term}（{str(plan.get("message") or "无法沉淀")}）')
                 continue
             mapped_terms.append(
                 {
-                    'term': term,
-                    'tag_name': str(target_row['name']),
-                    'action': ('already' if existing else 'add'),
+                    'term': str(plan['term']),
+                    'tag_name': str(plan['tag_name']),
+                    'action': str(plan.get('action') or 'add'),
+                    'source_tag_id': int(plan.get('source_tag_id') or 0),
                 }
             )
         return mapped_terms, skipped_terms
@@ -1934,7 +2035,7 @@ class ImageIndexDB:
                 requested_tags = list(item['selected_tag_names'])
                 requested_terms = list(item['source_terms'])
                 if not requested_tags:
-                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': '请至少选择一个主 tag。'})
+                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': '请至少选择一个归入主 tag。'})
                     totals['errors'] += 1
                     continue
                 image = conn.execute('SELECT id FROM images WHERE id = ? AND is_active = 1 LIMIT 1', (image_id,)).fetchone()
@@ -1950,20 +2051,26 @@ class ImageIndexDB:
                     preview_items.append({'image_id': image_id, 'status': 'error', 'message': f'图片 #{image_id} 没有 {platform_text} 来源记录。'})
                     totals['errors'] += 1
                     continue
-                resolved_rows: list[sqlite3.Row] = []
-                unresolved_tags: list[str] = []
-                for tag_name in requested_tags:
-                    row, _ = self._resolve_tag_exact_conn(conn, tag_name)
-                    if not row:
-                        unresolved_tags.append(tag_name)
-                    else:
-                        resolved_rows.append(row)
-                if unresolved_tags:
-                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': '以下主 tag 不存在：' + '、'.join(unresolved_tags)})
+                canonical_tag_name = requested_tags[0]
+                alias_terms = self._dedupe_terms([*requested_tags[1:], *requested_terms])
+                target_row, _ = self._resolve_tag_exact_conn(conn, canonical_tag_name)
+                if not target_row:
+                    preview_items.append({'image_id': image_id, 'status': 'error', 'message': f'归入主 tag 不存在：{canonical_tag_name}'})
                     totals['errors'] += 1
                     continue
-                selected_ids = {int(row['id']) for row in resolved_rows}
-                selected_names = [str(row['name']) for row in resolved_rows]
+                selected_ids = {int(target_row['id'])}
+                selected_names = [str(target_row['name'])]
+                mapped_terms, skipped_terms = self._preview_review_term_mappings_conn(
+                    conn,
+                    platform=platform_text,
+                    requested_terms=alias_terms,
+                    target_row=target_row,
+                )
+                merged_source_ids = {
+                    int(term.get('source_tag_id') or 0)
+                    for term in mapped_terms
+                    if str(term.get('action') or '') == 'merge_tag' and int(term.get('source_tag_id') or 0) > 0
+                }
                 tasks = conn.execute(
                     """
                     SELECT rt.tag_id, t.name AS tag_name
@@ -1977,14 +2084,8 @@ class ImageIndexDB:
                 rejected_names = [
                     str(row['tag_name'])
                     for row in tasks
-                    if reject_unselected and int(row['tag_id']) not in selected_ids
+                    if reject_unselected and int(row['tag_id']) not in selected_ids and int(row['tag_id']) not in merged_source_ids
                 ]
-                mapped_terms, skipped_terms = self._preview_review_term_mappings_conn(
-                    conn,
-                    platform=platform_text,
-                    requested_terms=requested_terms,
-                    resolved_rows=resolved_rows,
-                )
                 preview_items.append(
                     {
                         'image_id': image_id,
@@ -1993,7 +2094,7 @@ class ImageIndexDB:
                         'rejected_tags': rejected_names,
                         'mapped_terms': mapped_terms,
                         'skipped_terms': skipped_terms,
-                        'selected_source_terms': requested_terms,
+                        'selected_source_terms': alias_terms,
                     }
                 )
                 totals['images'] += 1
@@ -3168,7 +3269,7 @@ class ImageIndexDB:
             seen_tags.add(normalized)
             requested_tags.append(text)
         if not requested_tags:
-            return False, {'message': '请至少选择一个主 tag。'}
+            return False, {'message': '请至少选择一个归入主 tag。'}
 
         requested_terms: list[str] = []
         seen_terms: set[str] = set()
@@ -3179,6 +3280,8 @@ class ImageIndexDB:
                 continue
             seen_terms.add(normalized)
             requested_terms.append(text)
+        canonical_tag_name = requested_tags[0]
+        alias_terms = self._dedupe_terms([*requested_tags[1:], *requested_terms])
 
         platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
         now = utcnow_str()
@@ -3196,42 +3299,39 @@ class ImageIndexDB:
             if not source_exists:
                 return False, {'message': f'图片 #{image_id} 没有 {platform_text} 来源记录。'}
 
-            resolved_rows: list[sqlite3.Row] = []
-            unresolved: list[str] = []
-            for tag_name in requested_tags:
-                row, _ = self._resolve_tag_exact_conn(conn, tag_name)
-                if not row:
-                    unresolved.append(tag_name)
-                    continue
-                resolved_rows.append(row)
-            if unresolved:
-                return False, {'message': '以下主 tag 不存在：' + '、'.join(unresolved)}
+            target_row, _ = self._resolve_tag_exact_conn(conn, canonical_tag_name)
+            if not target_row:
+                return False, {'message': f'归入主 tag 不存在：{canonical_tag_name}'}
 
-            selected_ids = {int(row['id']) for row in resolved_rows}
-            selected_names = [str(row['name']) for row in resolved_rows]
-            tasks = conn.execute(
-                """
-                SELECT rt.id, rt.tag_id, rt.status, t.name AS tag_name,
-                       COALESCE((
-                           SELECT it.source_type
-                           FROM image_tags it
-                           WHERE it.image_id = rt.image_id AND it.tag_id = rt.tag_id
-                           ORDER BY CASE
-                               WHEN it.source_type = ? THEN 0
-                               WHEN it.source_type LIKE 'crawl:%' THEN 1
-                               WHEN it.source_type LIKE 'manual:%' THEN 2
-                               ELSE 3
-                           END, it.id DESC
-                           LIMIT 1
-                       ), '') AS source_type
-                FROM review_tasks rt
-                JOIN tags t ON t.id = rt.tag_id
-                WHERE rt.image_id = ?
-                ORDER BY rt.id DESC
-                """,
-                (f'crawl:{platform_text}', image_id),
-            ).fetchall()
-            task_by_tag_id = {int(row['tag_id']): row for row in tasks}
+            target_id = int(target_row['id'])
+            target_name = str(target_row['name'])
+            selected_ids = {target_id}
+            selected_names = [target_name]
+            def fetch_review_tasks() -> list[sqlite3.Row]:
+                return conn.execute(
+                    """
+                    SELECT rt.id, rt.tag_id, rt.status, t.name AS tag_name,
+                           COALESCE((
+                               SELECT it.source_type
+                               FROM image_tags it
+                               WHERE it.image_id = rt.image_id AND it.tag_id = rt.tag_id
+                               ORDER BY CASE
+                                   WHEN it.source_type = ? THEN 0
+                                   WHEN it.source_type LIKE 'crawl:%' THEN 1
+                                   WHEN it.source_type LIKE 'manual:%' THEN 2
+                                   ELSE 3
+                               END, it.id DESC
+                               LIMIT 1
+                           ), '') AS source_type
+                    FROM review_tasks rt
+                    JOIN tags t ON t.id = rt.tag_id
+                    WHERE rt.image_id = ?
+                    ORDER BY rt.id DESC
+                    """,
+                    (f'crawl:{platform_text}', image_id),
+                ).fetchall()
+
+            tasks = fetch_review_tasks()
 
             def upsert_image_tag_review(tag_id: int, status: str, reason_text: str, default_source_type: str) -> str:
                 image_tag_rows = conn.execute(
@@ -3265,39 +3365,70 @@ class ImageIndexDB:
                 )
                 return default_source_type
 
-            for row in resolved_rows:
-                tag_id = int(row['id'])
-                source_type = upsert_image_tag_review(tag_id, 'manual_approved', approved_reason, f'manual:{platform_text}_review')
-                task = task_by_tag_id.get(tag_id)
-                if task:
-                    conn.execute(
-                        """
-                        UPDATE review_tasks
-                        SET status = 'manual_approved', manual_result = 'approved', reason = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (approved_reason, now, int(task['id'])),
-                    )
-                else:
-                    cursor = conn.execute(
-                        """
-                        INSERT INTO review_tasks(image_id, tag_id, status, model_result, manual_result, reason, created_at, updated_at)
-                        VALUES(?, ?, 'manual_approved', '', 'approved', ?, ?, ?)
-                        """,
-                        (image_id, tag_id, approved_reason, now, now),
-                    )
-                    task_by_tag_id[tag_id] = {
-                        'id': int(cursor.lastrowid),
-                        'tag_id': tag_id,
-                        'tag_name': str(row['name']),
-                        'source_type': source_type,
+            mapped_terms: list[dict[str, Any]] = []
+            skipped_terms: list[str] = []
+            aliases_added: list[str] = []
+            merged_tags: list[str] = []
+            merged_source_ids: set[int] = set()
+            for term in alias_terms:
+                plan = self._apply_review_alias_term_conn(
+                    conn,
+                    platform=platform_text,
+                    target_row=target_row,
+                    term=term,
+                    now=now,
+                )
+                if plan.get('status') != 'mapped':
+                    skipped_terms.append(f'{term}（{str(plan.get("message") or "无法沉淀")}）')
+                    continue
+                mapped_terms.append(
+                    {
+                        'term': str(plan['term']),
+                        'tag_name': str(plan['tag_name']),
+                        'action': str(plan.get('action') or 'add'),
                     }
+                )
+                if plan.get('alias_added'):
+                    aliases_added.append(str(plan['term']))
+                if plan.get('merged_tag'):
+                    merged_tags.append(str(plan['merged_tag']))
+                source_tag_id = int(plan.get('source_tag_id') or 0)
+                if source_tag_id > 0 and str(plan.get('action') or '') == 'merge_tag':
+                    merged_source_ids.add(source_tag_id)
+
+            tasks = fetch_review_tasks()
+            task_by_tag_id = {int(row['tag_id']): row for row in tasks}
+            source_type = upsert_image_tag_review(target_id, 'manual_approved', approved_reason, f'manual:{platform_text}_review')
+            task = task_by_tag_id.get(target_id)
+            if task:
+                conn.execute(
+                    """
+                    UPDATE review_tasks
+                    SET status = 'manual_approved', manual_result = 'approved', reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (approved_reason, now, int(task['id'])),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO review_tasks(image_id, tag_id, status, model_result, manual_result, reason, created_at, updated_at)
+                    VALUES(?, ?, 'manual_approved', '', 'approved', ?, ?, ?)
+                    """,
+                    (image_id, target_id, approved_reason, now, now),
+                )
+                task_by_tag_id[target_id] = {
+                    'id': int(cursor.lastrowid),
+                    'tag_id': target_id,
+                    'tag_name': target_name,
+                    'source_type': source_type,
+                }
 
             rejected_names: list[str] = []
             if reject_unselected:
                 for task in tasks:
                     tag_id = int(task['tag_id'])
-                    if tag_id in selected_ids:
+                    if tag_id in selected_ids or tag_id in merged_source_ids:
                         continue
                     conn.execute(
                         """
@@ -3320,66 +3451,15 @@ class ImageIndexDB:
                         )
                     rejected_names.append(str(task['tag_name']))
 
-            mapped_terms: list[dict[str, str]] = []
-            skipped_terms: list[str] = []
-            if requested_terms:
-                if len(resolved_rows) == 1:
-                    target_row = resolved_rows[0]
-                    for term in requested_terms:
-                        if not self._looks_like_platform_term(term):
-                            skipped_terms.append(f'{term}（看起来不是适合沉淀的平台角色词）')
-                            continue
-                        ok, message = self._upsert_platform_term_conn(
-                            conn,
-                            tag_id=int(target_row['id']),
-                            platform=platform_text,
-                            term=term,
-                            term_type='both',
-                            source='manual_review',
-                            confidence=1.0,
-                            now=now,
-                        )
-                        if ok:
-                            mapped_terms.append({'term': term, 'tag_name': str(target_row['name'])})
-                        else:
-                            skipped_terms.append(f'{term}（{message}）')
-                else:
-                    for term in requested_terms:
-                        if not self._looks_like_platform_term(term):
-                            skipped_terms.append(f'{term}（看起来不是适合沉淀的平台角色词）')
-                            continue
-                        matched_tag_id: int | None = None
-                        platform_match = self._resolve_platform_term_exact_conn(conn, platform_text, term)
-                        if platform_match and int(platform_match['tag_id']) in selected_ids:
-                            matched_tag_id = int(platform_match['tag_id'])
-                        else:
-                            exact_row, _ = self._resolve_tag_exact_conn(conn, term)
-                            if exact_row and int(exact_row['id']) in selected_ids:
-                                matched_tag_id = int(exact_row['id'])
-                        if matched_tag_id is None:
-                            skipped_terms.append(f'{term}（多选主 tag 时无法自动判断映射目标）')
-                            continue
-                        target_row = next(row for row in resolved_rows if int(row['id']) == matched_tag_id)
-                        ok, message = self._upsert_platform_term_conn(
-                            conn,
-                            tag_id=int(target_row['id']),
-                            platform=platform_text,
-                            term=term,
-                            term_type='both',
-                            source='manual_review',
-                            confidence=1.0,
-                            now=now,
-                        )
-                        if ok:
-                            mapped_terms.append({'term': term, 'tag_name': str(target_row['name'])})
-                        else:
-                            skipped_terms.append(f'{term}（{message}）')
-
         return True, {
             'message': f'已完成图片 #{image_id} 的人工审核',
             'image_id': image_id,
+            'canonical_tag': target_name,
             'approved_tags': selected_names,
             'rejected_tags': rejected_names,
+            'alias_terms': alias_terms,
+            'aliases_added': aliases_added,
+            'merged_tags': merged_tags,
             'mapped_terms': mapped_terms,
             'skipped_terms': skipped_terms,
         }
