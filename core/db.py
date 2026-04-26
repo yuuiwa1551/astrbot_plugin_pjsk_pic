@@ -1285,6 +1285,7 @@ class ImageIndexDB:
             'pixiv', 'illustration', 'fanart', 'art', 'image', 'images',
             '插画', '图片', '图', '壁纸', '漫画', '约稿', '头像',
             '女の子', '女孩子', '世界计划', 'プロセカ', 'projectsekai', 'prsk_fa',
+            'プロジェクトセカイ', 'プロジェクトセカイカラフルステージ', 'pjsk',
             'ニーゴ', '25時、ナイトコードで。', '25时，在夜之电台',
         }
         if lowered in blacklist:
@@ -3223,8 +3224,12 @@ class ImageIndexDB:
         statuses: Iterable[str] | None = None,
         limit: int = 20,
         offset: int = 0,
+        keyword: str = '',
+        search_context: dict[str, Any] | None = None,
     ) -> list[sqlite3.Row]:
         normalized_statuses = [str(item).strip() for item in (statuses or ['pending', 'uncertain']) if str(item).strip()]
+        keyword_text = str(keyword or '').strip()
+        context = search_context if search_context is not None else self.build_pixiv_review_search_context(keyword_text)
         sql = """
             SELECT i.id AS image_id,
                    MAX(rt.id) AS latest_review_id,
@@ -3244,10 +3249,281 @@ class ImageIndexDB:
             placeholders = ','.join('?' for _ in normalized_statuses)
             sql += f' AND rt.status IN ({placeholders})'
             params.extend(normalized_statuses)
+        if keyword_text and context.get('has_query'):
+            search_clauses: list[str] = []
+            search_params: list[Any] = []
+            target_ids = [
+                int(item)
+                for item in (context.get('tag_ids') or [])
+                if int(item or 0) > 0
+            ]
+            if target_ids:
+                id_placeholders = ','.join('?' for _ in target_ids)
+                review_status_sql = ''
+                review_status_params: list[Any] = []
+                if normalized_statuses:
+                    review_status_placeholders = ','.join('?' for _ in normalized_statuses)
+                    review_status_sql = f' AND rt2.status IN ({review_status_placeholders})'
+                    review_status_params.extend(normalized_statuses)
+                search_clauses.append(
+                    f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM review_tasks rt2
+                        WHERE rt2.image_id = i.id
+                          AND rt2.tag_id IN ({id_placeholders})
+                          {review_status_sql}
+                    )
+                    """
+                )
+                search_params.extend(target_ids)
+                search_params.extend(review_status_params)
+                search_clauses.append(
+                    f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM image_tags it2
+                        WHERE it2.image_id = i.id
+                          AND it2.tag_id IN ({id_placeholders})
+                    )
+                    """
+                )
+                search_params.extend(target_ids)
+
+            normalized_terms = [
+                normalize_tag_name(str(item or ''))
+                for item in (context.get('terms') or [])
+                if normalize_tag_name(str(item or ''))
+            ]
+            normalized_terms = list(dict.fromkeys(normalized_terms))[:80]
+            if normalized_terms:
+                tag_like_clauses = []
+                tag_like_params: list[Any] = []
+                for term in normalized_terms:
+                    tag_like_clauses.append('t2.normalized_name LIKE ?')
+                    tag_like_params.append(f'%{term}%')
+                search_clauses.append(
+                    f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM review_tasks rt2
+                        JOIN tags t2 ON t2.id = rt2.tag_id
+                        WHERE rt2.image_id = i.id
+                          {'AND rt2.status IN (' + ','.join('?' for _ in normalized_statuses) + ')' if normalized_statuses else ''}
+                          AND ({' OR '.join(tag_like_clauses)})
+                    )
+                    """
+                )
+                if normalized_statuses:
+                    search_params.extend(normalized_statuses)
+                search_params.extend(tag_like_params)
+                search_clauses.append(
+                    f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM image_tags it2
+                        JOIN tags t2 ON t2.id = it2.tag_id
+                        WHERE it2.image_id = i.id
+                          AND ({' OR '.join(tag_like_clauses)})
+                    )
+                    """
+                )
+                search_params.extend(tag_like_params)
+
+            text_terms = self._dedupe_terms([str(item) for item in (context.get('terms') or [])])[:80]
+            if text_terms:
+                source_clauses = []
+                source_params: list[Any] = []
+                for term in text_terms:
+                    source_clauses.append('(s2.raw_tags LIKE ? OR s2.extra_json LIKE ?)')
+                    source_params.extend([f'%{term}%', f'%{term}%'])
+                search_clauses.append(
+                    f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM sources s2
+                        WHERE s2.image_id = i.id
+                          AND s2.platform = 'pixiv'
+                          AND ({' OR '.join(source_clauses)})
+                    )
+                    """
+                )
+                search_params.extend(source_params)
+
+            if search_clauses:
+                sql += ' AND (' + ' OR '.join(search_clauses) + ')'
+                params.extend(search_params)
         sql += ' GROUP BY i.id ORDER BY latest_review_id DESC LIMIT ? OFFSET ?'
         params.extend([limit, offset])
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
+
+    def build_pixiv_review_search_context(self, keyword: str, *, platform: str = 'pixiv') -> dict[str, Any]:
+        keyword_text = str(keyword or '').strip()
+        normalized_keyword = normalize_tag_name(keyword_text)
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        context: dict[str, Any] = {
+            'keyword': keyword_text,
+            'normalized_keyword': normalized_keyword,
+            'has_query': bool(keyword_text and normalized_keyword),
+            'matched_tags': [],
+            'expanded_terms': [],
+            'terms': [],
+            'tag_ids': [],
+            'message': '',
+        }
+        if not context['has_query']:
+            return context
+
+        seen_tag_ids: set[int] = set()
+        seen_terms: set[str] = set()
+
+        def push_term(value: str) -> None:
+            text = str(value or '').strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen_terms:
+                return
+            seen_terms.add(normalized)
+            context['terms'].append(text)
+            context['expanded_terms'].append(text)
+
+        def push_tag(
+            conn: sqlite3.Connection,
+            row: sqlite3.Row | None,
+            match_type: str,
+            *,
+            include_suggestions: bool = True,
+        ) -> None:
+            if not row:
+                return
+            tag_id = int(row['id'])
+            tag_name = str(row['name'])
+            if tag_id not in seen_tag_ids:
+                seen_tag_ids.add(tag_id)
+                context['tag_ids'].append(tag_id)
+                context['matched_tags'].append(
+                    {
+                        'id': tag_id,
+                        'name': tag_name,
+                        'match_type': match_type,
+                    }
+                )
+            push_term(tag_name)
+            alias_rows = conn.execute(
+                'SELECT alias FROM tag_aliases WHERE tag_id = ? ORDER BY alias ASC',
+                (tag_id,),
+            ).fetchall()
+            for alias_row in alias_rows:
+                push_term(str(alias_row['alias']))
+            platform_rows = conn.execute(
+                """
+                SELECT term
+                FROM platform_tag_terms
+                WHERE tag_id = ? AND platform = ?
+                ORDER BY confidence DESC, term ASC
+                LIMIT 100
+                """,
+                (tag_id, platform_text),
+            ).fetchall()
+            for term_row in platform_rows:
+                push_term(str(term_row['term']))
+            if include_suggestions:
+                source_rows = conn.execute(
+                    """
+                    SELECT s.raw_tags, s.extra_json
+                    FROM sources s
+                    JOIN image_tags it ON it.image_id = s.image_id
+                    WHERE it.tag_id = ?
+                      AND s.platform = ?
+                      AND it.review_status IN ('approved', 'manual_approved')
+                    ORDER BY s.id DESC
+                    LIMIT 200
+                    """,
+                    (tag_id, platform_text),
+                ).fetchall()
+                for source_row in source_rows:
+                    try:
+                        raw_terms = json.loads(source_row['raw_tags'] or '[]') if source_row['raw_tags'] else []
+                    except Exception:
+                        raw_terms = []
+                    try:
+                        extra = json.loads(source_row['extra_json'] or '{}') if source_row['extra_json'] else {}
+                    except Exception:
+                        extra = {}
+                    translated_terms = extra.get('translated_tags') if isinstance(extra, dict) else []
+                    if not isinstance(translated_terms, list):
+                        translated_terms = []
+                    for candidate_term in [*raw_terms, *translated_terms]:
+                        candidate_row, candidate_match_type = self._resolve_tag_exact_conn(conn, str(candidate_term or ''))
+                        if (
+                            candidate_row
+                            and int(candidate_row['id']) != tag_id
+                            and self._looks_like_platform_term(str(candidate_term or ''))
+                        ):
+                            push_tag(
+                                conn,
+                                candidate_row,
+                                f'suggested_{candidate_match_type or "tag"}',
+                                include_suggestions=False,
+                            )
+
+        push_term(keyword_text)
+        with self._lock, self._connect() as conn:
+            exact_row, exact_type = self._resolve_tag_exact_conn(conn, keyword_text)
+            push_tag(conn, exact_row, exact_type)
+            platform_row = self._resolve_platform_term_exact_conn(conn, platform_text, keyword_text)
+            if platform_row:
+                tag_row = conn.execute('SELECT * FROM tags WHERE id = ? LIMIT 1', (int(platform_row['tag_id']),)).fetchone()
+                push_tag(conn, tag_row, f'platform:{platform_text}')
+
+            like_normalized = f'%{normalized_keyword}%'
+            like_text = f'%{keyword_text}%'
+            fuzzy_rows = conn.execute(
+                """
+                SELECT DISTINCT t.id, t.name,
+                       CASE
+                           WHEN t.normalized_name LIKE ? OR t.name LIKE ? THEN 'fuzzy_tag'
+                           ELSE 'fuzzy_alias'
+                       END AS match_type
+                FROM tags t
+                LEFT JOIN tag_aliases a ON a.tag_id = t.id
+                WHERE t.normalized_name LIKE ?
+                   OR t.name LIKE ?
+                   OR a.normalized_alias LIKE ?
+                   OR a.alias LIKE ?
+                ORDER BY t.name ASC
+                LIMIT 20
+                """,
+                (like_normalized, like_text, like_normalized, like_text, like_normalized, like_text),
+            ).fetchall()
+            for row in fuzzy_rows:
+                push_tag(conn, row, str(row['match_type'] or 'fuzzy_tag'))
+
+            platform_rows = conn.execute(
+                """
+                SELECT DISTINCT t.id, t.name, 'fuzzy_platform' AS match_type
+                FROM platform_tag_terms p
+                JOIN tags t ON t.id = p.tag_id
+                WHERE p.platform = ?
+                  AND (p.normalized_term LIKE ? OR p.term LIKE ?)
+                ORDER BY t.name ASC
+                LIMIT 20
+                """,
+                (platform_text, like_normalized, like_text),
+            ).fetchall()
+            for row in platform_rows:
+                push_tag(conn, row, str(row['match_type'] or 'fuzzy_platform'))
+
+        matched_names = [str(item['name']) for item in context['matched_tags']]
+        term_preview = [str(item) for item in context['expanded_terms'][:12]]
+        if matched_names:
+            context['message'] = (
+                f"{keyword_text} 命中：" + '、'.join(matched_names[:6])
+                + ("；展开词：" + '、'.join(term_preview) if term_preview else '')
+            )
+        else:
+            context['message'] = f"{keyword_text} 未命中主 tag；已按待审 tag / Pixiv 来源词直接模糊搜索"
+        return context
 
     def apply_image_review(
         self,

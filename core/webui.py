@@ -87,6 +87,14 @@ HTML_PAGE = """<!DOCTYPE html>
     button.danger { background: #dc2626; }
     .sample-links { display: grid; gap: 4px; }
     .toolbar-box { border: 1px dashed #d8def5; border-radius: 12px; padding: 12px; margin-bottom: 14px; background: #f8faff; }
+    .toolbar-title { font-weight: 700; min-width: 72px; }
+    .filter-box { border-style: solid; background: #fff; }
+    .filter-box input { min-width: min(420px, 100%); }
+    .search-context { color: #475569; font-size: 13px; min-height: 18px; }
+    .batch-box { transition: border-color .16s ease, background .16s ease; }
+    .batch-box.is-active { border-color: #9fb2ff; background: #f8faff; }
+    .batch-box.is-idle .batch-controls { display: none; }
+    .batch-box.is-active .batch-idle-hint { display: none; }
     .preview-box { border: 1px solid #eceef2; border-radius: 10px; padding: 12px; background: #fbfcff; }
     .merge-arrow { font-weight: bold; color: #3c65f5; }
     .toast { position: fixed; right: 18px; bottom: 18px; z-index: 1200; max-width: min(420px, calc(100vw - 36px)); background: #15223b; color: white; border-radius: 10px; padding: 12px 14px; box-shadow: 0 12px 32px rgba(15,23,42,.26); opacity: 0; transform: translateY(8px); pointer-events: none; transition: opacity .16s ease, transform .16s ease; }
@@ -185,35 +193,43 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
   <section class="page-section" data-page="pixiv-review">
     <h2>Pixiv 审批页</h2>
-    <div class="row">
-      <select id="pixivReviewStatus">
-        <option value="pending,uncertain">待处理（pending / uncertain）</option>
-        <option value="pending">仅 pending</option>
-        <option value="uncertain">仅 uncertain</option>
-        <option value="rejected">仅 rejected</option>
-        <option value="pending,uncertain,rejected">待处理 + rejected</option>
-      </select>
-      <button onclick="loadPixivReviewImages()">刷新 Pixiv 审批</button>
-      <span class="muted">先单选归入主 tag；再多选来源 tag 作为 alias / Pixiv 搜索词沉淀。</span>
-    </div>
-    <div class="toolbar-box">
+    <div class="toolbar-box filter-box">
       <div class="row">
-        <strong>批量审核</strong>
+        <span class="toolbar-title">筛选</span>
+        <select id="pixivReviewStatus" onchange="loadPixivReviewImages()">
+          <option value="pending,uncertain">待处理（pending / uncertain）</option>
+          <option value="pending">仅 pending</option>
+          <option value="uncertain">仅 uncertain</option>
+          <option value="rejected">仅 rejected</option>
+          <option value="pending,uncertain,rejected">待处理 + rejected</option>
+        </select>
+        <input id="pixivReviewKeyword" placeholder="搜索角色 / alias / Pixiv tag，例如 mzk、Akiyama Mizuki" style="flex:1;" oninput="schedulePixivReviewSearch()" onkeydown="handlePixivReviewKeywordKeydown(event)" />
+        <button class="secondary" onclick="clearPixivReviewSearch()">清空搜索</button>
+        <button onclick="loadPixivReviewImages()">刷新 Pixiv 审批</button>
+      </div>
+      <div class="search-context" id="pixivReviewSearchContext">先筛选角色相关待审图，再勾选图片做批量审核。</div>
+    </div>
+    <div class="toolbar-box batch-box is-idle" id="pixivBatchBox">
+      <div class="row">
+        <span class="toolbar-title">批量审核</span>
         <span class="muted" id="pixivBatchSelectionHint">当前已选 0 张图片。</span>
         <button class="secondary" onclick="selectAllPixivReviewImages()">全选当前页</button>
         <button class="secondary" onclick="clearSelectedPixivReviewImages()">清空已选</button>
       </div>
-      <div class="row">
-        <input id="pixivBatchTags" placeholder="批量归入主 tag；多个时第 1 个为主 tag，其余作为别名词" style="flex:1;" />
-        <input id="pixivBatchSourceTerms" placeholder="批量 alias / Pixiv 来源词，逗号分隔；留空时使用每张图当前已选来源词" style="flex:1;" />
-        <label class="muted"><input id="pixivBatchRejectUnselected" type="checkbox" checked /> 拒绝未选 tag</label>
+      <div class="muted batch-idle-hint">勾选图片后显示批量归入和 alias / 来源词操作。</div>
+      <div class="batch-controls">
+        <div class="row">
+          <input id="pixivBatchTags" placeholder="批量归入主 tag；多个时第 1 个为主 tag，其余作为别名词" style="flex:1;" />
+          <input id="pixivBatchSourceTerms" placeholder="批量 alias / Pixiv 来源词，逗号分隔；留空时使用每张图当前已选来源词" style="flex:1;" />
+          <label class="muted"><input id="pixivBatchRejectUnselected" type="checkbox" checked /> 拒绝未选 tag</label>
+        </div>
+        <div class="row">
+          <button class="secondary" onclick="applyBatchTagsToSelectedImages()">将上面输入应用到已选图片</button>
+          <button onclick="previewPixivBatchReview()">批量预览审核</button>
+          <button onclick="submitPixivBatchReview()">批量确认审核</button>
+        </div>
+        <div class="list" id="pixivBatchPreview"></div>
       </div>
-      <div class="row">
-        <button class="secondary" onclick="applyBatchTagsToSelectedImages()">将上面输入应用到已选图片</button>
-        <button onclick="previewPixivBatchReview()">批量预览审核</button>
-        <button onclick="submitPixivBatchReview()">批量确认审核</button>
-      </div>
-      <div class="list" id="pixivBatchPreview"></div>
     </div>
     <div class="pixiv-grid" id="pixivReviewImages"></div>
   </section>
@@ -329,6 +345,7 @@ HTML_PAGE = """<!DOCTYPE html>
 document.getElementById('notice').textContent = '当前使用站点会话访问；如需切换账户，可点击右上角退出登录。';
 
 let toastTimer = null;
+let pixivReviewSearchTimer = null;
 
 function showToast(message, detail = '') {
   const toast = document.getElementById('toast');
@@ -367,6 +384,8 @@ const pixivReviewState = {
   previewImageId: null,
   batchPreview: [],
   manualTagFormImageId: null,
+  searchKeyword: '',
+  searchContext: null,
 };
 
 const imagePreviewState = {
@@ -852,20 +871,84 @@ function renderPixivReviewCard(item) {
 
 function renderPixivReviewList() {
   const items = Object.values(pixivReviewState.items).sort((a, b) => (b.image_id || 0) - (a.image_id || 0));
-  document.getElementById('pixivReviewImages').innerHTML = items.length ? items.map(renderPixivReviewCard).join('') : '<div class="empty">当前筛选没有 Pixiv 待审图片</div>';
+  const keyword = String(pixivReviewState.searchKeyword || '').trim();
+  const emptyText = keyword
+    ? '没有找到相关待审图；可以先补 alias / Pixiv 平台词，或清空搜索查看默认队列。'
+    : '当前筛选没有 Pixiv 待审图片';
+  document.getElementById('pixivReviewImages').innerHTML = items.length ? items.map(renderPixivReviewCard).join('') : `<div class="empty">${escapeHtml(emptyText)}</div>`;
   renderPixivBatchSelectionHint();
 }
 
+function renderPixivReviewSearchContext() {
+  const box = document.getElementById('pixivReviewSearchContext');
+  if (!box) return;
+  const keyword = String(pixivReviewState.searchKeyword || '').trim();
+  const context = pixivReviewState.searchContext || {};
+  if (!keyword) {
+    box.textContent = '先筛选角色相关待审图，再勾选图片做批量审核。';
+    return;
+  }
+  const matchedTags = (context.matched_tags || []).map(item => item.name).filter(Boolean);
+  const terms = uniqueTexts(context.expanded_terms || context.terms || []).slice(0, 12);
+  const count = Object.keys(pixivReviewState.items || {}).length;
+  if (matchedTags.length) {
+    box.textContent = `${keyword} 命中：${matchedTags.join('、')}；展开词：${terms.join('、') || '无'}；当前 ${count} 张`;
+  } else {
+    box.textContent = `${keyword} 未命中主 tag；已按待审 tag / Pixiv 来源词直接模糊搜索；当前 ${count} 张`;
+  }
+}
+
+function schedulePixivReviewSearch() {
+  if (pixivReviewSearchTimer) clearTimeout(pixivReviewSearchTimer);
+  pixivReviewSearchTimer = setTimeout(() => {
+    loadPixivReviewImages().catch(err => {
+      console.error(err);
+      showToast(err.message || err);
+    });
+  }, 420);
+}
+
+function handlePixivReviewKeywordKeydown(event) {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  if (pixivReviewSearchTimer) clearTimeout(pixivReviewSearchTimer);
+  loadPixivReviewImages().catch(err => {
+    console.error(err);
+    showToast(err.message || err);
+  });
+}
+
+function clearPixivReviewSearch() {
+  const input = document.getElementById('pixivReviewKeyword');
+  if (input) input.value = '';
+  if (pixivReviewSearchTimer) clearTimeout(pixivReviewSearchTimer);
+  loadPixivReviewImages().catch(err => {
+    console.error(err);
+    showToast(err.message || err);
+  });
+}
+
 async function loadPixivReviewImages() {
-  const q = new URLSearchParams({status: document.getElementById('pixivReviewStatus').value, limit: '24'});
+  const keywordInput = document.getElementById('pixivReviewKeyword');
+  const keyword = keywordInput ? String(keywordInput.value || '').trim() : '';
+  pixivReviewState.searchKeyword = keyword;
+  const q = new URLSearchParams({
+    status: document.getElementById('pixivReviewStatus').value,
+    keyword,
+    limit: '24',
+  });
   const data = await fetchJson(`/api/pixiv-review-images?${q.toString()}`);
   pixivReviewState.items = {};
+  pixivReviewState.searchContext = data.search_context || null;
+  pixivReviewState.batchPreview = [];
   for (const item of (data.items || [])) {
     pixivReviewState.items[item.image_id] = item;
     ensurePixivReviewSelection(item);
   }
   prunePixivReviewSelections();
   renderPixivReviewList();
+  renderPixivReviewSearchContext();
+  renderPixivBatchPreview();
   renderPixivPreview();
 }
 
@@ -878,7 +961,13 @@ function selectedPixivReviewImageIds() {
 }
 
 function renderPixivBatchSelectionHint() {
-  document.getElementById('pixivBatchSelectionHint').textContent = `当前已选 ${selectedPixivReviewImageIds().length} 张图片。`;
+  const count = selectedPixivReviewImageIds().length;
+  document.getElementById('pixivBatchSelectionHint').textContent = `当前已选 ${count} 张图片。`;
+  const box = document.getElementById('pixivBatchBox');
+  if (box) {
+    box.classList.toggle('is-idle', count === 0);
+    box.classList.toggle('is-active', count > 0);
+  }
 }
 
 function togglePixivReviewImageSelection(imageId) {
@@ -1624,6 +1713,7 @@ async function executeTagMerge() {
 
 resetPixivPlatformForm();
 clearPixivBulkMapSelection();
+renderPixivReviewSearchContext();
 renderPixivBatchSelectionHint();
 renderPixivBatchPreview();
 renderTagMergePreview();
@@ -1891,8 +1981,17 @@ class GalleryWebUI:
                 return source
         return sources[0] if sources else {}
 
-    def _build_source_term_payload(self, term: str, origin: str) -> dict[str, Any]:
+    def _build_source_term_payload(
+        self,
+        term: str,
+        origin: str,
+        *,
+        cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         text = str(term or "").strip()
+        cache_key = (str(origin or "raw"), normalize_tag_name(text))
+        if cache is not None and cache_key in cache:
+            return dict(cache[cache_key])
         platform_match = self.db.resolve_platform_term("pixiv", text)
         resolved_tag_name = ""
         resolution = ""
@@ -1913,7 +2012,7 @@ class GalleryWebUI:
                 resolution = "未命中现有主 tag"
                 if candidates:
                     resolution += "；可参考：" + "、".join(candidates)
-        return {
+        payload = {
             "term": text,
             "origin": str(origin or "raw"),
             "resolved_tag_name": resolved_tag_name,
@@ -1921,13 +2020,27 @@ class GalleryWebUI:
             "match_type": match_type,
             "candidate_tags": candidates,
         }
+        if cache is not None:
+            cache[cache_key] = dict(payload)
+        return payload
 
-    def _build_candidate_tag_payload(self, tag_name: str) -> dict[str, Any] | None:
+    def _build_candidate_tag_payload(
+        self,
+        tag_name: str,
+        *,
+        cache: dict[str, dict[str, Any] | None] | None = None,
+    ) -> dict[str, Any] | None:
+        normalized = normalize_tag_name(tag_name)
+        if cache is not None and normalized in cache:
+            cached = cache[normalized]
+            return dict(cached) if cached else None
         row = self.db.get_tag_row(tag_name)
         if not row:
+            if cache is not None:
+                cache[normalized] = None
             return None
         canonical_name = str(row["name"])
-        return {
+        payload = {
             "name": canonical_name,
             "is_character": bool(row["is_character"]),
             "aliases": self.db.list_aliases(canonical_name),
@@ -1944,6 +2057,9 @@ class GalleryWebUI:
                 limit=8,
             ),
         }
+        if cache is not None:
+            cache[normalized] = dict(payload)
+        return payload
 
     def _candidate_tag_names_for_term(self, term: str) -> list[str]:
         match = self.db.resolve_tag(term, allow_fuzzy=True, candidate_limit=5)
@@ -2031,6 +2147,8 @@ class GalleryWebUI:
         image_id: int,
         *,
         review_statuses: tuple[str, ...] | None = None,
+        source_term_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+        candidate_tag_cache: dict[str, dict[str, Any] | None] | None = None,
     ) -> dict[str, Any] | None:
         detail = self.db.get_image_detail(image_id)
         if not detail:
@@ -2051,7 +2169,7 @@ class GalleryWebUI:
                 if not normalized or normalized in seen_terms:
                     continue
                 seen_terms.add(normalized)
-                source_terms.append(self._build_source_term_payload(term, origin))
+                source_terms.append(self._build_source_term_payload(term, origin, cache=source_term_cache))
 
         review_tasks = self._build_review_task_payloads(image_id, statuses=review_statuses)
 
@@ -2093,7 +2211,7 @@ class GalleryWebUI:
 
         candidate_tags: list[dict[str, Any]] = []
         for name in candidate_names[:12]:
-            payload = self._build_candidate_tag_payload(name)
+            payload = self._build_candidate_tag_payload(name, cache=candidate_tag_cache)
             if payload:
                 candidate_tags.append(payload)
 
@@ -2288,17 +2406,28 @@ class GalleryWebUI:
         args = request.query
         statuses = [item.strip() for item in str(args.get("status", "") or "").split(",") if item.strip()]
         effective_statuses = tuple(statuses or ["pending", "uncertain"])
+        keyword = str(args.get("keyword", "") or "").strip()
+        search_context = self.db.build_pixiv_review_search_context(keyword, platform="pixiv")
         rows = self.db.list_pixiv_review_images(
             statuses=effective_statuses,
             limit=min(max(int(args.get("limit", 24) or 24), 1), 100),
             offset=max(int(args.get("offset", 0) or 0), 0),
+            keyword=keyword,
+            search_context=search_context,
         )
         items: list[dict[str, Any]] = []
+        source_term_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        candidate_tag_cache: dict[str, dict[str, Any] | None] = {}
         for row in rows:
-            item = self._build_pixiv_review_item(int(row["image_id"]), review_statuses=effective_statuses)
+            item = self._build_pixiv_review_item(
+                int(row["image_id"]),
+                review_statuses=effective_statuses,
+                source_term_cache=source_term_cache,
+                candidate_tag_cache=candidate_tag_cache,
+            )
             if item:
                 items.append(item)
-        return self._json_response({"items": items})
+        return self._json_response({"items": items, "search_context": search_context})
 
     async def api_pixiv_review_image(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
