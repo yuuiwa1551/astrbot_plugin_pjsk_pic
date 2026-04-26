@@ -708,19 +708,24 @@ function togglePixivManualTagForm(imageId) {
   renderPixivPreview();
 }
 
-function renderPixivManualTagForm(imageId) {
+function pixivManualTagScope(surface, imageId) {
+  return `${String(surface || 'card').replace(/[^a-z0-9_-]/gi, '')}-${imageId}`;
+}
+
+function renderPixivManualTagForm(imageId, surface) {
   if (pixivReviewState.manualTagFormImageId !== imageId) return '';
+  const scope = pixivManualTagScope(surface, imageId);
   return `
-    <div class="row inline-form">
-      <input id="pixivNewTagName-${imageId}" placeholder="新增主 tag" style="flex:1;" />
-      <label class="muted"><input id="pixivNewTagCharacter-${imageId}" type="checkbox" checked /> 角色</label>
-      <button class="mini-btn" onclick="createPixivReviewMainTag(${imageId})">添加</button>
+    <div class="row inline-form" data-pixiv-manual-tag-form="${escapeAttr(scope)}">
+      <input id="pixivNewTagName-${escapeAttr(scope)}" data-pixiv-new-tag-name placeholder="新增主 tag" style="flex:1;" />
+      <label class="muted"><input id="pixivNewTagCharacter-${escapeAttr(scope)}" data-pixiv-new-tag-character type="checkbox" checked /> 角色</label>
+      <button class="mini-btn" onclick='createPixivReviewMainTag(${imageId}, ${JSON.stringify(surface || 'card')})'>添加</button>
       <button class="secondary mini-btn" onclick="togglePixivManualTagForm(${imageId})">取消</button>
     </div>
   `;
 }
 
-function renderCandidateTagSection(item, selectedTags) {
+function renderCandidateTagSection(item, selectedTags, surface = 'card') {
   const imageId = item.image_id;
   const chips = (item.candidate_tags || [])
     .map(tag => renderCandidateTagChip(imageId, tag, selectedTags.some(name => normalizeKey(name) === normalizeKey(tag.name))))
@@ -730,14 +735,16 @@ function renderCandidateTagSection(item, selectedTags) {
       <div class="subheading">候选主 tag</div>
       <button class="secondary mini-btn" title="新增主 tag" onclick="togglePixivManualTagForm(${imageId})">+</button>
     </div>
-    ${renderPixivManualTagForm(imageId)}
+    ${renderPixivManualTagForm(imageId, surface)}
     <div class="chip-row">${chips}</div>
   `;
 }
 
-async function createPixivReviewMainTag(imageId) {
-  const input = document.getElementById(`pixivNewTagName-${imageId}`);
-  const checkbox = document.getElementById(`pixivNewTagCharacter-${imageId}`);
+async function createPixivReviewMainTag(imageId, surface = 'card') {
+  const scope = pixivManualTagScope(surface, imageId);
+  const form = document.querySelector(`[data-pixiv-manual-tag-form="${scope}"]`);
+  const input = form ? form.querySelector('[data-pixiv-new-tag-name]') : null;
+  const checkbox = form ? form.querySelector('[data-pixiv-new-tag-character]') : null;
   const tagName = input ? input.value.trim() : '';
   if (!tagName) {
     showToast('请先填写主 tag');
@@ -827,7 +834,7 @@ function renderPixivReviewCard(item) {
         <div class="tag-block">
           <div class="subheading">当前审核项</div>
           <div>${(item.review_tasks || []).map(task => `<span class="pill">${escapeHtml(task.tag_name)}(${escapeHtml(task.status)})</span>`).join('') || '<span class="muted">无</span>'}</div>
-          ${renderCandidateTagSection(item, selectedTags)}
+          ${renderCandidateTagSection(item, selectedTags, 'card')}
           <div class="subheading">Pixiv 来源 tag</div>
           <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
           <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
@@ -1091,7 +1098,7 @@ function renderPixivPreview() {
       <pre class="json">${escapeHtml(JSON.stringify({raw_tags: item.raw_tags || [], translated_tags: item.translated_tags || []}, null, 2))}</pre>
     </div>
     <div>
-      ${renderCandidateTagSection(item, selectedTags)}
+      ${renderCandidateTagSection(item, selectedTags, 'preview')}
       <div class="subheading">Pixiv 来源 tag</div>
       <div class="chip-row">${(item.source_terms || []).map(term => renderSourceTermChip(imageId, term, selectedTerms.some(name => normalizeKey(name) === normalizeKey(term.term)))).join('') || '<span class="muted">暂无来源 tag</span>'}</div>
       <div class="muted">已选主 tag：${selectedTags.map(escapeHtml).join('、') || '无'}；已选来源词：${selectedTerms.map(escapeHtml).join('、') || '无'}</div>
