@@ -12,6 +12,8 @@ from .crawl_tag_rules import parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
 from .matcher import normalize_tag_name
 
+WEBUI_STATIC_DIR = Path(__file__).resolve().parent / "webui_static"
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1817,8 +1819,7 @@ class GalleryWebUI:
             return
 
         app = web.Application()
-        app.add_routes(
-            [
+        routes = [
                 web.get("/", self.ui_page),
                 web.post("/api/auth/login", self.api_auth_login),
                 web.post("/api/auth/logout", self.api_auth_logout),
@@ -1853,7 +1854,10 @@ class GalleryWebUI:
                 web.delete("/api/tag/alias", self.api_tag_alias),
                 web.post("/api/tag/character", self.api_tag_character),
             ]
-        )
+        assets_dir = WEBUI_STATIC_DIR / "assets"
+        if assets_dir.exists():
+            routes.append(web.static("/assets", assets_dir))
+        app.add_routes(routes)
 
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
@@ -2238,6 +2242,9 @@ class GalleryWebUI:
     async def ui_page(self, request: web.Request) -> web.Response:
         if self.access_token and not self._is_authorized(request):
             return web.Response(text=LOGIN_PAGE, content_type="text/html", charset="utf-8")
+        static_index = WEBUI_STATIC_DIR / "index.html"
+        if static_index.exists():
+            return web.FileResponse(static_index)
         return web.Response(text=HTML_PAGE, content_type="text/html", charset="utf-8")
 
     async def api_auth_login(self, request: web.Request) -> web.Response:

@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.pyo
+webui/node_modules/
+webui/dist/
 plan.md
 *?plan.md
 data/plugin_data/
