@@ -4,7 +4,6 @@ import { useRoute, useRouter } from 'vue-router';
 import {
   BadgeCheck,
   Boxes,
-  ClipboardCheck,
   GitMerge,
   Images,
   LayoutDashboard,
@@ -16,7 +15,7 @@ import {
 } from 'lucide-vue-next';
 import { apiUrl, fetchJson, imageFileUrl } from './api';
 import { pageRoutes, type PageKey } from './router';
-import type { Dict, ImageItem, PixivReviewItem, ReviewTask, SummaryStats, TagItem } from './types';
+import type { Dict, ImageItem, PaginatedResponse, PixivReviewItem, SummaryStats, TagItem } from './types';
 
 const route = useRoute();
 const router = useRouter();
@@ -24,7 +23,6 @@ const router = useRouter();
 const iconMap: Record<PageKey, Component> = {
   overview: LayoutDashboard,
   gallery: Images,
-  reviews: ClipboardCheck,
   jobs: ListChecks,
   tags: Tags,
   'pixiv-review': BadgeCheck,
@@ -43,8 +41,13 @@ const summary = ref<SummaryStats>({});
 const gallery = reactive({
   keyword: '',
   tag: '',
-  status: '',
+  status: 'approved,manual_approved',
   platform: '',
+  page: 1,
+  limit: 30,
+  total: 0,
+  pageCount: 1,
+  jumpPage: 1,
   items: [] as ImageItem[],
 });
 
@@ -55,11 +58,6 @@ const jobs = reactive({
   includeTags: '',
   excludeTags: '',
   items: [] as Dict[],
-});
-
-const reviews = reactive({
-  status: '',
-  items: [] as ReviewTask[],
 });
 
 const tags = reactive({
@@ -77,6 +75,11 @@ const pixiv = reactive({
   status: 'pending,uncertain',
   keyword: '',
   searchContext: null as Dict | null,
+  page: 1,
+  limit: 30,
+  total: 0,
+  pageCount: 1,
+  jumpPage: 1,
   items: [] as PixivReviewItem[],
   selectedImages: {} as Record<number, boolean>,
   selectedTags: {} as Record<number, string[]>,
@@ -177,6 +180,41 @@ function parseCsv(value: unknown): string[] {
   return uniqueTexts(String(value || '').split(/[,，\n]/g));
 }
 
+const pageSizeOptions = [15, 30, 60, 100];
+
+const statusLabels: Record<string, string> = {
+  pending: '待审核',
+  uncertain: '待确认',
+  approved: '已通过',
+  manual_approved: '人工通过',
+  rejected: '已拒绝',
+  manual_rejected: '人工拒绝',
+  running: '运行中',
+  queued: '排队中',
+  completed: '已完成',
+  failed: '失败',
+};
+
+function statusLabel(status?: string): string {
+  const text = String(status || '').trim();
+  if (!text) return '未知';
+  return text.split(',').map((item) => statusLabels[item.trim()] || item.trim()).filter(Boolean).join(' / ');
+}
+
+function clampPage(page: number, pageCount: number): number {
+  const safeCount = Math.max(1, Number(pageCount || 1));
+  const safePage = Number.isFinite(page) ? Math.trunc(page) : 1;
+  return Math.min(Math.max(safePage || 1, 1), safeCount);
+}
+
+function applyPagination(target: { page: number; limit: number; total: number; pageCount: number; jumpPage: number }, data: Partial<PaginatedResponse<unknown>>): void {
+  target.limit = Number(data.limit || target.limit || 30);
+  target.total = Number(data.total || 0);
+  target.pageCount = Math.max(1, Number(data.page_count || 1));
+  target.page = clampPage(Number(data.page || 1), target.pageCount);
+  target.jumpPage = target.page;
+}
+
 function taskStatusClass(status?: string): string {
   const text = String(status || '');
   if (['approved', 'manual_approved'].includes(text)) return 'success';
@@ -194,7 +232,6 @@ async function loadPage(page: PageKey): Promise<void> {
     if (page === 'overview') await loadSummary();
     if (page === 'gallery') await loadImages();
     if (page === 'jobs') await loadJobs();
-    if (page === 'reviews') await loadReviews();
     if (page === 'tags') await loadTags();
     if (page === 'pixiv-review') await loadPixivReviewImages();
     if (page === 'pixiv-platform') await loadPlatformTerms();
@@ -227,10 +264,27 @@ async function loadImages(): Promise<void> {
     tag: gallery.tag,
     review_status: gallery.status,
     platform: gallery.platform,
-    limit: '36',
+    page: String(gallery.page),
+    limit: String(gallery.limit),
   });
-  const data = await fetchJson<{ items: ImageItem[] }>(`/api/images?${q.toString()}`);
+  const data = await fetchJson<PaginatedResponse<ImageItem>>(`/api/images?${q.toString()}`);
   gallery.items = data.items || [];
+  applyPagination(gallery, data);
+}
+
+function searchImages(): void {
+  gallery.page = 1;
+  void withBusy(loadImages);
+}
+
+function changeGalleryPage(page: number): void {
+  gallery.page = clampPage(page, gallery.pageCount);
+  void withBusy(loadImages);
+}
+
+function changeGalleryLimit(): void {
+  gallery.page = 1;
+  void withBusy(loadImages);
 }
 
 async function openImagePreview(imageId: number): Promise<void> {
@@ -288,19 +342,13 @@ async function retryJob(jobId: number): Promise<void> {
   });
 }
 
-async function loadReviews(): Promise<void> {
-  const q = new URLSearchParams({ status: reviews.status, limit: '50' });
-  const data = await fetchJson<{ items: ReviewTask[] }>(`/api/reviews?${q.toString()}`);
-  reviews.items = data.items || [];
-}
-
 async function reviewDecision(reviewId: number, approved: boolean): Promise<void> {
   await withBusy(async () => {
     const result = await fetchJson<Dict>('/api/reviews/decision', {
       method: 'POST',
       body: JSON.stringify({ review_id: reviewId, approved }),
     });
-    await loadReviews();
+    await loadImages();
     await loadSummary();
     showToast(String(result.message || '审核状态已更新'));
   });
@@ -370,31 +418,60 @@ async function loadPixivReviewImages(): Promise<void> {
   const q = new URLSearchParams({
     status: pixiv.status,
     keyword: pixiv.keyword.trim(),
-    limit: '24',
+    page: String(pixiv.page),
+    limit: String(pixiv.limit),
   });
-  const data = await fetchJson<{ items: PixivReviewItem[]; search_context: Dict }>(`/api/pixiv-review-images?${q.toString()}`);
+  const data = await fetchJson<PaginatedResponse<PixivReviewItem> & { search_context?: Dict }>(`/api/pixiv-review-images?${q.toString()}`);
   pixiv.items = data.items || [];
   pixiv.searchContext = data.search_context || null;
   pixiv.batchPreview = [];
+  applyPagination(pixiv, data);
   for (const item of pixiv.items) ensurePixivSelection(item);
   prunePixivSelections();
+}
+
+async function refillPixivPageIfEmpty(): Promise<void> {
+  if (pixiv.items.length) return;
+  await loadPixivReviewImages();
+}
+
+function resetPixivPage(): void {
+  pixiv.page = 1;
+  pixiv.jumpPage = 1;
 }
 
 function schedulePixivSearch(): void {
   if (pixivSearchTimer) window.clearTimeout(pixivSearchTimer);
   pixivSearchTimer = window.setTimeout(() => {
+    resetPixivPage();
     void withBusy(loadPixivReviewImages);
   }, 420);
 }
 
 function submitPixivSearch(): void {
   if (pixivSearchTimer) window.clearTimeout(pixivSearchTimer);
+  resetPixivPage();
   void withBusy(loadPixivReviewImages);
 }
 
 function clearPixivSearch(): void {
   pixiv.keyword = '';
   submitPixivSearch();
+}
+
+function changePixivStatus(): void {
+  resetPixivPage();
+  void withBusy(loadPixivReviewImages);
+}
+
+function changePixivPage(page: number): void {
+  pixiv.page = clampPage(page, pixiv.pageCount);
+  void withBusy(loadPixivReviewImages);
+}
+
+function changePixivLimit(): void {
+  resetPixivPage();
+  void withBusy(loadPixivReviewImages);
 }
 
 const pixivSearchMessage = computed(() => {
@@ -404,9 +481,9 @@ const pixivSearchMessage = computed(() => {
   const matched = ((ctx.matched_tags as Dict[] | undefined) || []).map((item) => item.name).filter(Boolean);
   const terms = uniqueTexts((((ctx.expanded_terms || ctx.terms) as string[] | undefined) || [])).slice(0, 12);
   if (matched.length) {
-    return `${keyword} 命中：${matched.join('、')}；展开词：${terms.join('、') || '无'}；当前 ${pixiv.items.length} 张`;
+    return `${keyword} 命中：${matched.join('、')}；展开词：${terms.join('、') || '无'}；共 ${pixiv.total} 张`;
   }
-  return `${keyword} 未命中主 tag；已按待审 tag / Pixiv 来源词直接模糊搜索；当前 ${pixiv.items.length} 张`;
+  return `${keyword} 未命中主 tag；已按待审 tag / Pixiv 来源词直接模糊搜索；共 ${pixiv.total} 张`;
 });
 
 function selectedPixivIds(): number[] {
@@ -481,6 +558,10 @@ async function createPixivMainTag(imageId: number): Promise<void> {
 function removePixivFromQueue(imageIds: number[]): void {
   const set = new Set(imageIds);
   pixiv.items = pixiv.items.filter((item) => !set.has(item.image_id));
+  pixiv.total = Math.max(0, pixiv.total - set.size);
+  pixiv.pageCount = Math.max(1, Math.ceil(pixiv.total / Math.max(1, pixiv.limit)));
+  pixiv.page = clampPage(pixiv.page, pixiv.pageCount);
+  pixiv.jumpPage = pixiv.page;
   for (const imageId of imageIds) {
     delete pixiv.selectedImages[imageId];
     delete pixiv.selectedTags[imageId];
@@ -506,6 +587,7 @@ async function submitPixivReview(imageId: number): Promise<void> {
     });
     closePreview();
     removePixivFromQueue([imageId]);
+    await refillPixivPageIfEmpty();
     showToast(String(result.message || '已完成审核'), '已从当前审批队列移除。');
   });
 }
@@ -518,6 +600,7 @@ async function rejectPixivReviewImage(imageId: number): Promise<void> {
     });
     closePreview();
     removePixivFromQueue([imageId]);
+    await refillPixivPageIfEmpty();
     showToast(String(result.message || '已拒绝图片'), result.post_url ? `已记录跳过来源：${String(result.post_url)}` : '已从当前审批队列移除。');
   });
 }
@@ -568,6 +651,7 @@ async function submitPixivBatch(): Promise<void> {
     });
     pixiv.batchPreview = (result.items as Dict[] | undefined) || [];
     removePixivFromQueue(items.map((item) => Number(item.image_id)).filter(Boolean));
+    await refillPixivPageIfEmpty();
     showToast(String(result.message || '批量审核完成'), '已从当前审批队列移除。');
   });
 }
@@ -816,18 +900,19 @@ async function executeMerge(): Promise<void> {
       <section v-if="activePage === 'gallery'" class="page">
         <div class="toolbar">
           <div class="toolbar-row">
-            <input v-model="gallery.keyword" class="grow" placeholder="关键词 / tag / alias" @keydown.enter="loadImages" />
-            <input v-model="gallery.tag" placeholder="精确 tag" @keydown.enter="loadImages" />
-            <select v-model="gallery.status">
+            <input v-model="gallery.keyword" class="grow" placeholder="关键词 / tag / alias" @keydown.enter="searchImages" />
+            <input v-model="gallery.tag" placeholder="精确 tag" @keydown.enter="searchImages" />
+            <select v-model="gallery.status" @change="searchImages">
               <option value="">全部状态</option>
-              <option>approved</option>
-              <option>manual_approved</option>
-              <option>pending</option>
-              <option>uncertain</option>
-              <option>rejected</option>
-              <option>manual_rejected</option>
+              <option value="approved,manual_approved">已通过</option>
+              <option value="approved">已通过（自动）</option>
+              <option value="manual_approved">人工通过</option>
+              <option value="pending">待审核</option>
+              <option value="uncertain">待确认</option>
+              <option value="rejected">已拒绝</option>
+              <option value="manual_rejected">人工拒绝</option>
             </select>
-            <select v-model="gallery.platform">
+            <select v-model="gallery.platform" @change="searchImages">
               <option value="">全部平台</option>
               <option>pixiv</option>
               <option>x</option>
@@ -835,7 +920,7 @@ async function executeMerge(): Promise<void> {
               <option>generic</option>
               <option>submission</option>
             </select>
-            <button type="button" @click="loadImages">
+            <button type="button" @click="searchImages">
               <Search />
               搜索
             </button>
@@ -856,7 +941,7 @@ async function executeMerge(): Promise<void> {
               <div class="muted">{{ item.width || 0 }}x{{ item.height || 0 }} · {{ item.format || '-' }} · {{ item.platform || 'local' }}</div>
               <div class="chips">
                 <span v-for="tag in item.tags || []" :key="String(tag.name)" class="pill" :class="taskStatusClass(String(tag.review_status || ''))">
-                  {{ tag.name }}{{ tag.review_status ? `(${tag.review_status})` : '' }}
+                  {{ tag.name }}{{ tag.review_status ? `(${statusLabel(String(tag.review_status))})` : '' }}
                 </span>
               </div>
               <div class="actions">
@@ -865,6 +950,19 @@ async function executeMerge(): Promise<void> {
               </div>
             </div>
           </article>
+        </div>
+        <div class="pagination-bar">
+          <span class="muted">第 {{ gallery.page }} / {{ gallery.pageCount }} 页，共 {{ gallery.total }} 张</span>
+          <button class="secondary mini" type="button" :disabled="gallery.page <= 1" @click="changeGalleryPage(gallery.page - 1)">上一页</button>
+          <button class="secondary mini" type="button" :disabled="gallery.page >= gallery.pageCount" @click="changeGalleryPage(gallery.page + 1)">下一页</button>
+          <label class="muted">跳到 <input v-model.number="gallery.jumpPage" class="page-input" type="number" min="1" :max="gallery.pageCount" @keydown.enter="changeGalleryPage(gallery.jumpPage)" /> 页</label>
+          <button class="secondary mini" type="button" @click="changeGalleryPage(gallery.jumpPage)">跳转</button>
+          <label class="muted">每页
+            <select v-model.number="gallery.limit" class="page-size" @change="changeGalleryLimit">
+              <option v-for="size in pageSizeOptions" :key="`gallery-size-${size}`" :value="size">{{ size }}</option>
+            </select>
+            张
+          </label>
         </div>
       </section>
 
@@ -890,44 +988,12 @@ async function executeMerge(): Promise<void> {
           <article v-for="item in jobs.items" :key="Number(item.id)" class="item">
             <div class="title-line">
               <strong>#{{ item.id }}</strong>
-              <span class="pill" :class="taskStatusClass(String(item.status || ''))">{{ item.status }}</span>
+              <span class="pill" :class="taskStatusClass(String(item.status || ''))">{{ statusLabel(String(item.status || '')) }}</span>
             </div>
             <div class="muted">{{ item.platform }} · {{ item.source_url || item.url || '-' }}</div>
             <div class="muted">{{ item.message || item.error || '' }}</div>
             <div class="actions">
               <button class="secondary mini" type="button" @click="retryJob(Number(item.id))">重试</button>
-            </div>
-          </article>
-        </div>
-      </section>
-
-      <section v-if="activePage === 'reviews'" class="page">
-        <div class="toolbar">
-          <div class="toolbar-row">
-            <select v-model="reviews.status" @change="loadReviews">
-              <option value="">全部</option>
-              <option>pending</option>
-              <option>uncertain</option>
-              <option>rejected</option>
-              <option>approved</option>
-              <option>manual_approved</option>
-              <option>manual_rejected</option>
-            </select>
-            <button type="button" @click="loadReviews">刷新审核</button>
-          </div>
-        </div>
-        <div v-if="!reviews.items.length" class="empty">暂无审核任务</div>
-        <div v-else class="grid review-grid">
-          <article v-for="item in reviews.items" :key="item.id" class="item">
-            <div class="title-line">
-              <strong>#{{ item.id }}</strong>
-              <span>{{ item.tag_name }}</span>
-              <span class="pill" :class="taskStatusClass(item.status)">{{ item.status }}</span>
-            </div>
-            <div class="muted">image #{{ item.image_id }} · {{ item.reason || '-' }}</div>
-            <div class="actions">
-              <button class="mini" type="button" @click="reviewDecision(item.id, true)">通过</button>
-              <button class="mini danger" type="button" @click="reviewDecision(item.id, false)">拒绝</button>
             </div>
           </article>
         </div>
@@ -977,11 +1043,11 @@ async function executeMerge(): Promise<void> {
       <section v-if="activePage === 'pixiv-review'" class="page">
         <div class="toolbar">
           <div class="toolbar-row">
-            <select v-model="pixiv.status" @change="loadPixivReviewImages">
-              <option value="pending,uncertain">待处理（pending / uncertain）</option>
-              <option value="pending">pending</option>
-              <option value="uncertain">uncertain</option>
-              <option value="rejected">rejected</option>
+            <select v-model="pixiv.status" @change="changePixivStatus">
+              <option value="pending,uncertain">待处理（待审核 / 待确认）</option>
+              <option value="pending">仅待审核</option>
+              <option value="uncertain">仅待确认</option>
+              <option value="rejected">仅已拒绝</option>
             </select>
             <input
               v-model="pixiv.keyword"
@@ -1047,9 +1113,9 @@ async function executeMerge(): Promise<void> {
               <div class="muted">标题：{{ item.title || '-' }}</div>
               <div class="muted">来源：<a v-if="item.post_url" :href="item.post_url" target="_blank" rel="noreferrer">{{ item.post_url }}</a><span v-else>-</span></div>
               <div class="chips">
-                <span v-for="task in item.review_tasks || []" :key="task.id" class="pill" :class="taskStatusClass(task.status)">{{ task.tag_name }}({{ task.status }})</span>
+                <span v-for="task in item.review_tasks || []" :key="task.id" class="pill" :class="taskStatusClass(task.status)">{{ task.tag_name }}({{ statusLabel(task.status) }})</span>
               </div>
-              <div class="panel" style="box-shadow: none; margin: 0;">
+              <div class="panel review-subpanel">
                 <div class="panel-header">
                   <h3 class="panel-title">归入主 tag</h3>
                   <button class="secondary mini" type="button" @click="toggleManualTagForm(item.image_id)">+</button>
@@ -1059,7 +1125,7 @@ async function executeMerge(): Promise<void> {
                   <label class="muted"><input v-model="pixiv.manualTagCharacter" type="checkbox" /> 角色</label>
                   <button class="mini" type="button" @click="createPixivMainTag(item.image_id)">添加</button>
                 </div>
-                <div class="chips">
+                <div class="chips scroll-chips">
                   <button
                     v-for="tag in item.candidate_tags || []"
                     :key="tag.name"
@@ -1074,7 +1140,7 @@ async function executeMerge(): Promise<void> {
               </div>
               <div>
                 <div class="muted" style="margin-bottom: 6px;">alias / Pixiv 来源词</div>
-                <div class="chips">
+                <div class="chips scroll-chips">
                   <button
                     v-for="term in item.source_terms || []"
                     :key="`${term.origin}-${term.term}`"
@@ -1089,13 +1155,26 @@ async function executeMerge(): Promise<void> {
                 </div>
               </div>
               <div class="muted">归入主 tag：{{ (pixiv.selectedTags[item.image_id] || [])[0] || '无' }}；alias / 搜索词：{{ (pixiv.selectedTerms[item.image_id] || []).join('、') || '无' }}</div>
-              <div class="actions">
+              <div class="actions card-actions">
                 <button type="button" @click="submitPixivReview(item.image_id)">确认审核</button>
                 <button class="danger" type="button" @click="rejectPixivReviewImage(item.image_id)">拒绝图片</button>
                 <button class="secondary" type="button" @click="resetPixivSelection(item.image_id)">重置</button>
               </div>
             </div>
           </article>
+        </div>
+        <div class="pagination-bar">
+          <span class="muted">第 {{ pixiv.page }} / {{ pixiv.pageCount }} 页，共 {{ pixiv.total }} 张</span>
+          <button class="secondary mini" type="button" :disabled="pixiv.page <= 1" @click="changePixivPage(pixiv.page - 1)">上一页</button>
+          <button class="secondary mini" type="button" :disabled="pixiv.page >= pixiv.pageCount" @click="changePixivPage(pixiv.page + 1)">下一页</button>
+          <label class="muted">跳到 <input v-model.number="pixiv.jumpPage" class="page-input" type="number" min="1" :max="pixiv.pageCount" @keydown.enter="changePixivPage(pixiv.jumpPage)" /> 页</label>
+          <button class="secondary mini" type="button" @click="changePixivPage(pixiv.jumpPage)">跳转</button>
+          <label class="muted">每页
+            <select v-model.number="pixiv.limit" class="page-size" @change="changePixivLimit">
+              <option v-for="size in pageSizeOptions" :key="`pixiv-size-${size}`" :value="size">{{ size }}</option>
+            </select>
+            张
+          </label>
         </div>
       </section>
 
@@ -1242,7 +1321,7 @@ async function executeMerge(): Promise<void> {
       </header>
       <div class="modal-body">
         <div v-if="preview.mode === 'image' && preview.imageDetail" class="modal-grid">
-          <div>
+          <div class="modal-image-pane">
             <img class="modal-image" :src="imageFileUrl(preview.imageId)" alt="" />
           </div>
           <div class="panel">
@@ -1250,22 +1329,24 @@ async function executeMerge(): Promise<void> {
             <div class="muted">{{ preview.imageDetail.image?.width || 0 }}x{{ preview.imageDetail.image?.height || 0 }} · {{ preview.imageDetail.image?.format || '-' }}</div>
             <div class="chips" style="margin: 10px 0;">
               <span v-for="tag in preview.imageDetail.tags || []" :key="String(tag.name)" class="pill" :class="taskStatusClass(String(tag.review_status || ''))">
-                {{ tag.name }}{{ tag.review_status ? `(${tag.review_status})` : '' }}
+                {{ tag.name }}{{ tag.review_status ? `(${statusLabel(String(tag.review_status))})` : '' }}
               </span>
             </div>
             <pre class="json">{{ JSON.stringify(preview.imageDetail.sources || [], null, 2) }}</pre>
           </div>
         </div>
         <div v-if="preview.mode === 'pixiv' && preview.pixivItem" class="modal-grid">
-          <div>
-            <img class="modal-image" :src="imageFileUrl(preview.pixivItem.image_id)" alt="" />
+          <div class="modal-left-pane">
+            <div class="modal-image-pane">
+              <img class="modal-image" :src="imageFileUrl(preview.pixivItem.image_id)" alt="" />
+            </div>
             <div class="panel" style="margin-top: 12px;">
               <a v-if="preview.pixivItem.post_url" :href="preview.pixivItem.post_url" target="_blank" rel="noreferrer">{{ preview.pixivItem.post_url }}</a>
               <pre class="json" style="margin-top: 10px;">{{ JSON.stringify({ raw_tags: preview.pixivItem.raw_tags || [], translated_tags: preview.pixivItem.translated_tags || [] }, null, 2) }}</pre>
             </div>
           </div>
-          <div>
-            <div class="panel">
+          <div class="modal-review-pane">
+            <div class="panel modal-subpanel">
               <div class="panel-header">
                 <h3 class="panel-title">归入主 tag</h3>
                 <button class="secondary mini" type="button" @click="toggleManualTagForm(preview.pixivItem.image_id)">+</button>
@@ -1275,7 +1356,7 @@ async function executeMerge(): Promise<void> {
                 <label class="muted"><input v-model="pixiv.manualTagCharacter" type="checkbox" /> 角色</label>
                 <button class="mini" type="button" @click="createPixivMainTag(preview.pixivItem.image_id)">添加</button>
               </div>
-              <div class="chips">
+              <div class="chips scroll-chips">
                 <button
                   v-for="tag in preview.pixivItem.candidate_tags || []"
                   :key="tag.name"
@@ -1288,9 +1369,9 @@ async function executeMerge(): Promise<void> {
                 </button>
               </div>
             </div>
-            <div class="panel">
+            <div class="panel modal-subpanel">
               <h3 class="panel-title">alias / Pixiv 来源词</h3>
-              <div class="chips">
+              <div class="chips scroll-chips">
                 <button
                   v-for="term in preview.pixivItem.source_terms || []"
                   :key="`${term.origin}-${term.term}`"
@@ -1304,7 +1385,7 @@ async function executeMerge(): Promise<void> {
                 </button>
               </div>
               <div class="muted" style="margin-top: 8px;">归入主 tag：{{ (pixiv.selectedTags[preview.pixivItem.image_id] || [])[0] || '无' }}；alias / 搜索词：{{ (pixiv.selectedTerms[preview.pixivItem.image_id] || []).join('、') || '无' }}</div>
-              <div class="actions" style="margin-top: 12px;">
+              <div class="actions card-actions">
                 <button type="button" @click="submitPixivReview(preview.pixivItem.image_id)">确认审核</button>
                 <button class="danger" type="button" @click="rejectPixivReviewImage(preview.pixivItem.image_id)">拒绝图片</button>
                 <button class="secondary" type="button" @click="resetPixivSelection(preview.pixivItem.image_id)">重置</button>

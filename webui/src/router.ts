@@ -3,7 +3,6 @@ import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-rou
 export type PageKey =
   | 'overview'
   | 'gallery'
-  | 'reviews'
   | 'jobs'
   | 'tags'
   | 'pixiv-review'
@@ -13,7 +12,6 @@ export type PageKey =
 export const pageRoutes: Array<{ key: PageKey; path: string; label: string; title: string }> = [
   { key: 'overview', path: '/overview', label: '概览', title: '概览' },
   { key: 'gallery', path: '/gallery', label: '图片检索', title: '图片检索' },
-  { key: 'reviews', path: '/reviews', label: '审核任务', title: '审核任务' },
   { key: 'jobs', path: '/jobs', label: '采集任务', title: '采集任务' },
   { key: 'tags', path: '/tags', label: 'tag 管理', title: 'tag 管理' },
   { key: 'pixiv-review', path: '/pixiv-review', label: 'Pixiv 审批', title: 'Pixiv 审批' },
@@ -23,6 +21,7 @@ export const pageRoutes: Array<{ key: PageKey; path: string; label: string; titl
 
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/overview' },
+  { path: '/reviews', redirect: '/overview' },
   ...pageRoutes.map((page) => ({ path: page.path, name: page.key, component: { template: '<span />' } })),
   { path: '/:pathMatch(.*)*', redirect: '/overview' },
 ];
@@ -37,6 +36,9 @@ export function normalizeEntryUrl(): void {
   const legacy = pageRoutes.find((page) => url.hash === `#${page.key}`);
   if (legacy) {
     url.hash = legacy.path;
+    changed = true;
+  } else if (url.hash === '#reviews') {
+    url.hash = '/overview';
     changed = true;
   }
   if (!changed) return;

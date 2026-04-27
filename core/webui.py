@@ -14,6 +14,37 @@ from .matcher import normalize_tag_name
 
 WEBUI_STATIC_DIR = Path(__file__).resolve().parent / "webui_static"
 
+
+def _bounded_int(value: Any, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, min_value), max_value)
+
+
+def _pagination_from_query(args: Any, *, default_limit: int, max_limit: int) -> tuple[int, int]:
+    limit = _bounded_int(args.get("limit", default_limit), default_limit, min_value=1, max_value=max_limit)
+    raw_page = str(args.get("page", "") or "").strip()
+    if raw_page:
+        page = _bounded_int(raw_page, 1, min_value=1, max_value=1_000_000)
+        return limit, (page - 1) * limit
+    offset = _bounded_int(args.get("offset", 0), 0, min_value=0, max_value=1_000_000_000)
+    return limit, offset
+
+
+def _pagination_payload(total: int, limit: int, offset: int) -> dict[str, int]:
+    page_count = max(1, (max(total, 0) + limit - 1) // limit)
+    page = max(1, offset // limit + 1)
+    return {
+        "total": max(total, 0),
+        "limit": limit,
+        "offset": offset,
+        "page": page,
+        "page_count": page_count,
+    }
+
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2276,13 +2307,23 @@ class GalleryWebUI:
         if denied is not None:
             return denied
         args = request.query
+        limit, offset = _pagination_from_query(args, default_limit=30, max_limit=100)
+        total = self.db.count_search_images(
+            keyword=args.get("keyword", ""),
+            review_status=args.get("review_status", ""),
+            tag_name=args.get("tag", ""),
+            platform=args.get("platform", ""),
+        )
+        if total and offset >= total:
+            page_count = max(1, (total + limit - 1) // limit)
+            offset = (page_count - 1) * limit
         rows = self.db.search_images(
             keyword=args.get("keyword", ""),
             review_status=args.get("review_status", ""),
             tag_name=args.get("tag", ""),
             platform=args.get("platform", ""),
-            limit=min(max(int(args.get("limit", 30) or 30), 1), 100),
-            offset=max(int(args.get("offset", 0) or 0), 0),
+            limit=limit,
+            offset=offset,
         )
         items: list[dict] = []
         for row in rows:
@@ -2310,7 +2351,7 @@ class GalleryWebUI:
                     ),
                 }
             )
-        return self._json_response({"items": items})
+        return self._json_response({"items": items, **_pagination_payload(total, limit, offset)})
 
     async def api_image_detail(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
@@ -2414,11 +2455,20 @@ class GalleryWebUI:
         statuses = [item.strip() for item in str(args.get("status", "") or "").split(",") if item.strip()]
         effective_statuses = tuple(statuses or ["pending", "uncertain"])
         keyword = str(args.get("keyword", "") or "").strip()
+        limit, offset = _pagination_from_query(args, default_limit=30, max_limit=100)
         search_context = self.db.build_pixiv_review_search_context(keyword, platform="pixiv")
+        total = self.db.count_pixiv_review_images(
+            statuses=effective_statuses,
+            keyword=keyword,
+            search_context=search_context,
+        )
+        if total and offset >= total:
+            page_count = max(1, (total + limit - 1) // limit)
+            offset = (page_count - 1) * limit
         rows = self.db.list_pixiv_review_images(
             statuses=effective_statuses,
-            limit=min(max(int(args.get("limit", 24) or 24), 1), 100),
-            offset=max(int(args.get("offset", 0) or 0), 0),
+            limit=limit,
+            offset=offset,
             keyword=keyword,
             search_context=search_context,
         )
@@ -2434,7 +2484,7 @@ class GalleryWebUI:
             )
             if item:
                 items.append(item)
-        return self._json_response({"items": items, "search_context": search_context})
+        return self._json_response({"items": items, "search_context": search_context, **_pagination_payload(total, limit, offset)})
 
     async def api_pixiv_review_image(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
@@ -2629,7 +2679,7 @@ class GalleryWebUI:
                 limit=min(max(int(request.query.get("limit", 30) or 30), 1), 80),
             )
         ]
-        return self._json_response({"items": items})
+        return self._json_response({"items": items, **_pagination_payload(total, limit, offset)})
 
     async def api_pixiv_platform_batch_preview(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
@@ -2691,7 +2741,7 @@ class GalleryWebUI:
             keyword=str(request.query.get("keyword", "") or "").strip(),
             limit=min(max(int(request.query.get("limit", 40) or 40), 1), 120),
         )
-        return self._json_response({"items": items})
+        return self._json_response({"items": items, **_pagination_payload(total, limit, offset)})
 
     async def api_tag_merge_preview(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)

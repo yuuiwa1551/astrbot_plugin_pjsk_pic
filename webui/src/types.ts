@@ -1,5 +1,15 @@
 export type Dict<T = any> = Record<string, T>;
 
+export interface PaginatedResponse<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+  page: number;
+  page_count: number;
+  [key: string]: unknown;
+}
+
 export interface SummaryStats {
   images?: number;
   tags?: number;

@@ -23,6 +23,24 @@ IMAGE_TAG_STATUS_PRIORITY = {
 }
 
 
+def split_status_filter(value: str | Iterable[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,，\s]+", value)
+    else:
+        raw_items = [str(item) for item in value]
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        text = str(raw or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
 def utcnow_str() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -3218,24 +3236,26 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
 
-    def list_pixiv_review_images(
+    def _build_pixiv_review_images_query(
         self,
         *,
         statuses: Iterable[str] | None = None,
-        limit: int = 20,
-        offset: int = 0,
         keyword: str = '',
         search_context: dict[str, Any] | None = None,
-    ) -> list[sqlite3.Row]:
-        normalized_statuses = [str(item).strip() for item in (statuses or ['pending', 'uncertain']) if str(item).strip()]
+        count: bool = False,
+    ) -> tuple[str, list[Any]]:
+        normalized_statuses = split_status_filter(statuses or ['pending', 'uncertain'])
         keyword_text = str(keyword or '').strip()
         context = search_context if search_context is not None else self.build_pixiv_review_search_context(keyword_text)
-        sql = """
+        select_sql = "SELECT i.id AS image_id" if count else """
             SELECT i.id AS image_id,
                    MAX(rt.id) AS latest_review_id,
                    MAX(rt.updated_at) AS latest_updated_at,
                    COUNT(DISTINCT rt.id) AS review_task_count,
                    COUNT(DISTINCT CASE WHEN rt.status IN ('pending', 'uncertain') THEN rt.id END) AS pending_task_count
+        """
+        sql = f"""
+            {select_sql}
             FROM review_tasks rt
             JOIN images i ON i.id = rt.image_id
             WHERE i.is_active = 1
@@ -3353,10 +3373,44 @@ class ImageIndexDB:
             if search_clauses:
                 sql += ' AND (' + ' OR '.join(search_clauses) + ')'
                 params.extend(search_params)
+        return sql, params
+
+    def list_pixiv_review_images(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        keyword: str = '',
+        search_context: dict[str, Any] | None = None,
+    ) -> list[sqlite3.Row]:
+        sql, params = self._build_pixiv_review_images_query(
+            statuses=statuses,
+            keyword=keyword,
+            search_context=search_context,
+        )
         sql += ' GROUP BY i.id ORDER BY latest_review_id DESC LIMIT ? OFFSET ?'
         params.extend([limit, offset])
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
+
+    def count_pixiv_review_images(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        keyword: str = '',
+        search_context: dict[str, Any] | None = None,
+    ) -> int:
+        sql, params = self._build_pixiv_review_images_query(
+            statuses=statuses,
+            keyword=keyword,
+            search_context=search_context,
+            count=True,
+        )
+        count_sql = f"SELECT COUNT(*) AS total FROM ({sql} GROUP BY i.id) AS pixiv_review_page"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(count_sql, params).fetchone()
+        return int(row["total"] or 0) if row else 0
 
     def build_pixiv_review_search_context(self, keyword: str, *, platform: str = 'pixiv') -> dict[str, Any]:
         keyword_text = str(keyword or '').strip()
@@ -3740,9 +3794,20 @@ class ImageIndexDB:
             'skipped_terms': skipped_terms,
         }
 
-    def search_images(self, *, keyword: str = '', review_status: str = '', tag_name: str = '', platform: str = '', limit: int = 100, offset: int = 0) -> list[sqlite3.Row]:
-        sql = """
+    def _build_search_images_query(
+        self,
+        *,
+        keyword: str = '',
+        review_status: str = '',
+        tag_name: str = '',
+        platform: str = '',
+        count: bool = False,
+    ) -> tuple[str, list[Any]]:
+        select_sql = "SELECT COUNT(DISTINCT i.id) AS total" if count else """
             SELECT DISTINCT i.id, i.file_path, i.file_name, i.width, i.height, i.format, i.phash, i.updated_at
+        """
+        sql = f"""
+            {select_sql}
             FROM images i
             LEFT JOIN image_tags it ON it.image_id = i.id
             LEFT JOIN tags t ON t.id = it.tag_id
@@ -3755,19 +3820,42 @@ class ImageIndexDB:
             normalized = normalize_tag_name(keyword)
             sql += " AND (i.file_name LIKE ? OR t.normalized_name LIKE ? OR a.normalized_alias LIKE ? OR s.post_url LIKE ? OR s.author LIKE ?)"
             params.extend([f'%{keyword}%', f'%{normalized}%', f'%{normalized}%', f'%{keyword}%', f'%{keyword}%'])
-        if review_status:
-            sql += ' AND it.review_status = ?'
-            params.append(review_status)
+        statuses = split_status_filter(review_status)
+        if statuses:
+            placeholders = ','.join('?' for _ in statuses)
+            sql += f' AND it.review_status IN ({placeholders})'
+            params.extend(statuses)
         if tag_name:
             sql += ' AND t.normalized_name = ?'
             params.append(normalize_tag_name(tag_name))
         if platform:
             sql += ' AND s.platform = ?'
             params.append(platform)
+        return sql, params
+
+    def search_images(self, *, keyword: str = '', review_status: str = '', tag_name: str = '', platform: str = '', limit: int = 100, offset: int = 0) -> list[sqlite3.Row]:
+        sql, params = self._build_search_images_query(
+            keyword=keyword,
+            review_status=review_status,
+            tag_name=tag_name,
+            platform=platform,
+        )
         sql += ' ORDER BY i.id DESC LIMIT ? OFFSET ?'
         params.extend([limit, offset])
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
+
+    def count_search_images(self, *, keyword: str = '', review_status: str = '', tag_name: str = '', platform: str = '') -> int:
+        sql, params = self._build_search_images_query(
+            keyword=keyword,
+            review_status=review_status,
+            tag_name=tag_name,
+            platform=platform,
+            count=True,
+        )
+        with self._lock, self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row["total"] or 0) if row else 0
 
     def get_image_detail(self, image_id: int) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
