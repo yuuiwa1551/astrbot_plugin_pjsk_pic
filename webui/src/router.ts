@@ -27,12 +27,20 @@ const routes: RouteRecordRaw[] = [
   { path: '/:pathMatch(.*)*', redirect: '/overview' },
 ];
 
-export function normalizeLegacyHash(): void {
-  const hash = window.location.hash || '';
-  const legacy = pageRoutes.find((page) => hash === `#${page.key}`);
-  if (!legacy) return;
-  const nextUrl = `${window.location.pathname}${window.location.search}#${legacy.path}`;
-  window.history.replaceState(null, '', nextUrl);
+export function normalizeEntryUrl(): void {
+  const url = new URL(window.location.href);
+  let changed = false;
+  if (url.searchParams.has('v')) {
+    url.searchParams.delete('v');
+    changed = true;
+  }
+  const legacy = pageRoutes.find((page) => url.hash === `#${page.key}`);
+  if (legacy) {
+    url.hash = legacy.path;
+    changed = true;
+  }
+  if (!changed) return;
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
 }
 
 export const router = createRouter({

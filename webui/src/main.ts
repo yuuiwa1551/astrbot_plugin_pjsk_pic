@@ -1,8 +1,8 @@
 import { createApp } from 'vue';
 import App from './App.vue';
-import { router, normalizeLegacyHash } from './router';
+import { router, normalizeEntryUrl } from './router';
 import './styles.css';
 
-normalizeLegacyHash();
+normalizeEntryUrl();
 
 createApp(App).use(router).mount('#app');

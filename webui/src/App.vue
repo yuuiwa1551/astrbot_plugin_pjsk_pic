@@ -762,7 +762,7 @@ async function executeMerge(): Promise<void> {
         <div class="brand-mark">P</div>
         <div>
           <h1 class="brand-title">PJSK 图片管理</h1>
-          <div class="brand-subtitle">WebUI v0.14.0</div>
+          <div class="brand-subtitle">Vue 工作台</div>
         </div>
       </div>
       <nav class="nav-stack" aria-label="功能导航">
