@@ -181,17 +181,17 @@
   },
   "pixiv_auto_crawl_max_results_per_tag": {
     "type": "int",
-    "description": "每个 tag 单轮最多抓取的 Pixiv 结果数。",
+    "description": "每个 tag 单轮最多抓取的 Pixiv 结果数；这是增量采集上限，不是全量回填。",
     "default": 30
   },
   "pixiv_auto_crawl_max_pages_per_tag": {
     "type": "int",
-    "description": "每个 tag 单轮最多抓取的 Pixiv 页数。",
+    "description": "每个 tag 单轮最多请求的 Pixiv 搜索页数；页数越大单轮越慢。",
     "default": 3
   },
   "pixiv_auto_crawl_max_new_jobs_per_cycle": {
     "type": "int",
-    "description": "每轮自动抓取最多创建的 Pixiv 新任务数。",
+    "description": "每轮自动抓取全局最多创建的 Pixiv 新任务数。",
     "default": 30
   },
   "x_cookie_string": {

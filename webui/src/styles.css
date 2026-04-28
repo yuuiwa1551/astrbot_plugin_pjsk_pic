@@ -303,6 +303,14 @@ button svg {
   margin-bottom: 12px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .panel-title {
   margin: 0;
   font-size: 17px;

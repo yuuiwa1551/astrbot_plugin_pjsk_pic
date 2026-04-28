@@ -125,6 +125,7 @@ const platform = reactive({
 const merge = reactive({
   keyword: '',
   candidates: [] as Dict[],
+  showHistoricalCandidates: false,
   pendingKeyword: '',
   pendingCandidates: [] as Dict[],
   identityScanSummary: null as Dict | null,
@@ -256,7 +257,7 @@ async function loadPage(page: PageKey): Promise<void> {
     if (page === 'pixiv-platform') await loadPlatformTerms();
     if (page === 'tag-merge') {
       await loadPendingMergeCandidates();
-      await loadMergeCandidates();
+      if (merge.showHistoricalCandidates) await loadMergeCandidates();
     }
   });
 }
@@ -896,6 +897,13 @@ async function loadMergeCandidates(): Promise<void> {
   merge.candidates = data.items || [];
 }
 
+async function toggleHistoricalMergeCandidates(): Promise<void> {
+  merge.showHistoricalCandidates = !merge.showHistoricalCandidates;
+  if (merge.showHistoricalCandidates) {
+    await withBusy(loadMergeCandidates);
+  }
+}
+
 async function loadPendingMergeCandidates(): Promise<void> {
   const q = new URLSearchParams({ status: 'pending', keyword: merge.pendingKeyword, limit: '100' });
   const data = await fetchJson<{ items: Dict[] }>(`/api/tag-merge/pending-candidates?${q.toString()}`);
@@ -937,10 +945,13 @@ async function ignorePendingMergeCandidate(candidateId: number): Promise<void> {
   });
 }
 
-function identityCandidateChars(item: Dict): string {
+function identityCandidateCharSummary(item: Dict): string {
   const evidence = (item.evidence || {}) as Dict;
   const chars = (evidence.shared_chars as string[] | undefined) || [];
-  return chars.join('');
+  const text = chars.join('');
+  const ratio = Number(evidence.shared_ratio || 0);
+  if (text && ratio > 0) return `${text} · 约 ${Math.round(ratio * 100)}%`;
+  return text;
 }
 
 function identityCandidateTerms(item: Dict): string {
@@ -977,7 +988,7 @@ async function executeMerge(): Promise<void> {
       body: JSON.stringify({ target_tag: merge.target, source_tags: parseCsv(merge.sources) }),
     });
     merge.preview = result;
-    await loadMergeCandidates();
+    if (merge.showHistoricalCandidates) await loadMergeCandidates();
     await loadPendingMergeCandidates();
     showToast(String(result.message || 'tag 归并完成'));
   });
@@ -1477,8 +1488,11 @@ async function executeMerge(): Promise<void> {
             <input v-model="merge.pendingKeyword" class="grow" placeholder="搜索待确认候选，例如 晓山瑞希 / 初音ミク" @keydown.enter="loadPendingMergeCandidates" />
             <button type="button" @click="loadPendingMergeCandidates">刷新待确认</button>
             <button class="secondary" type="button" @click="scanIdentityCandidates">扫描疑似同一角色</button>
+            <button class="secondary" type="button" @click="toggleHistoricalMergeCandidates">
+              {{ merge.showHistoricalCandidates ? '取消显示历史候选' : '显示历史候选' }}
+            </button>
           </div>
-          <div class="toolbar-row">
+          <div v-if="merge.showHistoricalCandidates" class="toolbar-row">
             <input v-model="merge.keyword" class="grow" placeholder="按 source / target / 词搜索候选" @keydown.enter="loadMergeCandidates" />
             <button class="secondary" type="button" @click="loadMergeCandidates">刷新历史候选</button>
           </div>
@@ -1506,7 +1520,7 @@ async function executeMerge(): Promise<void> {
                     <strong>{{ item.target_tag }}</strong>
                     <span class="pill warning">score {{ Number(item.score || 0).toFixed(1) }}</span>
                   </div>
-                  <div class="muted">重合字：{{ identityCandidateChars(item) || '无' }}</div>
+                  <div class="muted">重合字：{{ identityCandidateCharSummary(item) || '无' }}</div>
                   <div class="muted">证据词：{{ identityCandidateTerms(item) || '无' }}</div>
                   <div class="muted">LLM：{{ identityCandidateLlmText(item) }}</div>
                   <div class="chips compact">
@@ -1519,12 +1533,16 @@ async function executeMerge(): Promise<void> {
                 </article>
               </div>
             </div>
-            <div class="panel">
+            <div v-if="merge.showHistoricalCandidates" class="panel">
               <div class="panel-header">
                 <h3 class="panel-title">历史候选</h3>
-                <span class="muted">{{ merge.candidates.length }} 条</span>
+                <div class="header-actions">
+                  <span class="muted">{{ merge.candidates.length }} 条</span>
+                  <button class="secondary mini" type="button" @click="toggleHistoricalMergeCandidates">取消显示</button>
+                </div>
               </div>
-              <div class="grid review-grid compact-grid">
+              <div v-if="!merge.candidates.length" class="empty">暂无历史候选。</div>
+              <div v-else class="grid review-grid compact-grid">
                 <article v-for="item in merge.candidates" :key="`${item.source_tag}-${item.target_tag}`" class="item">
                   <div class="title-line">
                     <strong>{{ item.source_tag }}</strong>

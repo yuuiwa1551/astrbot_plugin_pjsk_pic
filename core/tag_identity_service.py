@@ -121,10 +121,17 @@ class TagIdentityService:
         reasons: list[str] = []
         score = 0.0
 
-        shared_chars = sorted(self._cjk_chars(str(left.get("name", ""))) & self._cjk_chars(str(right.get("name", ""))))
-        if len(shared_chars) >= 2:
-            score += 35 + min(25, len(shared_chars) * 5)
-            reasons.append(f"角色名共享 CJK 字符：{''.join(shared_chars)}")
+        left_name_chars = self._cjk_chars(str(left.get("name", "")))
+        right_name_chars = self._cjk_chars(str(right.get("name", "")))
+        shared_chars = sorted(left_name_chars & right_name_chars)
+        shared_ratio = (
+            len(shared_chars) / max(len(left_name_chars), len(right_name_chars))
+            if left_name_chars and right_name_chars
+            else 0.0
+        )
+        if shared_chars and shared_ratio >= 0.4:
+            score += 28 + min(35, int(shared_ratio * 50)) + min(10, len(shared_chars) * 3)
+            reasons.append(f"角色名 CJK 重合约 {shared_ratio:.0%}：{''.join(shared_chars)}")
 
         matched_terms: list[dict[str, Any]] = []
         common_norms = set(left_terms) & set(right_terms)
@@ -168,6 +175,7 @@ class TagIdentityService:
 
         evidence = {
             "shared_chars": shared_chars,
+            "shared_ratio": round(shared_ratio, 3),
             "matched_terms": matched_terms[:12],
             "source": self._entry_evidence(source),
             "target": self._entry_evidence(target),
