@@ -57,6 +57,11 @@ const jobs = reactive({
   tags: '',
   includeTags: '',
   excludeTags: '',
+  searchLimit: 12,
+  searchResolvedTag: null as Dict | null,
+  searchQueryTerms: [] as string[],
+  searchItems: [] as Dict[],
+  searchSelected: {} as Record<string, boolean>,
   items: [] as Dict[],
 });
 
@@ -120,6 +125,9 @@ const platform = reactive({
 const merge = reactive({
   keyword: '',
   candidates: [] as Dict[],
+  pendingKeyword: '',
+  pendingCandidates: [] as Dict[],
+  identityScanSummary: null as Dict | null,
   target: '',
   sources: '',
   preview: null as Dict | null,
@@ -195,10 +203,21 @@ const statusLabels: Record<string, string> = {
   failed: '失败',
 };
 
+const platformTermTypeLabels: Record<string, string> = {
+  query: '搜图',
+  match: '归属判断',
+  both: '搜图 + 归属',
+};
+
 function statusLabel(status?: string): string {
   const text = String(status || '').trim();
   if (!text) return '未知';
   return text.split(',').map((item) => statusLabels[item.trim()] || item.trim()).filter(Boolean).join(' / ');
+}
+
+function platformTermTypeLabel(termType?: string): string {
+  const text = String(termType || 'both').trim();
+  return platformTermTypeLabels[text] || text || '搜图 + 归属';
 }
 
 function clampPage(page: number, pageCount: number): number {
@@ -235,7 +254,10 @@ async function loadPage(page: PageKey): Promise<void> {
     if (page === 'tags') await loadTags();
     if (page === 'pixiv-review') await loadPixivReviewImages();
     if (page === 'pixiv-platform') await loadPlatformTerms();
-    if (page === 'tag-merge') await loadMergeCandidates();
+    if (page === 'tag-merge') {
+      await loadPendingMergeCandidates();
+      await loadMergeCandidates();
+    }
   });
 }
 
@@ -311,6 +333,10 @@ async function loadJobs(): Promise<void> {
 }
 
 async function createJob(): Promise<void> {
+  if (jobs.platform === 'pixiv' && !jobs.sourceUrl.trim()) {
+    await searchPixivPreview();
+    return;
+  }
   await withBusy(async () => {
     const result = await fetchJson<Dict>('/api/jobs', {
       method: 'POST',
@@ -328,6 +354,67 @@ async function createJob(): Promise<void> {
     jobs.excludeTags = '';
     await loadJobs();
     showToast(String(result.message || '采集任务已创建'), result.job_id ? `#${result.job_id}` : '');
+  });
+}
+
+async function searchPixivPreview(): Promise<void> {
+  await withBusy(async () => {
+    const result = await fetchJson<Dict>('/api/jobs/pixiv-search-preview', {
+      method: 'POST',
+      body: JSON.stringify({
+        tag_text: jobs.tags,
+        limit: jobs.searchLimit,
+      }),
+    });
+    jobs.searchResolvedTag = (result.resolved_tag as Dict | undefined) || null;
+    jobs.searchQueryTerms = ((result.query_terms as string[] | undefined) || []).map((item) => String(item));
+    jobs.searchItems = (result.items as Dict[] | undefined) || [];
+    jobs.searchSelected = {};
+    showToast('Pixiv 搜索预览已更新', `返回 ${jobs.searchItems.length} 个作品`);
+  });
+}
+
+function clearPixivSearchPreview(): void {
+  jobs.searchResolvedTag = null;
+  jobs.searchQueryTerms = [];
+  jobs.searchItems = [];
+  jobs.searchSelected = {};
+}
+
+function selectedPixivSearchItems(): Dict[] {
+  return jobs.searchItems.filter((item) => jobs.searchSelected[String(item.illust_id || item.post_url || '')]);
+}
+
+async function queueSelectedPixivSearchItems(): Promise<void> {
+  const selected = selectedPixivSearchItems().filter((item) => !item.already_exists && !item.rejected);
+  if (!selected.length) {
+    showToast('请先勾选可入队的 Pixiv 作品');
+    return;
+  }
+  await withBusy(async () => {
+    let created = 0;
+    const canonicalTag = String(jobs.searchResolvedTag?.name || jobs.tags || '').trim();
+    for (const item of selected) {
+      const postUrl = String(item.post_url || '').trim();
+      if (!postUrl) continue;
+      await fetchJson<Dict>('/api/jobs', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: 'pixiv',
+          source_url: postUrl,
+          tags: canonicalTag,
+          include_tags: jobs.includeTags,
+          exclude_tags: jobs.excludeTags,
+        }),
+      });
+      created += 1;
+    }
+    clearPixivSearchPreview();
+    jobs.sourceUrl = '';
+    jobs.includeTags = '';
+    jobs.excludeTags = '';
+    await loadJobs();
+    showToast(`已入队 ${created} 个 Pixiv 采集任务`);
   });
 }
 
@@ -809,10 +896,68 @@ async function loadMergeCandidates(): Promise<void> {
   merge.candidates = data.items || [];
 }
 
+async function loadPendingMergeCandidates(): Promise<void> {
+  const q = new URLSearchParams({ status: 'pending', keyword: merge.pendingKeyword, limit: '100' });
+  const data = await fetchJson<{ items: Dict[] }>(`/api/tag-merge/pending-candidates?${q.toString()}`);
+  merge.pendingCandidates = data.items || [];
+}
+
+async function scanIdentityCandidates(): Promise<void> {
+  await withBusy(async () => {
+    const result = await fetchJson<Dict>('/api/tag-merge/identity-scan', {
+      method: 'POST',
+      body: JSON.stringify({ limit: 100 }),
+    });
+    merge.identityScanSummary = result;
+    await loadPendingMergeCandidates();
+    showToast(String(result.message || '身份候选扫描完成'));
+  });
+}
+
 function useMergeCandidate(source: string, target: string): void {
   merge.target = target;
   merge.sources = source;
   void previewMerge();
+}
+
+function usePendingMergeCandidate(item: Dict): void {
+  merge.target = String(item.target_tag || '');
+  merge.sources = String(item.source_tag || '');
+  void previewMerge();
+}
+
+async function ignorePendingMergeCandidate(candidateId: number): Promise<void> {
+  await withBusy(async () => {
+    const result = await fetchJson<Dict>('/api/tag-merge/candidate/ignore', {
+      method: 'POST',
+      body: JSON.stringify({ candidate_id: candidateId }),
+    });
+    await loadPendingMergeCandidates();
+    showToast(String(result.message || '已忽略候选'));
+  });
+}
+
+function identityCandidateChars(item: Dict): string {
+  const evidence = (item.evidence || {}) as Dict;
+  const chars = (evidence.shared_chars as string[] | undefined) || [];
+  return chars.join('');
+}
+
+function identityCandidateTerms(item: Dict): string {
+  const evidence = (item.evidence || {}) as Dict;
+  const matched = (evidence.matched_terms as Dict[] | undefined) || [];
+  return matched.map((term) => String(term.term || '')).filter(Boolean).slice(0, 8).join('、');
+}
+
+function identityCandidateLlmText(item: Dict): string {
+  const llm = (item.llm_result || {}) as Dict;
+  const status = String(llm.status || '');
+  if (status === 'ok') {
+    const same = llm.same_character === true ? '同一角色' : llm.same_character === false ? '不是同一角色' : '不确定';
+    return `${same} · 置信度 ${Number(llm.confidence || 0).toFixed(2)} · ${String(llm.reason || '')}`;
+  }
+  if (status) return `${status} · ${String(llm.reason || '')}`;
+  return '未复核';
 }
 
 async function previewMerge(): Promise<void> {
@@ -833,6 +978,7 @@ async function executeMerge(): Promise<void> {
     });
     merge.preview = result;
     await loadMergeCandidates();
+    await loadPendingMergeCandidates();
     showToast(String(result.message || 'tag 归并完成'));
   });
 }
@@ -975,13 +1121,62 @@ async function executeMerge(): Promise<void> {
               <option>xiaohongshu</option>
               <option>generic</option>
             </select>
-            <input v-model="jobs.sourceUrl" class="grow" placeholder="帖子链接或图片直链" />
-            <input v-model="jobs.tags" class="grow" placeholder="tags_csv，例如 初音未来,miku" />
+            <input v-model="jobs.sourceUrl" class="grow" placeholder="帖子链接；Pixiv 可留空按 tag 搜索预览" />
+            <input v-model="jobs.tags" class="grow" placeholder="主 tag / alias，例如 mzk、初音未来" @keydown.enter="jobs.sourceUrl.trim() ? createJob() : searchPixivPreview()" />
           </div>
           <div class="toolbar-row">
             <input v-model="jobs.includeTags" class="grow" placeholder="include tags" />
             <input v-model="jobs.excludeTags" class="grow" placeholder="exclude tags" />
             <button type="button" @click="createJob">新建任务</button>
+            <button v-if="jobs.platform === 'pixiv'" class="secondary" type="button" @click="searchPixivPreview">Pixiv 搜索预览</button>
+            <label v-if="jobs.platform === 'pixiv'" class="muted">预览数量
+              <select v-model.number="jobs.searchLimit" class="page-size">
+                <option :value="6">6</option>
+                <option :value="12">12</option>
+                <option :value="20">20</option>
+                <option :value="30">30</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div v-if="jobs.searchItems.length || jobs.searchQueryTerms.length" class="panel">
+          <div class="panel-header">
+            <div>
+              <h3 class="panel-title">Pixiv 搜索预览</h3>
+              <div class="muted">
+                解析到：{{ jobs.searchResolvedTag?.name || jobs.tags || '-' }}；
+                搜索词：{{ jobs.searchQueryTerms.join('、') || '-' }}
+              </div>
+            </div>
+            <div class="actions">
+              <button type="button" @click="queueSelectedPixivSearchItems">将选中结果入队</button>
+              <button class="secondary" type="button" @click="clearPixivSearchPreview">清空预览</button>
+            </div>
+          </div>
+          <div v-if="!jobs.searchItems.length" class="empty">没有搜索到可预览的 Pixiv 作品。</div>
+          <div v-else class="grid preview-grid">
+            <article v-for="item in jobs.searchItems" :key="String(item.illust_id)" class="item">
+              <div class="title-line">
+                <label>
+                  <input
+                    :checked="!!jobs.searchSelected[String(item.illust_id || item.post_url || '')]"
+                    :disabled="!!item.already_exists || !!item.rejected"
+                    type="checkbox"
+                    @change="jobs.searchSelected[String(item.illust_id || item.post_url || '')] = !jobs.searchSelected[String(item.illust_id || item.post_url || '')]"
+                  />
+                  选中
+                </label>
+                <strong>#{{ item.illust_id }}</strong>
+                <span v-if="item.already_exists" class="pill success">已入库</span>
+                <span v-if="item.rejected" class="pill danger">已拒绝</span>
+              </div>
+              <div class="strong truncate">{{ item.title || '-' }}</div>
+              <div class="muted">{{ item.author || '-' }}</div>
+              <a :href="String(item.post_url || '')" target="_blank" rel="noreferrer">{{ item.post_url }}</a>
+              <div class="chips scroll-chips compact">
+                <span v-for="tag in [...((item.raw_tags as string[]) || []), ...((item.translated_tags as string[]) || [])]" :key="String(tag)" class="pill">{{ tag }}</span>
+              </div>
+            </article>
           </div>
         </div>
         <div class="grid review-grid">
@@ -1185,9 +1380,9 @@ async function executeMerge(): Promise<void> {
             <input v-model="platform.keyword" class="grow" placeholder="Pixiv 词搜索 / 未解决词" />
             <select v-model="platform.termType">
               <option value="">全部类型</option>
-              <option value="raw">raw</option>
-              <option value="translated">translated</option>
-              <option value="both">both</option>
+              <option value="query">搜图</option>
+              <option value="match">归属判断</option>
+              <option value="both">搜图 + 归属</option>
             </select>
             <button type="button" @click="loadPlatformTerms">查询平台词</button>
             <button class="secondary" type="button" @click="loadPlatformSuggestions">建议词</button>
@@ -1197,9 +1392,9 @@ async function executeMerge(): Promise<void> {
             <input v-model="platform.formTag" placeholder="主 tag" />
             <input v-model="platform.formTerm" class="grow" placeholder="Pixiv 词，例如 初音ミク" />
             <select v-model="platform.formType">
-              <option value="both">both</option>
-              <option value="raw">raw</option>
-              <option value="translated">translated</option>
+              <option value="query">搜图</option>
+              <option value="match">归属判断</option>
+              <option value="both">搜图 + 归属</option>
             </select>
             <input v-model="platform.formSource" placeholder="来源" />
             <input v-model.number="platform.formConfidence" type="number" step="0.01" min="0" max="1" style="width: 110px;" />
@@ -1213,7 +1408,7 @@ async function executeMerge(): Promise<void> {
               <article v-for="item in platform.terms" :key="String(item.id)" class="item">
                 <div class="title-line">
                   <strong>{{ item.tag_name }}</strong>
-                  <span class="pill">{{ item.term_type }}</span>
+                  <span class="pill">{{ platformTermTypeLabel(String(item.term_type || 'both')) }}</span>
                 </div>
                 <div>{{ item.term }}</div>
                 <div class="muted">alias：{{ ((item.aliases as string[]) || []).join('、') || '无' }}</div>
@@ -1255,9 +1450,9 @@ async function executeMerge(): Promise<void> {
               <input v-model="platform.bulkTag" placeholder="目标主 tag" />
               <input v-model="platform.bulkTerms" class="grow" placeholder="额外 Pixiv 词，逗号分隔" />
               <select v-model="platform.bulkType">
-                <option value="both">both</option>
-                <option value="raw">raw</option>
-                <option value="translated">translated</option>
+                <option value="query">搜图</option>
+                <option value="match">归属判断</option>
+                <option value="both">搜图 + 归属</option>
               </select>
             </div>
             <div class="toolbar-row">
@@ -1279,8 +1474,13 @@ async function executeMerge(): Promise<void> {
       <section v-if="activePage === 'tag-merge'" class="page">
         <div class="toolbar">
           <div class="toolbar-row">
+            <input v-model="merge.pendingKeyword" class="grow" placeholder="搜索待确认候选，例如 晓山瑞希 / 初音ミク" @keydown.enter="loadPendingMergeCandidates" />
+            <button type="button" @click="loadPendingMergeCandidates">刷新待确认</button>
+            <button class="secondary" type="button" @click="scanIdentityCandidates">扫描疑似同一角色</button>
+          </div>
+          <div class="toolbar-row">
             <input v-model="merge.keyword" class="grow" placeholder="按 source / target / 词搜索候选" @keydown.enter="loadMergeCandidates" />
-            <button type="button" @click="loadMergeCandidates">刷新候选</button>
+            <button class="secondary" type="button" @click="loadMergeCandidates">刷新历史候选</button>
           </div>
           <div class="toolbar-row">
             <input v-model="merge.target" placeholder="目标主 tag" />
@@ -1288,18 +1488,54 @@ async function executeMerge(): Promise<void> {
             <button type="button" @click="previewMerge">预览归并</button>
             <button type="button" @click="executeMerge">执行归并</button>
           </div>
+          <div v-if="merge.identityScanSummary" class="muted">{{ merge.identityScanSummary.message || '' }}</div>
         </div>
         <div class="split">
-          <div class="grid review-grid">
-            <article v-for="item in merge.candidates" :key="`${item.source_tag}-${item.target_tag}`" class="item">
-              <div class="title-line">
-                <strong>{{ item.source_tag }}</strong>
-                <span>→</span>
-                <strong>{{ item.target_tag }}</strong>
+          <div>
+            <div class="panel">
+              <div class="panel-header">
+                <h3 class="panel-title">待手动确认</h3>
+                <span class="muted">{{ merge.pendingCandidates.length }} 条</span>
               </div>
-              <div class="muted">score: {{ item.score ?? '-' }} · {{ item.reason || '' }}</div>
-              <button class="secondary mini" type="button" @click="useMergeCandidate(String(item.source_tag), String(item.target_tag))">使用并预览</button>
-            </article>
+              <div v-if="!merge.pendingCandidates.length" class="empty">暂无待确认归并候选。可以点击“扫描疑似同一角色”。</div>
+              <div v-else class="stack-list">
+                <article v-for="item in merge.pendingCandidates" :key="Number(item.id)" class="item identity-candidate">
+                  <div class="title-line">
+                    <strong>{{ item.source_tag }}</strong>
+                    <span>→</span>
+                    <strong>{{ item.target_tag }}</strong>
+                    <span class="pill warning">score {{ Number(item.score || 0).toFixed(1) }}</span>
+                  </div>
+                  <div class="muted">重合字：{{ identityCandidateChars(item) || '无' }}</div>
+                  <div class="muted">证据词：{{ identityCandidateTerms(item) || '无' }}</div>
+                  <div class="muted">LLM：{{ identityCandidateLlmText(item) }}</div>
+                  <div class="chips compact">
+                    <span v-for="reason in ((item.reasons as string[]) || [])" :key="reason" class="pill">{{ reason }}</span>
+                  </div>
+                  <div class="actions">
+                    <button class="secondary mini" type="button" @click="usePendingMergeCandidate(item)">使用并预览</button>
+                    <button class="danger mini" type="button" @click="ignorePendingMergeCandidate(Number(item.id))">忽略</button>
+                  </div>
+                </article>
+              </div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h3 class="panel-title">历史候选</h3>
+                <span class="muted">{{ merge.candidates.length }} 条</span>
+              </div>
+              <div class="grid review-grid compact-grid">
+                <article v-for="item in merge.candidates" :key="`${item.source_tag}-${item.target_tag}`" class="item">
+                  <div class="title-line">
+                    <strong>{{ item.source_tag }}</strong>
+                    <span>→</span>
+                    <strong>{{ item.target_tag }}</strong>
+                  </div>
+                  <div class="muted">score: {{ item.score ?? '-' }} · {{ ((item.reasons as string[]) || []).join('、') || item.reason || '' }}</div>
+                  <button class="secondary mini" type="button" @click="useMergeCandidate(String(item.source_tag), String(item.target_tag))">使用并预览</button>
+                </article>
+              </div>
+            </div>
           </div>
           <div class="panel">
             <h3 class="panel-title">预览</h3>

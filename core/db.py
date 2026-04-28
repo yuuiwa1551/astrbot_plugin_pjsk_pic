@@ -231,6 +231,22 @@ class ImageIndexDB:
                     UNIQUE(platform, normalized_post_url)
                 );
 
+                CREATE TABLE IF NOT EXISTS tag_merge_identity_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_tag_id INTEGER NOT NULL,
+                    target_tag_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    score REAL DEFAULT 0,
+                    reasons_json TEXT DEFAULT '[]',
+                    evidence_json TEXT DEFAULT '{}',
+                    llm_result_json TEXT DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_tag_id, target_tag_id),
+                    FOREIGN KEY(source_tag_id) REFERENCES tags(id),
+                    FOREIGN KEY(target_tag_id) REFERENCES tags(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_images_active ON images(is_active);
                 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
                 CREATE INDEX IF NOT EXISTS idx_image_files_image_id ON image_files(image_id);
@@ -244,6 +260,7 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 CREATE INDEX IF NOT EXISTS idx_platform_tag_terms_tag_id ON platform_tag_terms(tag_id, platform);
                 CREATE INDEX IF NOT EXISTS idx_rejected_sources_platform ON rejected_sources(platform, normalized_post_url);
+                CREATE INDEX IF NOT EXISTS idx_tag_merge_identity_candidates_status ON tag_merge_identity_candidates(status, updated_at);
                 """
             )
             try:
@@ -2416,6 +2433,348 @@ class ImageIndexDB:
         )
         return items[: max(1, int(limit or 1))]
 
+    def list_tag_identity_scan_inputs(
+        self,
+        *,
+        platform: str = 'pixiv',
+        limit: int = 260,
+    ) -> list[dict[str, Any]]:
+        platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
+        resolved_limit = max(1, int(limit or 1))
+        with self._lock, self._connect() as conn:
+            tag_rows = conn.execute(
+                """
+                SELECT t.id, t.name, t.normalized_name, t.is_character,
+                       COUNT(DISTINCT CASE WHEN it.review_status IN ('approved', 'manual_approved') AND i.is_active = 1 THEN i.id END) AS image_count
+                FROM tags t
+                LEFT JOIN image_tags it ON it.tag_id = t.id
+                LEFT JOIN images i ON i.id = it.image_id
+                WHERE t.is_character = 1
+                GROUP BY t.id, t.name, t.normalized_name, t.is_character
+                ORDER BY image_count DESC, t.name ASC
+                LIMIT ?
+                """,
+                (resolved_limit,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for tag_row in tag_rows:
+                tag_id = int(tag_row['id'])
+                alias_rows = conn.execute(
+                    'SELECT alias, normalized_alias FROM tag_aliases WHERE tag_id = ? ORDER BY alias ASC',
+                    (tag_id,),
+                ).fetchall()
+                platform_rows = conn.execute(
+                    """
+                    SELECT term, normalized_term, term_type, source, confidence
+                    FROM platform_tag_terms
+                    WHERE tag_id = ? AND platform = ?
+                    ORDER BY confidence DESC, term ASC
+                    LIMIT 120
+                    """,
+                    (tag_id, platform_text),
+                ).fetchall()
+                source_rows = conn.execute(
+                    """
+                    SELECT s.raw_tags, s.extra_json
+                    FROM sources s
+                    JOIN image_tags it ON it.image_id = s.image_id
+                    JOIN images i ON i.id = s.image_id
+                    WHERE s.platform = ?
+                      AND it.tag_id = ?
+                      AND i.is_active = 1
+                      AND it.review_status IN ('approved', 'manual_approved')
+                    ORDER BY s.id DESC
+                    LIMIT 260
+                    """,
+                    (platform_text, tag_id),
+                ).fetchall()
+                history_counter: Counter[str] = Counter()
+                history_display: dict[str, str] = {}
+                for source_row in source_rows:
+                    try:
+                        raw_terms = json.loads(source_row['raw_tags'] or '[]') if source_row['raw_tags'] else []
+                    except Exception:
+                        raw_terms = []
+                    try:
+                        extra = json.loads(source_row['extra_json'] or '{}') if source_row['extra_json'] else {}
+                    except Exception:
+                        extra = {}
+                    translated_terms = extra.get('translated_tags') if isinstance(extra, dict) else []
+                    if not isinstance(translated_terms, list):
+                        translated_terms = []
+                    for value in [*raw_terms, *translated_terms]:
+                        text = str(value or '').strip()
+                        normalized = normalize_tag_name(text)
+                        if not text or not normalized or not self._looks_like_platform_term(text):
+                            continue
+                        history_counter[normalized] += 1
+                        history_display.setdefault(normalized, text)
+                history_terms = [
+                    {
+                        'term': history_display.get(normalized, normalized),
+                        'normalized_term': normalized,
+                        'count': int(count),
+                    }
+                    for normalized, count in sorted(
+                        history_counter.items(),
+                        key=lambda item: (-item[1], history_display.get(item[0], item[0])),
+                    )[:40]
+                ]
+                result.append(
+                    {
+                        'id': tag_id,
+                        'name': str(tag_row['name']),
+                        'normalized_name': str(tag_row['normalized_name'] or ''),
+                        'is_character': bool(tag_row['is_character']),
+                        'image_count': int(tag_row['image_count'] or 0),
+                        'aliases': [str(row['alias']) for row in alias_rows],
+                        'platform_terms': [
+                            {
+                                'term': str(row['term'] or ''),
+                                'normalized_term': str(row['normalized_term'] or ''),
+                                'term_type': str(row['term_type'] or 'both'),
+                                'source': str(row['source'] or ''),
+                                'confidence': float(row['confidence'] or 0.0),
+                            }
+                            for row in platform_rows
+                        ],
+                        'history_terms': history_terms,
+                    }
+                )
+        return result
+
+    @staticmethod
+    def _parse_candidate_json(value: str, fallback: Any) -> Any:
+        try:
+            parsed = json.loads(value or '')
+        except Exception:
+            return fallback
+        return parsed if parsed is not None else fallback
+
+    def upsert_tag_identity_candidate(
+        self,
+        *,
+        source_tag_id: int,
+        target_tag_id: int,
+        score: float,
+        reasons: list[str],
+        evidence: dict[str, Any],
+        llm_result: dict[str, Any] | None = None,
+        status: str = 'pending',
+    ) -> dict[str, Any]:
+        source_id = int(source_tag_id or 0)
+        target_id = int(target_tag_id or 0)
+        if source_id <= 0 or target_id <= 0 or source_id == target_id:
+            raise ValueError('source_tag_id / target_tag_id 无效')
+        normalized_status = str(status or 'pending').strip().lower() or 'pending'
+        if normalized_status not in {'pending', 'ignored'}:
+            normalized_status = 'pending'
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tag_merge_identity_candidates(
+                    source_tag_id, target_tag_id, status, score, reasons_json,
+                    evidence_json, llm_result_json, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_tag_id, target_tag_id) DO UPDATE SET
+                    status = CASE
+                        WHEN tag_merge_identity_candidates.status = 'ignored' AND excluded.status = 'pending'
+                        THEN tag_merge_identity_candidates.status
+                        ELSE excluded.status
+                    END,
+                    score = excluded.score,
+                    reasons_json = excluded.reasons_json,
+                    evidence_json = excluded.evidence_json,
+                    llm_result_json = excluded.llm_result_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    source_id,
+                    target_id,
+                    normalized_status,
+                    float(score or 0),
+                    json.dumps(reasons or [], ensure_ascii=False),
+                    json.dumps(evidence or {}, ensure_ascii=False),
+                    json.dumps(llm_result or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT c.*, s.name AS source_tag, t.name AS target_tag
+                FROM tag_merge_identity_candidates c
+                JOIN tags s ON s.id = c.source_tag_id
+                JOIN tags t ON t.id = c.target_tag_id
+                WHERE c.source_tag_id = ? AND c.target_tag_id = ?
+                LIMIT 1
+                """,
+                (source_id, target_id),
+            ).fetchone()
+        return self._build_tag_identity_candidate_payload(row) if row else {}
+
+    def list_tag_identity_candidates(
+        self,
+        *,
+        status: str = 'pending',
+        keyword: str = '',
+        limit: int = 80,
+    ) -> list[dict[str, Any]]:
+        status_text = str(status or 'pending').strip().lower()
+        keyword_text = str(keyword or '').strip()
+        normalized_keyword = normalize_tag_name(keyword_text)
+        sql = """
+            SELECT c.*, s.name AS source_tag, t.name AS target_tag,
+                   s.is_character AS source_is_character, t.is_character AS target_is_character
+            FROM tag_merge_identity_candidates c
+            JOIN tags s ON s.id = c.source_tag_id
+            JOIN tags t ON t.id = c.target_tag_id
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status_text:
+            clauses.append('c.status = ?')
+            params.append(status_text)
+        if keyword_text:
+            like_text = f'%{keyword_text}%'
+            like_normalized = f'%{normalized_keyword}%'
+            clauses.append(
+                """
+                (
+                    s.name LIKE ?
+                    OR t.name LIKE ?
+                    OR s.normalized_name LIKE ?
+                    OR t.normalized_name LIKE ?
+                    OR c.reasons_json LIKE ?
+                    OR c.evidence_json LIKE ?
+                )
+                """
+            )
+            params.extend([like_text, like_text, like_normalized, like_normalized, like_text, like_text])
+        if clauses:
+            sql += ' WHERE ' + ' AND '.join(clauses)
+        sql += ' ORDER BY c.score DESC, c.updated_at DESC, c.id DESC LIMIT ?'
+        params.append(max(1, int(limit or 1)))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._build_tag_identity_candidate_payload(row) for row in rows]
+
+    def ignore_tag_identity_candidate(self, candidate_id: int) -> tuple[bool, str]:
+        resolved_id = int(candidate_id or 0)
+        if resolved_id <= 0:
+            return False, 'candidate_id 无效'
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                'SELECT id FROM tag_merge_identity_candidates WHERE id = ? LIMIT 1',
+                (resolved_id,),
+            ).fetchone()
+            if not row:
+                return False, '候选不存在'
+            conn.execute(
+                "UPDATE tag_merge_identity_candidates SET status = 'ignored', updated_at = ? WHERE id = ?",
+                (utcnow_str(), resolved_id),
+            )
+        return True, '已忽略该归并候选'
+
+    def mark_stale_tag_identity_candidates(self, active_pairs: set[tuple[int, int]]) -> int:
+        normalized_pairs = {(int(source), int(target)) for source, target in active_pairs if int(source) > 0 and int(target) > 0}
+        now = utcnow_str()
+        changed = 0
+        with self._lock, self._connect() as conn:
+            pending_rows = conn.execute(
+                """
+                SELECT id, source_tag_id, target_tag_id
+                FROM tag_merge_identity_candidates
+                WHERE status = 'pending'
+                """
+            ).fetchall()
+            for row in pending_rows:
+                pair = (int(row['source_tag_id']), int(row['target_tag_id']))
+                if pair in normalized_pairs:
+                    continue
+                conn.execute(
+                    "UPDATE tag_merge_identity_candidates SET status = 'stale', updated_at = ? WHERE id = ?",
+                    (now, int(row['id'])),
+                )
+                changed += 1
+        return changed
+
+    def get_pixiv_query_terms_for_tag(self, tag_name: str) -> list[str]:
+        row = self.get_tag_row(tag_name)
+        if not row:
+            return []
+        tag_id = int(row['id'])
+        terms: list[str] = []
+        seen: set[str] = set()
+
+        def append_term(value: str) -> None:
+            text = str(value or '').strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            terms.append(text)
+
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT term, term_type, confidence
+                FROM platform_tag_terms
+                WHERE tag_id = ? AND platform = ?
+                ORDER BY
+                    CASE term_type WHEN 'query' THEN 0 WHEN 'both' THEN 1 ELSE 2 END,
+                    confidence DESC,
+                    term ASC
+                LIMIT 80
+                """,
+                (tag_id, 'pixiv'),
+            ).fetchall()
+        for term_row in rows:
+            term_type = self._normalize_platform_term_type(str(term_row['term_type'] or 'both'))
+            if self._platform_term_type_matches(term_type, {'query'}):
+                append_term(str(term_row['term'] or ''))
+        if not terms:
+            primary_cjk = set(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", str(row['name'] or '')))
+            for suggestion in self.suggest_platform_terms_for_tag(
+                tag_name=str(row['name']),
+                platform='pixiv',
+                limit=20,
+            ):
+                term = str(suggestion.get('term', '') or '').strip()
+                term_cjk = set(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", term))
+                if len(primary_cjk & term_cjk) >= 2:
+                    append_term(term)
+                if len(terms) >= 5:
+                    break
+        if not terms:
+            append_term(str(row['name']))
+        return terms
+
+    def _build_tag_identity_candidate_payload(self, row: Any) -> dict[str, Any]:
+        if not row:
+            return {}
+        reasons = self._parse_candidate_json(str(row['reasons_json'] or '[]'), [])
+        evidence = self._parse_candidate_json(str(row['evidence_json'] or '{}'), {})
+        llm_result = self._parse_candidate_json(str(row['llm_result_json'] or '{}'), {})
+        return {
+            'id': int(row['id']),
+            'source_tag_id': int(row['source_tag_id']),
+            'target_tag_id': int(row['target_tag_id']),
+            'source_tag': str(row['source_tag'] or ''),
+            'target_tag': str(row['target_tag'] or ''),
+            'source_is_character': bool(row['source_is_character']) if 'source_is_character' in row.keys() else True,
+            'target_is_character': bool(row['target_is_character']) if 'target_is_character' in row.keys() else True,
+            'status': str(row['status'] or 'pending'),
+            'score': float(row['score'] or 0.0),
+            'reasons': reasons if isinstance(reasons, list) else [],
+            'evidence': evidence if isinstance(evidence, dict) else {},
+            'llm_result': llm_result if isinstance(llm_result, dict) else {},
+            'created_at': str(row['created_at'] or ''),
+            'updated_at': str(row['updated_at'] or ''),
+        }
+
     def preview_merge_tags(
         self,
         *,
@@ -2892,11 +3251,13 @@ class ImageIndexDB:
         raw_post_url = str(post_url or '').strip()
         if not raw_post_url:
             return False
-        sql = 'SELECT 1 FROM sources WHERE post_url = ?'
-        params: list[Any] = [raw_post_url]
-        if platform:
+        platform_text = str(platform or '').strip().lower()
+        normalized_post_url = self.normalize_source_post_url(platform_text, raw_post_url)
+        sql = 'SELECT 1 FROM sources WHERE (post_url = ? OR post_url = ?)'
+        params: list[Any] = [raw_post_url, normalized_post_url]
+        if platform_text:
             sql += ' AND platform = ?'
-            params.append(platform)
+            params.append(platform_text)
         sql += ' LIMIT 1'
         with self._lock, self._connect() as conn:
             row = conn.execute(sql, params).fetchone()

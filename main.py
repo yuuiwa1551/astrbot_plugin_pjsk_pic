@@ -59,7 +59,7 @@ class PJSKPicPlugin(Star):
         )
         self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
-        self.webui = GalleryWebUI(self.db, self.crawl_service)
+        self.webui = GalleryWebUI(self.db, self.crawl_service, context=context, config=config)
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
         )

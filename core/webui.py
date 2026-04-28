@@ -11,6 +11,8 @@ from astrbot.api import logger
 from .crawl_tag_rules import parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
 from .matcher import normalize_tag_name
+from .pixiv_search_service import PixivSearchService
+from .tag_identity_service import TagIdentityService
 
 WEBUI_STATIC_DIR = Path(__file__).resolve().parent / "webui_static"
 
@@ -1826,9 +1828,11 @@ LOGIN_PAGE = """<!DOCTYPE html>
 
 
 class GalleryWebUI:
-    def __init__(self, db: ImageIndexDB, crawl_service) -> None:
+    def __init__(self, db: ImageIndexDB, crawl_service, *, context=None, config=None) -> None:
         self.db = db
         self.crawl_service = crawl_service
+        self.context = context
+        self.config = config if config is not None else getattr(crawl_service, "config", {})
         self.host = "0.0.0.0"
         self.port = 9099
         self.access_token = ""
@@ -1861,6 +1865,7 @@ class GalleryWebUI:
                 web.get("/api/tags", self.api_tags),
                 web.get("/api/jobs", self.api_jobs),
                 web.post("/api/jobs", self.api_jobs),
+                web.post("/api/jobs/pixiv-search-preview", self.api_jobs_pixiv_search_preview),
                 web.post("/api/jobs/retry", self.api_jobs_retry),
                 web.get("/api/reviews", self.api_reviews),
                 web.get("/api/pixiv-review-images", self.api_pixiv_review_images),
@@ -1877,6 +1882,9 @@ class GalleryWebUI:
                 web.post("/api/pixiv-platform/batch-preview", self.api_pixiv_platform_batch_preview),
                 web.post("/api/pixiv-platform/batch-submit", self.api_pixiv_platform_batch_submit),
                 web.get("/api/tag-merge/candidates", self.api_tag_merge_candidates),
+                web.get("/api/tag-merge/pending-candidates", self.api_tag_merge_pending_candidates),
+                web.post("/api/tag-merge/identity-scan", self.api_tag_merge_identity_scan),
+                web.post("/api/tag-merge/candidate/ignore", self.api_tag_merge_candidate_ignore),
                 web.post("/api/tag-merge/preview", self.api_tag_merge_preview),
                 web.post("/api/tag-merge/execute", self.api_tag_merge_execute),
                 web.post("/api/reviews/decision", self.api_review_decision),
@@ -2415,11 +2423,21 @@ class GalleryWebUI:
             return self._json_response({"items": [dict(row) for row in rows]})
 
         data = await self._json_body(request)
+        platform = str(data.get("platform", "") or "").strip().lower()
+        source_url = str(data.get("source_url", "") or "").strip()
+        if platform == "pixiv" and not source_url:
+            return self._json_response(
+                {
+                    "ok": False,
+                    "message": "Pixiv URL 为空；请先用 Pixiv 搜索预览勾选作品后入队。",
+                },
+                status=400,
+            )
         parsed_rules = parse_crawl_rule_text(str(data.get("tags", "")))
         try:
             job_id = await self.crawl_service.submit_job(
-                str(data.get("platform", "")).strip(),
-                str(data.get("source_url", "")).strip(),
+                platform,
+                source_url,
                 parsed_rules.manual_tags,
                 include_tags=parse_tag_csv([*parsed_rules.include_tags, *parse_tag_csv(str(data.get("include_tags", "")))]),
                 exclude_tags=parse_tag_csv([*parsed_rules.exclude_tags, *parse_tag_csv(str(data.get("exclude_tags", "")))]),
@@ -2427,6 +2445,137 @@ class GalleryWebUI:
         except Exception as exc:
             return self._json_response({"ok": False, "message": str(exc)}, status=400)
         return self._json_response({"ok": True, "job_id": job_id})
+
+    async def api_jobs_pixiv_search_preview(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        tag_text = str(data.get("tag_text", "") or "").strip()
+        if not tag_text:
+            return self._json_response({"ok": False, "message": "请先填写 tag 词再搜索 Pixiv。"}, status=400)
+        limit = _bounded_int(data.get("limit", 12), 12, min_value=1, max_value=30)
+        resolved_tag = self._resolve_pixiv_search_tag(tag_text)
+        if resolved_tag:
+            canonical_name = str(resolved_tag["name"])
+            query_terms = self._pixiv_query_terms_for_input(tag_text, canonical_name)
+        else:
+            canonical_name = ""
+            query_terms = [tag_text]
+        query_terms = self._dedupe_texts(query_terms)[:5]
+        search_service = PixivSearchService(self.config)
+        timeout_seconds = _bounded_int(
+            self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)),
+            20,
+            min_value=5,
+            max_value=120,
+        )
+        max_pages = _bounded_int(self.config.get("pixiv_search_preview_max_pages", 2), 2, min_value=1, max_value=5)
+        hits = []
+        seen_ids: set[str] = set()
+        try:
+            for query_term in query_terms:
+                remaining = max(1, limit - len(hits))
+                term_hits = await search_service.search_tag(
+                    query_term,
+                    max_results=remaining,
+                    max_pages=max_pages,
+                    timeout_seconds=timeout_seconds,
+                )
+                for hit in term_hits:
+                    if hit.illust_id in seen_ids:
+                        continue
+                    seen_ids.add(hit.illust_id)
+                    hits.append(hit)
+                    if len(hits) >= limit:
+                        break
+                if len(hits) >= limit:
+                    break
+        except Exception as exc:
+            return self._json_response({"ok": False, "message": f"Pixiv 搜索失败：{exc}"}, status=400)
+
+        items = [
+            {
+                "illust_id": hit.illust_id,
+                "post_url": hit.post_url,
+                "title": hit.title,
+                "author": hit.author,
+                "raw_tags": hit.raw_tags or [],
+                "translated_tags": hit.translated_tags or [],
+                "already_exists": self.db.has_source_post_url(hit.post_url, platform="pixiv"),
+                "rejected": self.db.is_rejected_source_post_url(hit.post_url, platform="pixiv"),
+            }
+            for hit in hits
+        ]
+        return self._json_response(
+            {
+                "ok": True,
+                "resolved_tag": resolved_tag or {"id": 0, "name": canonical_name, "match_type": ""},
+                "query_terms": query_terms,
+                "items": items,
+            }
+        )
+
+    def _pixiv_query_terms_for_input(self, raw_text: str, canonical_name: str) -> list[str]:
+        known_terms = self._known_pixiv_query_terms(raw_text, canonical_name)
+        db_terms = self.db.get_pixiv_query_terms_for_tag(canonical_name) or [canonical_name]
+        return self._dedupe_texts([*known_terms, *db_terms])
+
+    @staticmethod
+    def _known_pixiv_query_terms(*values: str) -> list[str]:
+        mapping = {
+            "初音未来": ["初音ミク"],
+            "初音未來": ["初音ミク"],
+            "hatsunemiku": ["初音ミク"],
+            "hatsune miku": ["初音ミク"],
+            "miku": ["初音ミク"],
+            "晓山瑞希": ["暁山瑞希"],
+            "暁山瑞希": ["暁山瑞希"],
+            "akiyama mizuki": ["暁山瑞希"],
+            "mzk": ["暁山瑞希"],
+        }
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = normalize_tag_name(value)
+            lowered = str(value or "").strip().casefold()
+            for key in (normalized, lowered):
+                for term in mapping.get(key, []):
+                    term_key = normalize_tag_name(term)
+                    if term and term_key not in seen:
+                        seen.add(term_key)
+                        resolved.append(term)
+        return resolved
+
+    def _resolve_pixiv_search_tag(self, tag_text: str) -> dict[str, Any] | None:
+        text = str(tag_text or "").strip()
+        if not text:
+            return None
+        platform_match = self.db.resolve_platform_term("pixiv", text)
+        if platform_match.matched and platform_match.tag_name:
+            return {
+                "id": int(platform_match.tag_id or 0),
+                "name": str(platform_match.tag_name),
+                "match_type": str(platform_match.match_type or "platform:pixiv"),
+            }
+        direct_match = self.db.resolve_tag(text, allow_fuzzy=True, candidate_limit=5)
+        if direct_match.matched and direct_match.tag_name:
+            return {
+                "id": int(direct_match.tag_id or 0),
+                "name": str(direct_match.tag_name),
+                "match_type": str(direct_match.match_type or ""),
+            }
+        context = self.db.build_pixiv_review_search_context(text, platform="pixiv")
+        matched_tags = context.get("matched_tags") if isinstance(context, dict) else []
+        if isinstance(matched_tags, list) and matched_tags:
+            first = matched_tags[0]
+            if isinstance(first, dict) and first.get("name"):
+                return {
+                    "id": int(first.get("id", 0) or 0),
+                    "name": str(first.get("name", "")),
+                    "match_type": str(first.get("match_type", "")),
+                }
+        return None
 
     async def api_jobs_retry(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
@@ -2679,7 +2828,7 @@ class GalleryWebUI:
                 limit=min(max(int(request.query.get("limit", 30) or 30), 1), 80),
             )
         ]
-        return self._json_response({"items": items, **_pagination_payload(total, limit, offset)})
+        return self._json_response({"items": items})
 
     async def api_pixiv_platform_batch_preview(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
@@ -2741,7 +2890,41 @@ class GalleryWebUI:
             keyword=str(request.query.get("keyword", "") or "").strip(),
             limit=min(max(int(request.query.get("limit", 40) or 40), 1), 120),
         )
-        return self._json_response({"items": items, **_pagination_payload(total, limit, offset)})
+        return self._json_response({"items": items})
+
+    async def api_tag_merge_pending_candidates(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        items = self.db.list_tag_identity_candidates(
+            status=str(request.query.get("status", "pending") or "pending").strip(),
+            keyword=str(request.query.get("keyword", "") or "").strip(),
+            limit=min(max(int(request.query.get("limit", 80) or 80), 1), 200),
+        )
+        return self._json_response({"items": items})
+
+    async def api_tag_merge_identity_scan(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        service = TagIdentityService(self.context, self.db, self.config)
+        try:
+            result = await service.scan(
+                limit=_bounded_int(data.get("limit", 80), 80, min_value=1, max_value=200),
+                llm_limit=_bounded_int(data.get("llm_limit", self.config.get("tag_identity_llm_limit", 12)), 12, min_value=0, max_value=40),
+            )
+        except Exception as exc:
+            return self._json_response({"ok": False, "message": f"身份候选扫描失败：{exc}"}, status=500)
+        return self._json_response(result)
+
+    async def api_tag_merge_candidate_ignore(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        ok, message = self.db.ignore_tag_identity_candidate(int(data.get("candidate_id", 0) or 0))
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
 
     async def api_tag_merge_preview(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)

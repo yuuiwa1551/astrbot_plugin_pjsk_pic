@@ -348,6 +348,19 @@ button svg {
   grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
 }
 
+.preview-grid {
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+}
+
+.compact-grid {
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+.stack-list {
+  display: grid;
+  gap: 10px;
+}
+
 .item {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -429,6 +442,16 @@ button svg {
   overflow: auto;
   align-content: flex-start;
   padding-right: 4px;
+}
+
+.scroll-chips.compact,
+.chips.compact {
+  max-height: 86px;
+}
+
+.identity-candidate {
+  display: grid;
+  gap: 8px;
 }
 
 .chip,
