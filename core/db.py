@@ -180,6 +180,35 @@ class ImageIndexDB:
                     FOREIGN KEY(tag_id) REFERENCES tags(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS pixiv_backfill_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tag_id INTEGER DEFAULT 0,
+                    tag_name TEXT NOT NULL,
+                    normalized_tag TEXT NOT NULL,
+                    tag_text TEXT DEFAULT '',
+                    query_terms_json TEXT DEFAULT '[]',
+                    include_tags_text TEXT DEFAULT '',
+                    exclude_tags_text TEXT DEFAULT '',
+                    max_pages INTEGER DEFAULT 20,
+                    max_results INTEGER DEFAULT 200,
+                    max_new_jobs INTEGER DEFAULT 100,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    current_query_text TEXT DEFAULT '',
+                    current_page INTEGER DEFAULT 0,
+                    current_offset TEXT DEFAULT '',
+                    scanned INTEGER DEFAULT 0,
+                    matched INTEGER DEFAULT 0,
+                    queued INTEGER DEFAULT 0,
+                    skipped_existing INTEGER DEFAULT 0,
+                    skipped_rejected INTEGER DEFAULT 0,
+                    skipped_filtered INTEGER DEFAULT 0,
+                    skipped_duplicate INTEGER DEFAULT 0,
+                    error_log TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT DEFAULT ''
+                );
+
                 CREATE TABLE IF NOT EXISTS review_tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     image_id INTEGER NOT NULL,
@@ -256,6 +285,7 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_sources_platform ON sources(platform);
                 CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status ON crawl_jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_crawl_subscriptions_platform ON crawl_subscriptions(platform, enabled);
+                CREATE INDEX IF NOT EXISTS idx_pixiv_backfill_tasks_status ON pixiv_backfill_tasks(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 CREATE INDEX IF NOT EXISTS idx_platform_tag_terms_tag_id ON platform_tag_terms(tag_id, platform);
@@ -3419,6 +3449,129 @@ class ImageIndexDB:
     def reset_running_jobs(self) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("UPDATE crawl_jobs SET status = 'retry', updated_at = ? WHERE status = 'running'", (utcnow_str(),))
+
+    def has_crawl_job_source_url(self, source_url: str, *, platform: str = '') -> bool:
+        url = str(source_url or '').strip()
+        if not url:
+            return False
+        sql = 'SELECT id FROM crawl_jobs WHERE source_url = ?'
+        params: list[Any] = [url]
+        if platform:
+            sql += ' AND platform = ?'
+            params.append(str(platform or '').strip().lower())
+        sql += ' LIMIT 1'
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchone() is not None
+
+    def create_pixiv_backfill_task(
+        self,
+        *,
+        tag_id: int,
+        tag_name: str,
+        tag_text: str,
+        query_terms: list[str],
+        include_tags: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        max_pages: int = 20,
+        max_results: int = 200,
+        max_new_jobs: int = 100,
+    ) -> int:
+        now = utcnow_str()
+        canonical_tag = str(tag_name or '').strip()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO pixiv_backfill_tasks(
+                    tag_id, tag_name, normalized_tag, tag_text, query_terms_json,
+                    include_tags_text, exclude_tags_text, max_pages, max_results, max_new_jobs,
+                    status, current_query_text, current_page, current_offset,
+                    scanned, matched, queued, skipped_existing, skipped_rejected,
+                    skipped_filtered, skipped_duplicate, error_log, created_at, updated_at, completed_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', 0, '', 0, 0, 0, 0, 0, 0, 0, '', ?, ?, '')
+                """,
+                (
+                    int(tag_id or 0),
+                    canonical_tag,
+                    normalize_tag_name(canonical_tag),
+                    str(tag_text or '').strip(),
+                    json.dumps(query_terms or [], ensure_ascii=False),
+                    ','.join(include_tags or []),
+                    ','.join(exclude_tags or []),
+                    int(max_pages or 20),
+                    int(max_results or 200),
+                    int(max_new_jobs or 100),
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_pixiv_backfill_task(self, task_id: int) -> sqlite3.Row | None:
+        with self._lock, self._connect() as conn:
+            return conn.execute('SELECT * FROM pixiv_backfill_tasks WHERE id = ?', (int(task_id),)).fetchone()
+
+    def update_pixiv_backfill_task(self, task_id: int, **fields: Any) -> None:
+        allowed = {
+            'status',
+            'current_query_text',
+            'current_page',
+            'current_offset',
+            'scanned',
+            'matched',
+            'queued',
+            'skipped_existing',
+            'skipped_rejected',
+            'skipped_filtered',
+            'skipped_duplicate',
+            'error_log',
+            'completed_at',
+        }
+        assignments: list[str] = ['updated_at = ?']
+        params: list[Any] = [utcnow_str()]
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            assignments.append(f'{key} = ?')
+            params.append(value)
+        if len(assignments) == 1:
+            return
+        params.append(int(task_id))
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE pixiv_backfill_tasks SET {', '.join(assignments)} WHERE id = ?", params)
+
+    def list_pixiv_backfill_tasks(
+        self,
+        *,
+        limit: int = 20,
+        statuses: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        sql = 'SELECT * FROM pixiv_backfill_tasks'
+        params: list[Any] = []
+        if statuses:
+            status_values = [str(item).strip() for item in statuses if str(item).strip()]
+            if status_values:
+                placeholders = ','.join('?' for _ in status_values)
+                sql += f' WHERE status IN ({placeholders})'
+                params.extend(status_values)
+        sql += ' ORDER BY id DESC LIMIT ?'
+        params.append(max(1, int(limit or 20)))
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def get_pending_pixiv_backfill_task_ids(self) -> list[int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM pixiv_backfill_tasks WHERE status IN ('pending', 'retry') ORDER BY id ASC"
+            ).fetchall()
+            return [int(row['id']) for row in rows]
+
+    def reset_running_pixiv_backfill_tasks(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE pixiv_backfill_tasks SET status = 'retry', updated_at = ? WHERE status = 'running'",
+                (utcnow_str(),),
+            )
 
     def create_review_task(self, image_id: int, tag_id: int, status: str, model_result: str = '', reason: str = '') -> int:
         now = utcnow_str()

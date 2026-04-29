@@ -62,6 +62,11 @@ const jobs = reactive({
   searchQueryTerms: [] as string[],
   searchItems: [] as Dict[],
   searchSelected: {} as Record<string, boolean>,
+  backfillTag: '',
+  backfillMaxPages: 20,
+  backfillMaxResults: 200,
+  backfillMaxJobs: 100,
+  backfillTasks: [] as Dict[],
   items: [] as Dict[],
 });
 
@@ -200,6 +205,7 @@ const statusLabels: Record<string, string> = {
   manual_rejected: '人工拒绝',
   running: '运行中',
   queued: '排队中',
+  retry: '等待重试',
   completed: '已完成',
   failed: '失败',
 };
@@ -239,7 +245,9 @@ function taskStatusClass(status?: string): string {
   const text = String(status || '');
   if (['approved', 'manual_approved'].includes(text)) return 'success';
   if (['rejected', 'manual_rejected'].includes(text)) return 'danger';
-  if (['uncertain'].includes(text)) return 'warning';
+  if (['uncertain', 'running', 'retry', 'queued'].includes(text)) return 'warning';
+  if (['completed'].includes(text)) return 'success';
+  if (['failed'].includes(text)) return 'danger';
   return '';
 }
 
@@ -329,8 +337,12 @@ function closePreview(): void {
 }
 
 async function loadJobs(): Promise<void> {
-  const data = await fetchJson<{ items: Dict[] }>('/api/jobs');
+  const [data, backfillData] = await Promise.all([
+    fetchJson<{ items: Dict[] }>('/api/jobs'),
+    fetchJson<{ items: Dict[] }>('/api/jobs/pixiv-backfill?limit=30'),
+  ]);
   jobs.items = data.items || [];
+  jobs.backfillTasks = backfillData.items || [];
 }
 
 async function createJob(): Promise<void> {
@@ -416,6 +428,39 @@ async function queueSelectedPixivSearchItems(): Promise<void> {
     jobs.excludeTags = '';
     await loadJobs();
     showToast(`已入队 ${created} 个 Pixiv 采集任务`);
+  });
+}
+
+async function createPixivBackfillTask(): Promise<void> {
+  if (!jobs.backfillTag.trim()) {
+    showToast('请先填写要回填的 tag');
+    return;
+  }
+  await withBusy(async () => {
+    const result = await fetchJson<Dict>('/api/jobs/pixiv-backfill', {
+      method: 'POST',
+      body: JSON.stringify({
+        tag_text: jobs.backfillTag,
+        max_pages: jobs.backfillMaxPages,
+        max_results: jobs.backfillMaxResults,
+        max_new_jobs: jobs.backfillMaxJobs,
+        include_tags: jobs.includeTags,
+        exclude_tags: jobs.excludeTags,
+      }),
+    });
+    await loadJobs();
+    showToast(String(result.message || '历史回填任务已创建'), `搜索词：${((result.query_terms as string[]) || []).join('、') || '-'}`);
+  });
+}
+
+async function retryPixivBackfillTask(taskId: number): Promise<void> {
+  await withBusy(async () => {
+    const result = await fetchJson<Dict>('/api/jobs/pixiv-backfill/retry', {
+      method: 'POST',
+      body: JSON.stringify({ task_id: taskId }),
+    });
+    await loadJobs();
+    showToast(String(result.message || '历史回填任务已重新入队'));
   });
 }
 
@@ -1148,6 +1193,50 @@ async function executeMerge(): Promise<void> {
                 <option :value="30">30</option>
               </select>
             </label>
+          </div>
+        </div>
+        <div v-if="jobs.platform === 'pixiv'" class="panel">
+          <div class="panel-header">
+            <div>
+              <h3 class="panel-title">Pixiv 历史回填</h3>
+              <div class="muted">按主 tag / alias 解析 Pixiv 搜图词，逐页扫描旧结果并创建普通采集任务。</div>
+            </div>
+            <button class="secondary" type="button" @click="loadJobs">刷新任务</button>
+          </div>
+          <div class="toolbar-row">
+            <input v-model="jobs.backfillTag" class="grow" placeholder="回填 tag，例如 晓山瑞希 / mzk / 初音未来" @keydown.enter="createPixivBackfillTask" />
+            <label class="muted">页数
+              <input v-model.number="jobs.backfillMaxPages" class="page-input" type="number" min="1" max="100" />
+            </label>
+            <label class="muted">扫描上限
+              <input v-model.number="jobs.backfillMaxResults" class="page-input wide" type="number" min="1" max="2000" />
+            </label>
+            <label class="muted">入队上限
+              <input v-model.number="jobs.backfillMaxJobs" class="page-input wide" type="number" min="1" max="500" />
+            </label>
+            <button type="button" @click="createPixivBackfillTask">创建历史回填</button>
+          </div>
+          <div v-if="!jobs.backfillTasks.length" class="empty">暂无历史回填任务。</div>
+          <div v-else class="grid review-grid compact-grid">
+            <article v-for="task in jobs.backfillTasks" :key="Number(task.id)" class="item">
+              <div class="title-line">
+                <strong>#{{ task.id }} {{ task.tag_text || task.tag_name }}</strong>
+                <span class="pill" :class="taskStatusClass(String(task.status || ''))">{{ statusLabel(String(task.status || '')) }}</span>
+              </div>
+              <div class="muted">归入：{{ task.tag_name || '-' }}</div>
+              <div class="muted">搜索词：{{ ((task.query_terms as string[]) || []).join('、') || '-' }}</div>
+              <div class="muted">当前：{{ task.current_query_text || '-' }} 第 {{ task.current_page || 0 }} / {{ task.max_pages || 0 }} 页</div>
+              <div class="muted">
+                扫描 {{ task.scanned || 0 }}，匹配 {{ task.matched || 0 }}，入队 {{ task.queued || 0 }}
+              </div>
+              <div class="muted">
+                跳过：已存在 {{ task.skipped_existing || 0 }}，已拒绝 {{ task.skipped_rejected || 0 }}，过滤 {{ task.skipped_filtered || 0 }}，重复 {{ task.skipped_duplicate || 0 }}
+              </div>
+              <div v-if="task.error_log" class="muted danger-text">{{ task.error_log }}</div>
+              <div class="actions">
+                <button class="secondary mini" type="button" @click="retryPixivBackfillTask(Number(task.id))">重试回填</button>
+              </div>
+            </article>
           </div>
         </div>
         <div v-if="jobs.searchItems.length || jobs.searchQueryTerms.length" class="panel">

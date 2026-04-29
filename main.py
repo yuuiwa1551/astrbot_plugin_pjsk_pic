@@ -19,6 +19,7 @@ from .core import (
     ImageIndexDB,
     ImportedImageService,
     LibraryIndexer,
+    PixivBackfillService,
     ReviewService,
     SubmissionNotifyService,
     SubmissionService,
@@ -57,9 +58,20 @@ class PJSKPicPlugin(Star):
             crawl_service=self.crawl_service,
             config=config,
         )
+        self.pixiv_backfill_service = PixivBackfillService(
+            db=self.db,
+            crawl_service=self.crawl_service,
+            config=config,
+        )
         self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
-        self.webui = GalleryWebUI(self.db, self.crawl_service, context=context, config=config)
+        self.webui = GalleryWebUI(
+            self.db,
+            self.crawl_service,
+            pixiv_backfill_service=self.pixiv_backfill_service,
+            context=context,
+            config=config,
+        )
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
         )
@@ -73,6 +85,7 @@ class PJSKPicPlugin(Star):
             except Exception as exc:
                 logger.error(f"[PJSKPic] 启动扫描失败: {exc}", exc_info=True)
         await self.crawl_service.start()
+        await self.pixiv_backfill_service.start()
         await self.auto_crawl_service.start()
         if self._webui_enabled():
             try:
@@ -87,6 +100,7 @@ class PJSKPicPlugin(Star):
     async def terminate(self) -> None:
         await self.webui.stop()
         await self.auto_crawl_service.stop()
+        await self.pixiv_backfill_service.stop()
         await self.crawl_service.stop()
 
     def _library_root(self) -> Path:
@@ -1058,6 +1072,56 @@ class PJSKPicPlugin(Star):
             f"已存在跳过 {summary['skipped_existing']} 个，"
             f"过滤跳过 {summary['skipped_filtered']} 个，错误 {summary['errors']} 个。"
         )
+
+    @pjsk_gallery.command("历史回填添加")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def add_pixiv_backfill_task(
+        self,
+        event: AstrMessageEvent,
+        tag_text: str,
+        max_pages: int = 20,
+        max_results: int = 200,
+        max_new_jobs: int = 100,
+    ):
+        try:
+            task_id, info = await self.pixiv_backfill_service.create_task(
+                tag_text=tag_text,
+                max_pages=max_pages,
+                max_results=max_results,
+                max_new_jobs=max_new_jobs,
+            )
+        except Exception as exc:
+            yield event.plain_result(f"创建 Pixiv 历史回填任务失败：{exc}")
+            return
+        resolved = info.get("resolved_tag") or {}
+        yield event.plain_result(
+            "已创建 Pixiv 历史回填任务：\n"
+            f"#{task_id} {tag_text} -> {resolved.get('name') or tag_text}\n"
+            f"搜索词：{'、'.join(info.get('query_terms') or []) or tag_text}\n"
+            f"页数上限：{max_pages}，扫描上限：{max_results}，入队上限：{max_new_jobs}"
+        )
+
+    @pjsk_gallery.command("历史回填列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_pixiv_backfill_tasks(self, event: AstrMessageEvent):
+        rows = self.db.list_pixiv_backfill_tasks(limit=10)
+        if not rows:
+            yield event.plain_result("当前没有 Pixiv 历史回填任务。")
+            return
+        lines = ["最近 Pixiv 历史回填任务："]
+        for row in rows:
+            lines.append(
+                "\n".join(
+                    [
+                        f"#{row['id']} [{row['status']}] {row['tag_text'] or row['tag_name']} -> {row['tag_name']}",
+                        f"当前：{row['current_query_text'] or '-'} 第 {row['current_page'] or 0}/{row['max_pages']} 页",
+                        f"扫描 {row['scanned']}，匹配 {row['matched']}，入队 {row['queued']}",
+                        f"跳过：已存在 {row['skipped_existing']}，已拒绝 {row['skipped_rejected']}，过滤 {row['skipped_filtered']}，重复 {row['skipped_duplicate']}",
+                        f"错误：{row['error_log'] or '-'}",
+                    ]
+                )
+            )
+        yield event.plain_result("\n\n".join(lines))
 
     @pjsk_gallery.command("采集重试")
     @filter.permission_type(filter.PermissionType.ADMIN)

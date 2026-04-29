@@ -194,6 +194,21 @@
     "description": "每轮自动抓取全局最多创建的 Pixiv 新任务数。",
     "default": 30
   },
+  "pixiv_backfill_default_pages": {
+    "type": "int",
+    "description": "WebUI 创建 Pixiv 历史回填任务时的默认页数上限。",
+    "default": 20
+  },
+  "pixiv_backfill_default_max_results": {
+    "type": "int",
+    "description": "WebUI 创建 Pixiv 历史回填任务时的默认扫描结果上限。",
+    "default": 200
+  },
+  "pixiv_backfill_default_max_new_jobs": {
+    "type": "int",
+    "description": "WebUI 创建 Pixiv 历史回填任务时的默认新增采集任务上限。",
+    "default": 100
+  },
   "x_cookie_string": {
     "type": "string",
     "description": "X / Twitter 抓取所需的 Cookie 字符串。",

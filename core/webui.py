@@ -11,6 +11,7 @@ from astrbot.api import logger
 from .crawl_tag_rules import parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
 from .matcher import normalize_tag_name
+from .pixiv_backfill_service import PixivBackfillService
 from .pixiv_search_service import PixivSearchService
 from .tag_identity_service import TagIdentityService
 
@@ -1828,9 +1829,22 @@ LOGIN_PAGE = """<!DOCTYPE html>
 
 
 class GalleryWebUI:
-    def __init__(self, db: ImageIndexDB, crawl_service, *, context=None, config=None) -> None:
+    def __init__(
+        self,
+        db: ImageIndexDB,
+        crawl_service,
+        *,
+        pixiv_backfill_service: PixivBackfillService | None = None,
+        context=None,
+        config=None,
+    ) -> None:
         self.db = db
         self.crawl_service = crawl_service
+        self.pixiv_backfill_service = pixiv_backfill_service or PixivBackfillService(
+            db=db,
+            crawl_service=crawl_service,
+            config=config if config is not None else getattr(crawl_service, "config", {}),
+        )
         self.context = context
         self.config = config if config is not None else getattr(crawl_service, "config", {})
         self.host = "0.0.0.0"
@@ -1866,6 +1880,9 @@ class GalleryWebUI:
                 web.get("/api/jobs", self.api_jobs),
                 web.post("/api/jobs", self.api_jobs),
                 web.post("/api/jobs/pixiv-search-preview", self.api_jobs_pixiv_search_preview),
+                web.get("/api/jobs/pixiv-backfill", self.api_jobs_pixiv_backfill),
+                web.post("/api/jobs/pixiv-backfill", self.api_jobs_pixiv_backfill),
+                web.post("/api/jobs/pixiv-backfill/retry", self.api_jobs_pixiv_backfill_retry),
                 web.post("/api/jobs/retry", self.api_jobs_retry),
                 web.get("/api/reviews", self.api_reviews),
                 web.get("/api/pixiv-review-images", self.api_pixiv_review_images),
@@ -2283,7 +2300,7 @@ class GalleryWebUI:
             return web.Response(text=LOGIN_PAGE, content_type="text/html", charset="utf-8")
         static_index = WEBUI_STATIC_DIR / "index.html"
         if static_index.exists():
-            return web.FileResponse(static_index)
+            return web.FileResponse(static_index, headers={"Cache-Control": "no-store"})
         return web.Response(text=HTML_PAGE, content_type="text/html", charset="utf-8")
 
     async def api_auth_login(self, request: web.Request) -> web.Response:
@@ -2515,6 +2532,55 @@ class GalleryWebUI:
                 "items": items,
             }
         )
+
+    async def api_jobs_pixiv_backfill(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        if request.method == "GET":
+            rows = self.db.list_pixiv_backfill_tasks(
+                limit=_bounded_int(request.query.get("limit", 30), 30, min_value=1, max_value=100),
+            )
+            return self._json_response({"items": [self._build_pixiv_backfill_task_item(row) for row in rows]})
+
+        data = await self._json_body(request)
+        try:
+            task_id, info = await self.pixiv_backfill_service.create_task(
+                tag_text=str(data.get("tag_text", "") or "").strip(),
+                max_pages=_bounded_int(data.get("max_pages", 20), 20, min_value=1, max_value=100),
+                max_results=_bounded_int(data.get("max_results", 200), 200, min_value=1, max_value=2000),
+                max_new_jobs=_bounded_int(data.get("max_new_jobs", 100), 100, min_value=1, max_value=500),
+                include_tags=parse_tag_csv(str(data.get("include_tags", "") or "")),
+                exclude_tags=parse_tag_csv(str(data.get("exclude_tags", "") or "")),
+            )
+        except Exception as exc:
+            return self._json_response({"ok": False, "message": str(exc)}, status=400)
+        return self._json_response(
+            {
+                "ok": True,
+                "task_id": task_id,
+                "message": f"已创建 Pixiv 历史回填任务 #{task_id}",
+                **info,
+            }
+        )
+
+    async def api_jobs_pixiv_backfill_retry(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        data = await self._json_body(request)
+        ok, message = await self.pixiv_backfill_service.retry_task(int(data.get("task_id", 0) or 0))
+        return self._json_response({"ok": ok, "message": message}, status=(200 if ok else 400))
+
+    @staticmethod
+    def _build_pixiv_backfill_task_item(row) -> dict[str, Any]:
+        item = dict(row)
+        try:
+            query_terms = json.loads(str(item.get("query_terms_json") or "[]"))
+        except json.JSONDecodeError:
+            query_terms = []
+        item["query_terms"] = query_terms if isinstance(query_terms, list) else []
+        return item
 
     def _pixiv_query_terms_for_input(self, raw_text: str, canonical_name: str) -> list[str]:
         known_terms = self._known_pixiv_query_terms(raw_text, canonical_name)

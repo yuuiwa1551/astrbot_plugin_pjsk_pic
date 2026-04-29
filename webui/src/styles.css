@@ -550,6 +550,14 @@ button svg {
   padding: 4px 7px;
 }
 
+.page-input.wide {
+  width: 96px;
+}
+
+.danger-text {
+  color: var(--danger);
+}
+
 .page-size {
   min-height: 30px;
   padding: 4px 7px;

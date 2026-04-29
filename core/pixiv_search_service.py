@@ -18,6 +18,12 @@ class PixivSearchHit:
     translated_tags: list[str] | None = None
 
 
+@dataclass
+class PixivSearchPage:
+    hits: list[PixivSearchHit]
+    next_offset: int | None = None
+
+
 class PixivSearchService:
     def __init__(self, config) -> None:
         self.config = config
@@ -51,6 +57,47 @@ class PixivSearchService:
             timeout_seconds,
         )
 
+    async def search_tag_page(
+        self,
+        tag_name: str,
+        *,
+        offset: int | None = None,
+        timeout_seconds: int = 20,
+    ) -> PixivSearchPage:
+        return await asyncio.to_thread(
+            self._search_tag_page_sync,
+            tag_name,
+            offset,
+            timeout_seconds,
+        )
+
+    def _search_tag_page_sync(
+        self,
+        tag_name: str,
+        offset: int | None,
+        timeout_seconds: int,
+    ) -> PixivSearchPage:
+        refresh_token = self.refresh_token()
+        if not refresh_token:
+            raise PixivAppAPIError("未配置 Pixiv refresh token")
+
+        payload = search_illusts(
+            self.build_query(tag_name),
+            refresh_token=refresh_token,
+            search_target="partial_match_for_tags",
+            sort="date_desc",
+            search_ai_type=0,
+            offset=offset,
+            timeout_seconds=timeout_seconds,
+        )
+        hits = [
+            hit
+            for hit in (self._build_hit(illust) for illust in (payload.get("illusts") or []))
+            if hit is not None
+        ]
+        next_url = str(payload.get("next_url", "") or "").strip()
+        return PixivSearchPage(hits=hits, next_offset=extract_offset_from_next_url(next_url))
+
     def _search_tag_sync(
         self,
         tag_name: str,
@@ -60,7 +107,7 @@ class PixivSearchService:
     ) -> list[PixivSearchHit]:
         refresh_token = self.refresh_token()
         if not refresh_token:
-            raise PixivAppAPIError("??? Pixiv refresh token")
+            raise PixivAppAPIError("未配置 Pixiv refresh token")
 
         query = self.build_query(tag_name)
         results: list[PixivSearchHit] = []
