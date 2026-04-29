@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch, type Component } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch, type Component } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
   BadgeCheck,
@@ -103,6 +103,8 @@ const pixiv = reactive({
   batchPreview: [] as Dict[],
 });
 let pixivSearchTimer: number | null = null;
+let autoRefreshTimer: number | null = null;
+let autoRefreshRunning = false;
 
 const platform = reactive({
   tagFilter: '',
@@ -277,6 +279,38 @@ watch(
   },
   { immediate: true },
 );
+
+async function runLiveRefresh(): Promise<void> {
+  if (autoRefreshRunning || busyCount.value > 0 || document.visibilityState === 'hidden') return;
+  const page = activePage.value;
+  if (page !== 'jobs' && page !== 'pixiv-review') return;
+  if (preview.open) return;
+  if (page === 'pixiv-review' && selectedPixivIds().length) return;
+  autoRefreshRunning = true;
+  try {
+    if (page === 'jobs') {
+      await loadJobs();
+    } else if (page === 'pixiv-review') {
+      await loadPixivReviewImages();
+    }
+  } catch (error) {
+    console.debug('live refresh skipped', error);
+  } finally {
+    autoRefreshRunning = false;
+  }
+}
+
+onMounted(() => {
+  autoRefreshTimer = window.setInterval(() => {
+    void runLiveRefresh();
+  }, 6000);
+});
+
+onBeforeUnmount(() => {
+  if (autoRefreshTimer) window.clearInterval(autoRefreshTimer);
+  if (pixivSearchTimer) window.clearTimeout(pixivSearchTimer);
+  if (toastTimer) window.clearTimeout(toastTimer);
+});
 
 async function logout(): Promise<void> {
   await withBusy(async () => {

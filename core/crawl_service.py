@@ -11,6 +11,7 @@ from .crawl_tag_rules import CrawlTagRules
 from .db import ImageIndexDB
 from .importer import ImportedImageService
 from .matcher import normalize_tag_name
+from .pixiv_tag_terms import known_pixiv_query_terms
 from .review_service import ReviewService
 from .tag_cleaner import TagCleaner
 
@@ -117,8 +118,14 @@ class CrawlService:
         job_rules = CrawlTagRules.from_db_row(row)
         default_rules = CrawlTagRules.from_config(self.config)
         manual_tags = job_rules.manual_tags
-        include_tags = self._normalized_rule_tags([*default_rules.include_tags, *job_rules.include_tags])
-        exclude_tags = self._normalized_rule_tags([*default_rules.exclude_tags, *job_rules.exclude_tags])
+        include_tags = self._normalized_rule_tags(
+            [*default_rules.include_tags, *job_rules.include_tags],
+            platform=platform,
+        )
+        exclude_tags = self._normalized_rule_tags(
+            [*default_rules.exclude_tags, *job_rules.exclude_tags],
+            platform=platform,
+        )
         match_mode = str(row["tag_match_mode"] or "exact").strip().lower() or "exact"
         adapter = CrawlAdapterFactory.create(platform, config=self.config)
         max_candidates = max(1, int(self.config.get("crawler_max_candidates", 6) or 6))
@@ -205,6 +212,7 @@ class CrawlService:
                         manual_tags=manual_tags,
                         include_tags=include_tags,
                         raw_tags=[*candidate.raw_tags, *translated_tags],
+                        platform=platform,
                     )
                 else:
                     tags = self.tag_cleaner.clean_tags(
@@ -303,9 +311,36 @@ class CrawlService:
                 result.append(tag)
         return result
 
-    def _normalized_rule_tags(self, tags: Iterable[str]) -> set[str]:
+    def _normalized_rule_tags(self, tags: Iterable[str], *, platform: str = "") -> set[str]:
         normalized = self.tag_cleaner.normalize_tags(list(tags), drop_noise=False)
-        return {normalize_tag_name(tag) for tag in normalized if tag}
+        result: set[str] = set()
+
+        def add(value: str) -> None:
+            key = normalize_tag_name(value)
+            if key:
+                result.add(key)
+
+        for tag in normalized:
+            add(tag)
+            if CrawlAdapterFactory.normalize_platform(platform) == "pixiv":
+                for term in known_pixiv_query_terms(tag):
+                    add(term)
+            canonical = self._canonicalize_explicit_tag(tag, platform=platform)
+            if not canonical:
+                continue
+            add(canonical)
+            if CrawlAdapterFactory.normalize_platform(platform) == "pixiv":
+                for term in known_pixiv_query_terms(canonical):
+                    add(term)
+            for term in self.db.get_platform_terms_for_tag(
+                tag_name=canonical,
+                platform=platform or "pixiv",
+                purpose="match",
+                include_aliases=True,
+                include_primary=True,
+            ):
+                add(term)
+        return result
 
     def _canonicalize_primary_tags(
         self,
@@ -313,6 +348,7 @@ class CrawlService:
         manual_tags: Iterable[str],
         include_tags: Iterable[str],
         raw_tags: Iterable[str],
+        platform: str = "",
     ) -> list[str]:
         result: list[str] = []
         seen: set[str] = set()
@@ -325,31 +361,37 @@ class CrawlService:
             result.append(tag_name)
 
         for tag in self.tag_cleaner.normalize_tags(list(manual_tags), drop_noise=False):
-            canonical = self._canonicalize_explicit_tag(tag)
+            canonical = self._canonicalize_explicit_tag(tag, platform=platform)
             if canonical:
                 append_if_missing(canonical)
 
         for tag in self.tag_cleaner.normalize_tags(list(include_tags), drop_noise=False):
-            canonical = self._canonicalize_existing_character_tag(tag)
+            canonical = self._canonicalize_existing_character_tag(tag, platform=platform)
             if canonical:
                 append_if_missing(canonical)
 
         for tag in self.tag_cleaner.normalize_tags(list(raw_tags), drop_noise=False):
-            canonical = self._canonicalize_existing_character_tag(tag)
+            canonical = self._canonicalize_existing_character_tag(tag, platform=platform)
             if canonical:
                 append_if_missing(canonical)
 
         return result
 
-    def _canonicalize_explicit_tag(self, tag_name: str) -> str | None:
+    def _canonicalize_explicit_tag(self, tag_name: str, *, platform: str = "") -> str | None:
         match = self.db.resolve_tag(tag_name, allow_fuzzy=False)
         if match.matched and match.tag_name:
             return str(match.tag_name)
+        if platform:
+            platform_match = self.db.resolve_platform_term(platform, tag_name)
+            if platform_match.matched and platform_match.tag_name:
+                return str(platform_match.tag_name)
         normalized = self.tag_cleaner.normalize_tags([tag_name], drop_noise=False)
         return normalized[0] if normalized else None
 
-    def _canonicalize_existing_character_tag(self, tag_name: str) -> str | None:
+    def _canonicalize_existing_character_tag(self, tag_name: str, *, platform: str = "") -> str | None:
         match = self.db.resolve_tag(tag_name, allow_fuzzy=False)
+        if (not match.matched or not match.tag_name) and platform:
+            match = self.db.resolve_platform_term(platform, tag_name)
         if not match.matched or not match.tag_name:
             return None
         row = self.db.get_tag_row(str(match.tag_name))

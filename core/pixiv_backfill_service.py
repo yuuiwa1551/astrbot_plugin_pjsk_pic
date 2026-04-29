@@ -9,6 +9,7 @@ from astrbot.api import logger
 from .db import utcnow_str
 from .matcher import normalize_tag_name
 from .pixiv_search_service import PixivSearchHit, PixivSearchService
+from .pixiv_tag_terms import known_pixiv_query_terms
 
 
 class PixivBackfillService:
@@ -133,7 +134,9 @@ class PixivBackfillService:
 
         tag_name = str(row["tag_name"] or "").strip()
         query_terms = self._query_terms_from_row(row)
-        include_tags = self._unique_texts([tag_name, *self._csv_texts(str(row["include_tags_text"] or ""))])
+        include_tags = self._unique_texts(
+            [tag_name, *query_terms, *self._csv_texts(str(row["include_tags_text"] or ""))]
+        )
         exclude_tags = self._csv_texts(str(row["exclude_tags_text"] or ""))
         max_pages = self._bounded_int(row["max_pages"], 20, 1, 100)
         max_results = self._bounded_int(row["max_results"], 200, 1, 2000)
@@ -290,35 +293,13 @@ class PixivBackfillService:
         return {"id": 0, "name": text, "match_type": "raw"}
 
     def _query_terms_for_input(self, raw_text: str, canonical_name: str) -> list[str]:
-        known_terms = self._known_pixiv_query_terms(raw_text, canonical_name)
+        known_terms = known_pixiv_query_terms(raw_text, canonical_name)
         db_terms = self.db.get_pixiv_query_terms_for_tag(canonical_name) or [canonical_name]
         return self._unique_texts([*known_terms, *db_terms])
 
     @staticmethod
     def _known_pixiv_query_terms(*values: str) -> list[str]:
-        mapping = {
-            "初音未来": ["初音ミク"],
-            "初音未來": ["初音ミク"],
-            "hatsunemiku": ["初音ミク"],
-            "hatsune miku": ["初音ミク"],
-            "miku": ["初音ミク"],
-            "晓山瑞希": ["暁山瑞希"],
-            "暁山瑞希": ["暁山瑞希"],
-            "akiyama mizuki": ["暁山瑞希"],
-            "mzk": ["暁山瑞希"],
-        }
-        resolved: list[str] = []
-        seen: set[str] = set()
-        for value in values:
-            normalized = normalize_tag_name(value)
-            lowered = str(value or "").strip().casefold()
-            for key in (normalized, lowered):
-                for term in mapping.get(key, []):
-                    term_key = normalize_tag_name(term)
-                    if term and term_key not in seen:
-                        seen.add(term_key)
-                        resolved.append(term)
-        return resolved
+        return known_pixiv_query_terms(*values)
 
     @staticmethod
     def _query_terms_from_row(row) -> list[str]:
