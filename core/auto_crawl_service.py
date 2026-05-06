@@ -43,6 +43,9 @@ class AutoCrawlService:
     def timeout_seconds(self) -> int:
         return max(5, int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20))
 
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
     async def start(self) -> None:
         self._stop_event.clear()
         if not self.enabled():

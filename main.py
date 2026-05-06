@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 from collections import defaultdict, deque
 from datetime import datetime
@@ -32,6 +33,7 @@ from .core.webui import GalleryWebUI
 class PJSKPicPlugin(Star):
     OPEN_REVIEW_STATUSES = ("pending", "uncertain", "rejected")
     SENDABLE_REVIEW_STATUSES = {"approved", "manual_approved"}
+    NUMERIC_INSPECT_PATTERN = re.compile(r"^\s*(?:看看|看下|看一看|看)\s*([0-9０-９]+)\s*$")
 
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -75,6 +77,7 @@ class PJSKPicPlugin(Star):
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
         )
+        self.inspect_by_session: dict[str, dict] = {}
 
     async def initialize(self) -> None:
         library_root = self._library_root()
@@ -152,6 +155,190 @@ class PJSKPicPlugin(Star):
             self.recent_by_session[key] = queue
         return queue
 
+    def _numeric_inspect_enabled(self) -> bool:
+        return bool(self.config.get("numeric_inspect_enabled", True))
+
+    def _numeric_inspect_admin_only(self) -> bool:
+        return bool(self.config.get("numeric_inspect_admin_only", True))
+
+    def _numeric_inspect_ttl_seconds(self) -> int:
+        minutes = int(self.config.get("numeric_inspect_ttl_minutes", 60) or 60)
+        return max(1, minutes) * 60
+
+    def _numeric_inspect_max_items(self) -> int:
+        return max(1, min(int(self.config.get("numeric_inspect_max_items", 20) or 20), 100))
+
+    def _inspect_session_key(self, event: AstrMessageEvent) -> str:
+        return str(getattr(event, "unified_msg_origin", "") or "default")
+
+    def _is_admin_event(self, event: AstrMessageEvent) -> bool:
+        try:
+            is_admin_attr = getattr(event, "is_admin", None)
+            if callable(is_admin_attr):
+                if bool(is_admin_attr()):
+                    return True
+            elif is_admin_attr is not None and bool(is_admin_attr):
+                return True
+        except Exception:
+            pass
+        try:
+            role = getattr(event, "role", None)
+            if isinstance(role, str) and role.lower() == "admin":
+                return True
+        except Exception:
+            pass
+        try:
+            sender_id = str(event.get_sender_id())
+            astrbot_config = self.context.get_config()
+            for key in ("admins_id", "admins", "admin_ids", "admin_list", "superusers", "super_users"):
+                values = astrbot_config.get(key, [])
+                if isinstance(values, (list, tuple, set)) and sender_id in {str(item) for item in values}:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _can_use_numeric_inspect(self, event: AstrMessageEvent) -> bool:
+        return (not self._numeric_inspect_admin_only()) or self._is_admin_event(event)
+
+    def _remember_inspect_images(
+        self,
+        event: AstrMessageEvent,
+        image_ids: list[int] | tuple[int, ...],
+        *,
+        source: str = "",
+    ) -> list[int]:
+        if not self._numeric_inspect_enabled():
+            return []
+        max_items = self._numeric_inspect_max_items()
+        clean_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_image_id in image_ids:
+            try:
+                image_id = int(raw_image_id)
+            except Exception:
+                continue
+            if image_id <= 0 or image_id in seen:
+                continue
+            clean_ids.append(image_id)
+            seen.add(image_id)
+            if len(clean_ids) >= max_items:
+                break
+        if not clean_ids:
+            return []
+        self.inspect_by_session[self._inspect_session_key(event)] = {
+            "created_at": datetime.utcnow(),
+            "items": clean_ids,
+            "source": str(source or ""),
+        }
+        return clean_ids
+
+    def _get_inspect_image_id(self, event: AstrMessageEvent, index: int) -> tuple[int | None, str]:
+        if not self._numeric_inspect_enabled():
+            return None, "序号自查功能当前未启用。"
+        if not self._can_use_numeric_inspect(event):
+            return None, "这个自查入口当前仅管理员可用。"
+        if index <= 0:
+            return None, "序号需要从 1 开始，例如：看看1"
+        state = self.inspect_by_session.get(self._inspect_session_key(event))
+        if not state:
+            return None, "当前会话还没有可自查的图片列表。先用 /pp 审核列表 或发图命令生成一组图片。"
+        created_at = state.get("created_at")
+        if not isinstance(created_at, datetime):
+            self.inspect_by_session.pop(self._inspect_session_key(event), None)
+            return None, "当前会话的图片序号缓存已失效。请重新生成图片列表。"
+        if (datetime.utcnow() - created_at).total_seconds() > self._numeric_inspect_ttl_seconds():
+            self.inspect_by_session.pop(self._inspect_session_key(event), None)
+            return None, "当前会话的图片序号缓存已过期。请重新生成图片列表。"
+        items: list[int] = []
+        for item in list(state.get("items") or []):
+            try:
+                numeric_item = int(item)
+            except Exception:
+                continue
+            if numeric_item > 0:
+                items.append(numeric_item)
+        if index > len(items):
+            return None, f"当前只有 {len(items)} 张可自查图片，没有第 {index} 张。"
+        return items[index - 1], ""
+
+    def _parse_numeric_inspect_index(self, message: str) -> int | None:
+        match = self.NUMERIC_INSPECT_PATTERN.match(str(message or ""))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    async def _send_image_detail_by_id(
+        self,
+        event: AstrMessageEvent,
+        image_id: int,
+        *,
+        prefix: str = "",
+    ) -> bool:
+        detail = self.db.get_image_detail(int(image_id))
+        if not detail:
+            await event.send(MessageChain().message(f"没有找到图片：#{int(image_id)}"))
+            return False
+
+        image_path = self._find_detail_image_path(detail, prefer_active=True)
+        if image_path is None:
+            image_path = self._find_trash_path(detail)
+        if image_path is not None and image_path.exists():
+            await event.send(MessageChain().file_image(str(image_path)))
+
+        detail_text = self._build_image_detail_text(detail)
+        if prefix:
+            detail_text = f"{prefix}\n{detail_text}"
+        await event.send(MessageChain().message(detail_text))
+        return True
+
+    async def _handle_numeric_inspect_message(self, event: AstrMessageEvent) -> bool:
+        index = self._parse_numeric_inspect_index(event.message_str)
+        if index is None:
+            return False
+        image_id, error = self._get_inspect_image_id(event, index)
+        if image_id is None:
+            await event.send(MessageChain().message(error))
+            return True
+        await self._send_image_detail_by_id(event, image_id, prefix=f"自查序号 {index} -> 图片 #{image_id}")
+        return True
+
+    @staticmethod
+    def _format_status_counts(counts: dict[str, int], order: tuple[str, ...]) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for status in order:
+            if int(counts.get(status, 0) or 0) > 0:
+                parts.append(f"{status}={int(counts.get(status, 0) or 0)}")
+                seen.add(status)
+        for status, total in sorted(counts.items()):
+            if status in seen or int(total or 0) <= 0:
+                continue
+            parts.append(f"{status}={int(total or 0)}")
+        return "，".join(parts) if parts else "无"
+
+    @staticmethod
+    def _short_text(value: str, limit: int = 180) -> str:
+        text = str(value or "").strip().replace("\r", " ").replace("\n", " ")
+        if len(text) <= limit:
+            return text
+        return text[: max(1, limit - 1)] + "…"
+
+    def _format_crawl_job_brief(self, row, *, index: int | None = None) -> str:
+        prefix = f"{index}. " if index is not None and index > 0 else ""
+        error_text = self._short_text(str(row["error_log"] or ""), 180) or "-"
+        source_url = self._short_text(str(row["source_url"] or ""), 160) or "-"
+        return (
+            f"{prefix}#{int(row['id'])} {row['platform']} {row['status']} "
+            f"progress={int(row['progress'] or 0)} attempts={int(row['attempt_count'] or 0)}\n"
+            f"   URL：{source_url}\n"
+            f"   错误：{error_text}\n"
+            f"   更新：{row['updated_at']}"
+        )
+
     def _review_image_path(self, image_id: int, fallback_path: str = "") -> Path | None:
         resolved_path = self.db.get_image_file_path(int(image_id)) or str(fallback_path or "")
         if not resolved_path:
@@ -161,7 +348,13 @@ class PJSKPicPlugin(Star):
             return None
         return path
 
-    async def _send_review_group_preview(self, event: AstrMessageEvent, rows: list[dict]) -> None:
+    async def _send_review_group_preview(
+        self,
+        event: AstrMessageEvent,
+        rows: list[dict],
+        *,
+        display_index: int | None = None,
+    ) -> None:
         if not rows:
             return
         first = rows[0]
@@ -170,7 +363,10 @@ class PJSKPicPlugin(Star):
         if image_path:
             await event.send(MessageChain().file_image(str(image_path)))
 
-        header = f"图片 #{image_id} 的审核任务（{len(rows)} 条）"
+        if display_index is not None and display_index > 0:
+            header = f"{display_index}. 图片 #{image_id} 的审核任务（{len(rows)} 条）"
+        else:
+            header = f"图片 #{image_id} 的审核任务（{len(rows)} 条）"
         lines = [header]
         for row in rows:
             lines.append(
@@ -181,12 +377,15 @@ class PJSKPicPlugin(Star):
         if rows:
             review_id = int(rows[0]["id"])
             lines.append(f"查看详情：/pjsk图库 审核查看 {review_id}")
+        if display_index is not None and display_index > 0:
+            lines.append(f"自查：看看{display_index}")
         await event.send(MessageChain().message("\n\n".join(lines)))
 
     async def _send_review_task_detail(self, event: AstrMessageEvent, task) -> None:
         image_path = self._review_image_path(int(task["image_id"]), str(task["file_path"] or ""))
         if image_path:
             await event.send(MessageChain().file_image(str(image_path)))
+        self._remember_inspect_images(event, [int(task["image_id"])], source="review_detail")
         await event.send(
             MessageChain().message(
                 f"审核任务 #{task['id']}\n"
@@ -196,7 +395,8 @@ class PJSKPicPlugin(Star):
                 f"来源：{task['source_type'] or '-'}\n"
                 f"原因：{task['reason'] or '-'}\n"
                 f"通过：/pjsk图库 审核通过 {task['id']}\n"
-                f"拒绝：/pjsk图库 审核拒绝 {task['id']}"
+                f"拒绝：/pjsk图库 审核拒绝 {task['id']}\n"
+                f"自查：看看1"
             ),
         )
 
@@ -518,6 +718,7 @@ class PJSKPicPlugin(Star):
 
         send_count = max(1, min(int(count or 1), 3))
         sent = 0
+        sent_image_ids: list[int] = []
         queue = self._recent_queue(getattr(event, "unified_msg_origin", "default"))
 
         for _ in range(send_count):
@@ -539,15 +740,18 @@ class PJSKPicPlugin(Star):
                 continue
 
             await event.send(MessageChain().file_image(str(image_path)))
+            inspect_index = len(sent_image_ids) + 1
+            brief_text = self._build_image_brief_text(
+                int(row["id"]),
+                matched_tag=str(match.tag_name),
+            )
+            if self._numeric_inspect_enabled():
+                brief_text += f"\n自查：看看{inspect_index}"
             await event.send(
-                MessageChain().message(
-                    self._build_image_brief_text(
-                        int(row["id"]),
-                        matched_tag=str(match.tag_name),
-                    ),
-                ),
+                MessageChain().message(brief_text),
             )
             queue.append(int(row["id"]))
+            sent_image_ids.append(int(row["id"]))
             self.db.record_send_log(
                 getattr(event, "unified_msg_origin", "default"),
                 int(row["id"]),
@@ -557,10 +761,14 @@ class PJSKPicPlugin(Star):
 
         if sent == 0:
             return "send_failed"
+        self._remember_inspect_images(event, sent_image_ids, source="tag_image")
         return None
 
     @filter.regex(r"^(?:看看|看下|看一看|看|来张|来一张|发一张|来点).+")
     async def send_image_by_natural_language(self, event: AstrMessageEvent):
+        if await self._handle_numeric_inspect_message(event):
+            event.stop_event()
+            return
         query = extract_query_from_text(event.message_str)
         if not query:
             return
@@ -752,7 +960,16 @@ class PJSKPicPlugin(Star):
         if image_path is not None and image_path.exists():
             await event.send(MessageChain().file_image(str(image_path)))
 
+        self._remember_inspect_images(event, [int(image_id)], source="image_detail")
         yield event.plain_result(self._build_image_detail_text(detail))
+
+    @pjsk_gallery.command("看看")
+    async def inspect_recent_image_command(self, event: AstrMessageEvent, index: int):
+        image_id, error = self._get_inspect_image_id(event, int(index))
+        if image_id is None:
+            await event.send(MessageChain().message(error))
+            return
+        await self._send_image_detail_by_id(event, image_id, prefix=f"自查序号 {int(index)} -> 图片 #{image_id}")
 
     @pjsk_gallery.command("别名添加")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1021,6 +1238,97 @@ class PJSKPicPlugin(Star):
             )
         yield event.plain_result("\n\n".join(lines))
 
+    @pjsk_gallery.command("采集诊断")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def crawl_diagnostics(self, event: AstrMessageEvent):
+        job_counts = self.db.count_crawl_jobs_by_status()
+        backfill_counts = self.db.count_pixiv_backfill_tasks_by_status()
+        pixiv_subs = self.db.list_crawl_subscriptions(platform="pixiv", limit=1000)
+        enabled_pixiv_subs = [row for row in pixiv_subs if int(row["enabled"] or 0) == 1]
+        last_checked = max([str(row["last_checked_at"] or "") for row in pixiv_subs] or [""]) or "-"
+        last_success = max([str(row["last_success_at"] or "") for row in pixiv_subs] or [""]) or "-"
+        latest_job = self.db.get_latest_crawl_job()
+        latest_failed = self.db.get_latest_crawl_job(statuses=("failed",))
+        latest_subscription_error = self.db.get_latest_crawl_subscription_error(platform="pixiv")
+
+        lines = [
+            "采集诊断：",
+            f"采集 worker：{'运行中' if self.crawl_service.worker_running() else '未运行'}，队列 {self.crawl_service.queue_size()}",
+            f"Pixiv 自动采集：{'启用' if self.auto_crawl_service.enabled() else '未启用'} / {'运行中' if self.auto_crawl_service.running() else '未运行'}",
+            f"Pixiv refresh token：{'已配置' if self.auto_crawl_service.has_refresh_token() else '未配置'}",
+            f"Pixiv 自动订阅：启用 {len(enabled_pixiv_subs)} / 总计 {len(pixiv_subs)}",
+            f"最近检查：{last_checked}",
+            f"最近成功：{last_success}",
+            f"采集任务状态：{self._format_status_counts(job_counts, ('pending', 'retry', 'running', 'failed', 'completed'))}",
+            f"历史回填状态：{self._format_status_counts(backfill_counts, ('pending', 'retry', 'running', 'failed', 'completed'))}",
+            f"历史回填 worker：{'运行中' if self.pixiv_backfill_service.worker_running() else '未运行'}，队列 {self.pixiv_backfill_service.queue_size()}",
+        ]
+        if latest_job:
+            lines.append(
+                "最近采集任务："
+                + f" #{latest_job['id']} [{latest_job['status']}] {latest_job['platform']} "
+                + f"{latest_job['progress']}% 更新 {latest_job['updated_at']}"
+            )
+        if latest_failed:
+            lines.append("最近失败任务：\n" + self._format_crawl_job_brief(latest_failed))
+        if latest_subscription_error:
+            lines.append(
+                "最近 Pixiv 自动采集错误："
+                + f" #{latest_subscription_error['id']} {latest_subscription_error['tag_name']}\n"
+                + f"   query：{latest_subscription_error['query_text'] or '-'}\n"
+                + f"   错误：{self._short_text(str(latest_subscription_error['last_error'] or ''), 180) or '-'}\n"
+                + f"   更新：{latest_subscription_error['updated_at']}"
+            )
+        lines.append("失败任务可用 /pp 失败列表 查看，或 /pp 失败重试 <job_id> 重新入队。")
+        yield event.plain_result("\n".join(lines))
+
+    @pjsk_gallery.command("失败列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_failed_crawl_jobs_command(self, event: AstrMessageEvent, platform: str = ""):
+        platform_text = str(platform or "").strip().lower()
+        if platform_text in {"全部", "all", "*"}:
+            platform_text = ""
+        rows = self.db.list_failed_crawl_jobs(platform=platform_text, limit=10)
+        if not rows:
+            scope = f" {platform_text}" if platform_text else ""
+            yield event.plain_result(f"当前没有{scope}失败采集任务。")
+            return
+        lines = ["最近失败采集任务："]
+        for index, row in enumerate(rows, start=1):
+            lines.append(self._format_crawl_job_brief(row, index=index))
+        lines.append("可用 /pp 失败重试 <job_id> 或 /pp 失败重试 全部。")
+        yield event.plain_result("\n\n".join(lines))
+
+    @pjsk_gallery.command("失败重试")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def retry_failed_crawl_jobs_command(self, event: AstrMessageEvent, job_id: str):
+        target = str(job_id or "").strip().lower()
+        if target in {"全部", "all", "*"}:
+            rows = self.db.list_failed_crawl_jobs(limit=20)
+            if not rows:
+                yield event.plain_result("当前没有失败采集任务可重试。")
+                return
+            ok_count = 0
+            failed: list[str] = []
+            for row in rows:
+                ok, message = await self.crawl_service.retry_job(int(row["id"]))
+                if ok:
+                    ok_count += 1
+                else:
+                    failed.append(message)
+            lines = [f"已重新入队 {ok_count} 个失败采集任务。"]
+            if failed:
+                lines.append("失败：" + "；".join(failed[:5]))
+            yield event.plain_result("\n".join(lines))
+            return
+        try:
+            numeric_job_id = int(target)
+        except ValueError:
+            yield event.plain_result("用法：/pp 失败重试 <job_id|全部>")
+            return
+        ok, message = await self.crawl_service.retry_job(numeric_job_id)
+        yield event.plain_result(message if ok else f"重试失败：{message}")
+
     @pjsk_gallery.command("自动采集状态")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def auto_crawl_status(self, event: AstrMessageEvent):
@@ -1161,15 +1469,17 @@ class PJSKPicPlugin(Star):
         )
 
         preview_limit = min(5, len(ordered_image_ids))
-        for image_id in ordered_image_ids[:preview_limit]:
-            await self._send_review_group_preview(event, grouped.get(image_id, []))
+        displayed_image_ids = ordered_image_ids[:preview_limit]
+        self._remember_inspect_images(event, displayed_image_ids, source="review_list")
+        for index, image_id in enumerate(displayed_image_ids, start=1):
+            await self._send_review_group_preview(event, grouped.get(image_id, []), display_index=index)
 
         if len(ordered_image_ids) > preview_limit:
             yield event.plain_result(
-                f"其余 {len(ordered_image_ids) - preview_limit} 张图片未展开。可用 /pjsk图库 审核查看 <review_id> 查看单条审核。",
+                f"其余 {len(ordered_image_ids) - preview_limit} 张图片未展开。可用 /pjsk图库 审核查看 <review_id> 查看单条审核；已展开图片可用 看看1~看看{preview_limit} 自查。",
             )
             return
-        yield event.plain_result("可继续使用 /pjsk图库 审核查看 <review_id> 查看单条审核。")
+        yield event.plain_result(f"可继续使用 /pjsk图库 审核查看 <review_id> 查看单条审核；已展开图片可用 看看1~看看{preview_limit} 自查。")
 
     @pjsk_gallery.command("审核查看")
     @filter.permission_type(filter.PermissionType.ADMIN)

@@ -31,6 +31,12 @@ class CrawlService:
     def _keep_primary_tags_only(self) -> bool:
         return bool(self.config.get("crawl_keep_primary_tags_only", True))
 
+    def queue_size(self) -> int:
+        return int(self._queue.qsize())
+
+    def worker_running(self) -> bool:
+        return self._worker_task is not None and not self._worker_task.done()
+
     async def start(self) -> None:
         self.db.reset_running_jobs()
         self._stop_event.clear()

@@ -23,6 +23,12 @@ class PixivBackfillService:
         self._worker_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
+    def queue_size(self) -> int:
+        return int(self._queue.qsize())
+
+    def worker_running(self) -> bool:
+        return self._worker_task is not None and not self._worker_task.done()
+
     async def start(self) -> None:
         self.db.reset_running_pixiv_backfill_tasks()
         self._stop_event.clear()

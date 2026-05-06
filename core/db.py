@@ -3441,6 +3441,55 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
 
+    def count_crawl_jobs_by_status(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS total FROM crawl_jobs GROUP BY status"
+            ).fetchall()
+        return {str(row["status"] or ""): int(row["total"] or 0) for row in rows}
+
+    def count_pixiv_backfill_tasks_by_status(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS total FROM pixiv_backfill_tasks GROUP BY status"
+            ).fetchall()
+        return {str(row["status"] or ""): int(row["total"] or 0) for row in rows}
+
+    def get_latest_crawl_job(self, *, statuses: Iterable[str] | None = None) -> sqlite3.Row | None:
+        sql = "SELECT * FROM crawl_jobs"
+        params: list[Any] = []
+        status_values = [str(item).strip() for item in (statuses or []) if str(item).strip()]
+        if status_values:
+            placeholders = ",".join("?" for _ in status_values)
+            sql += f" WHERE status IN ({placeholders})"
+            params.extend(status_values)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT 1"
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchone()
+
+    def list_failed_crawl_jobs(self, *, platform: str = "", limit: int = 10) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM crawl_jobs WHERE status = 'failed'"
+        params: list[Any] = []
+        platform_text = str(platform or "").strip().lower()
+        if platform_text:
+            sql += " AND platform = ?"
+            params.append(platform_text)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit or 10)))
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def get_latest_crawl_subscription_error(self, *, platform: str = "") -> sqlite3.Row | None:
+        sql = "SELECT * FROM crawl_subscriptions WHERE TRIM(COALESCE(last_error, '')) <> ''"
+        params: list[Any] = []
+        platform_text = str(platform or "").strip().lower()
+        if platform_text:
+            sql += " AND platform = ?"
+            params.append(platform_text)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT 1"
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchone()
+
     def get_pending_job_ids(self) -> list[int]:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT id FROM crawl_jobs WHERE status IN ('pending', 'retry') ORDER BY id ASC").fetchall()
