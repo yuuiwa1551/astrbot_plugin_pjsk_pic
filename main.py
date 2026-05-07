@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 import shutil
 from collections import defaultdict, deque
 from datetime import datetime
@@ -745,7 +746,7 @@ class PJSKPicPlugin(Star):
                 int(row["id"]),
                 matched_tag=str(match.tag_name),
             )
-            if self._numeric_inspect_enabled():
+            if self._numeric_inspect_enabled() and self._can_use_numeric_inspect(event):
                 brief_text += f"\n自查：看看{inspect_index}"
             await event.send(
                 MessageChain().message(brief_text),
@@ -764,7 +765,7 @@ class PJSKPicPlugin(Star):
         self._remember_inspect_images(event, sent_image_ids, source="tag_image")
         return None
 
-    @filter.regex(r"^(?:看看|看下|看一看|看|来张|来一张|发一张|来点).+")
+    @filter.regex(r"^(?:看看|看下|看一看|看|来张|来一张|发一张|来点).+", priority=sys.maxsize)
     async def send_image_by_natural_language(self, event: AstrMessageEvent):
         if await self._handle_numeric_inspect_message(event):
             event.stop_event()
