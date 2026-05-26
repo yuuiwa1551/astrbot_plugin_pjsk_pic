@@ -19,25 +19,15 @@
     "description": "最近结果去重窗口大小，避免短时间内重复返回相同图片。",
     "default": 20
   },
-  "numeric_inspect_enabled": {
+  "image_id_lookup_enabled": {
     "type": "bool",
-    "description": "是否启用 看看<序号> 自查入口；用于查看当前会话最近展示图片列表里的指定图片详情。",
+    "description": "是否启用 看看id<image_id> 图片 ID 查看入口。",
     "default": true
   },
-  "numeric_inspect_admin_only": {
+  "image_id_lookup_admin_only": {
     "type": "bool",
-    "description": "看看<序号> 自查入口是否仅管理员可用。建议保持开启，以免普通群友看到来源、文件路径和审核状态等管理信息。",
+    "description": "看看id<image_id> 图片 ID 查看入口是否仅管理员可用。建议保持开启，以免普通群友看到来源、文件路径和审核状态等管理信息。",
     "default": true
-  },
-  "numeric_inspect_ttl_minutes": {
-    "type": "int",
-    "description": "看看<序号> 自查缓存的有效时间（分钟）。过期后需要重新生成图片列表。",
-    "default": 60
-  },
-  "numeric_inspect_max_items": {
-    "type": "int",
-    "description": "每个会话最多记录多少张最近展示图片供 看看<序号> 自查。",
-    "default": 20
   },
   "enable_llm_tool": {
     "type": "bool",

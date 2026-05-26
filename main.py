@@ -35,7 +35,6 @@ from .core.webui import GalleryWebUI
 class PJSKPicPlugin(Star):
     OPEN_REVIEW_STATUSES = ("pending", "uncertain", "rejected")
     SENDABLE_REVIEW_STATUSES = {"approved", "manual_approved"}
-    NUMERIC_INSPECT_PATTERN = re.compile(r"^\s*(?:看看|看下|看一看|看)\s*([0-9０-９]+)\s*$")
     DIRECT_IMAGE_ID_PATTERN = re.compile(
         r"^\s*(?:看看|看下|看一看|看一下|看)\s*(?:(?:图片|图)\s*)?(?:id|编号|#)\s*(?:[:：#号=为是-]\s*)?([0-9０-９]+)\s*(?:的?(?:图片|图))?\s*$",
         re.IGNORECASE,
@@ -83,7 +82,6 @@ class PJSKPicPlugin(Star):
         self.recent_by_session: dict[str, deque[int]] = defaultdict(
             lambda: deque(maxlen=self._dedupe_count()),
         )
-        self.inspect_by_session: dict[str, dict] = {}
 
     async def initialize(self) -> None:
         library_root = self._library_root()
@@ -161,21 +159,11 @@ class PJSKPicPlugin(Star):
             self.recent_by_session[key] = queue
         return queue
 
-    def _numeric_inspect_enabled(self) -> bool:
-        return bool(self.config.get("numeric_inspect_enabled", True))
+    def _image_id_lookup_enabled(self) -> bool:
+        return bool(self.config.get("image_id_lookup_enabled", True))
 
-    def _numeric_inspect_admin_only(self) -> bool:
-        return bool(self.config.get("numeric_inspect_admin_only", True))
-
-    def _numeric_inspect_ttl_seconds(self) -> int:
-        minutes = int(self.config.get("numeric_inspect_ttl_minutes", 60) or 60)
-        return max(1, minutes) * 60
-
-    def _numeric_inspect_max_items(self) -> int:
-        return max(1, min(int(self.config.get("numeric_inspect_max_items", 20) or 20), 100))
-
-    def _inspect_session_key(self, event: AstrMessageEvent) -> str:
-        return str(getattr(event, "unified_msg_origin", "") or "default")
+    def _image_id_lookup_admin_only(self) -> bool:
+        return bool(self.config.get("image_id_lookup_admin_only", True))
 
     def _is_admin_event(self, event: AstrMessageEvent) -> bool:
         try:
@@ -204,79 +192,8 @@ class PJSKPicPlugin(Star):
             pass
         return False
 
-    def _can_use_numeric_inspect(self, event: AstrMessageEvent) -> bool:
-        return (not self._numeric_inspect_admin_only()) or self._is_admin_event(event)
-
-    def _remember_inspect_images(
-        self,
-        event: AstrMessageEvent,
-        image_ids: list[int] | tuple[int, ...],
-        *,
-        source: str = "",
-    ) -> list[int]:
-        if not self._numeric_inspect_enabled():
-            return []
-        max_items = self._numeric_inspect_max_items()
-        clean_ids: list[int] = []
-        seen: set[int] = set()
-        for raw_image_id in image_ids:
-            try:
-                image_id = int(raw_image_id)
-            except Exception:
-                continue
-            if image_id <= 0 or image_id in seen:
-                continue
-            clean_ids.append(image_id)
-            seen.add(image_id)
-            if len(clean_ids) >= max_items:
-                break
-        if not clean_ids:
-            return []
-        self.inspect_by_session[self._inspect_session_key(event)] = {
-            "created_at": datetime.utcnow(),
-            "items": clean_ids,
-            "source": str(source or ""),
-        }
-        return clean_ids
-
-    def _get_inspect_image_id(self, event: AstrMessageEvent, index: int) -> tuple[int | None, str]:
-        if not self._numeric_inspect_enabled():
-            return None, "序号自查功能当前未启用。"
-        if not self._can_use_numeric_inspect(event):
-            return None, "这个自查入口当前仅管理员可用。"
-        if index <= 0:
-            return None, "序号需要从 1 开始，例如：看看1"
-        state = self.inspect_by_session.get(self._inspect_session_key(event))
-        if not state:
-            return None, "当前会话还没有可自查的图片列表。先用 /pp 审核列表 或发图命令生成一组图片。"
-        created_at = state.get("created_at")
-        if not isinstance(created_at, datetime):
-            self.inspect_by_session.pop(self._inspect_session_key(event), None)
-            return None, "当前会话的图片序号缓存已失效。请重新生成图片列表。"
-        if (datetime.utcnow() - created_at).total_seconds() > self._numeric_inspect_ttl_seconds():
-            self.inspect_by_session.pop(self._inspect_session_key(event), None)
-            return None, "当前会话的图片序号缓存已过期。请重新生成图片列表。"
-        items: list[int] = []
-        for item in list(state.get("items") or []):
-            try:
-                numeric_item = int(item)
-            except Exception:
-                continue
-            if numeric_item > 0:
-                items.append(numeric_item)
-        if index > len(items):
-            return None, f"当前只有 {len(items)} 张可自查图片，没有第 {index} 张。"
-        return items[index - 1], ""
-
-    def _parse_numeric_inspect_index(self, message: str) -> int | None:
-        text = unicodedata.normalize("NFKC", str(message or ""))
-        match = self.NUMERIC_INSPECT_PATTERN.match(text)
-        if not match:
-            return None
-        try:
-            return int(match.group(1))
-        except ValueError:
-            return None
+    def _can_use_image_id_lookup(self, event: AstrMessageEvent) -> bool:
+        return (not self._image_id_lookup_admin_only()) or self._is_admin_event(event)
 
     def _parse_direct_image_id(self, message: str) -> int | None:
         text = unicodedata.normalize("NFKC", str(message or ""))
@@ -312,35 +229,24 @@ class PJSKPicPlugin(Star):
         await event.send(MessageChain().message(detail_text))
         return True
 
-    async def _handle_numeric_inspect_message(self, event: AstrMessageEvent) -> bool:
+    async def _handle_direct_image_id_message(self, event: AstrMessageEvent) -> bool:
         direct_image_id = self._parse_direct_image_id(event.message_str)
-        if direct_image_id is not None:
-            if not self._numeric_inspect_enabled():
-                await event.send(MessageChain().message("图片 ID 查看入口当前未启用。"))
-                return True
-            if not self._can_use_numeric_inspect(event):
-                await event.send(MessageChain().message("这个图片 ID 查看入口当前仅管理员可用。"))
-                return True
-            if direct_image_id <= 0:
-                await event.send(MessageChain().message("图片 ID 需要大于 0，例如：看看id123"))
-                return True
-            sent = await self._send_image_detail_by_id(
-                event,
-                direct_image_id,
-                prefix=f"图片 ID #{direct_image_id}",
-            )
-            if sent:
-                self._remember_inspect_images(event, [direct_image_id], source="image_id_lookup")
-            return True
-
-        index = self._parse_numeric_inspect_index(event.message_str)
-        if index is None:
+        if direct_image_id is None:
             return False
-        image_id, error = self._get_inspect_image_id(event, index)
-        if image_id is None:
-            await event.send(MessageChain().message(error))
+        if not self._image_id_lookup_enabled():
+            await event.send(MessageChain().message("图片 ID 查看入口当前未启用。"))
             return True
-        await self._send_image_detail_by_id(event, image_id, prefix=f"自查序号 {index} -> 图片 #{image_id}")
+        if not self._can_use_image_id_lookup(event):
+            await event.send(MessageChain().message("这个图片 ID 查看入口当前仅管理员可用。"))
+            return True
+        if direct_image_id <= 0:
+            await event.send(MessageChain().message("图片 ID 需要大于 0，例如：看看id123"))
+            return True
+        await self._send_image_detail_by_id(
+            event,
+            direct_image_id,
+            prefix=f"图片 ID #{direct_image_id}",
+        )
         return True
 
     @staticmethod
@@ -414,15 +320,13 @@ class PJSKPicPlugin(Star):
         if rows:
             review_id = int(rows[0]["id"])
             lines.append(f"查看详情：/pjsk图库 审核查看 {review_id}")
-        if display_index is not None and display_index > 0:
-            lines.append(f"自查：看看{display_index}")
+        lines.append(f"图片详情：看看id{image_id}")
         await event.send(MessageChain().message("\n\n".join(lines)))
 
     async def _send_review_task_detail(self, event: AstrMessageEvent, task) -> None:
         image_path = self._review_image_path(int(task["image_id"]), str(task["file_path"] or ""))
         if image_path:
             await event.send(MessageChain().file_image(str(image_path)))
-        self._remember_inspect_images(event, [int(task["image_id"])], source="review_detail")
         await event.send(
             MessageChain().message(
                 f"审核任务 #{task['id']}\n"
@@ -432,8 +336,7 @@ class PJSKPicPlugin(Star):
                 f"来源：{task['source_type'] or '-'}\n"
                 f"原因：{task['reason'] or '-'}\n"
                 f"通过：/pjsk图库 审核通过 {task['id']}\n"
-                f"拒绝：/pjsk图库 审核拒绝 {task['id']}\n"
-                f"自查：看看1"
+                f"拒绝：/pjsk图库 审核拒绝 {task['id']}"
             ),
         )
 
@@ -755,7 +658,6 @@ class PJSKPicPlugin(Star):
 
         send_count = max(1, min(int(count or 1), 3))
         sent = 0
-        sent_image_ids: list[int] = []
         queue = self._recent_queue(getattr(event, "unified_msg_origin", "default"))
 
         for _ in range(send_count):
@@ -777,18 +679,14 @@ class PJSKPicPlugin(Star):
                 continue
 
             await event.send(MessageChain().file_image(str(image_path)))
-            inspect_index = len(sent_image_ids) + 1
             brief_text = self._build_image_brief_text(
                 int(row["id"]),
                 matched_tag=str(match.tag_name),
             )
-            if self._numeric_inspect_enabled() and self._can_use_numeric_inspect(event):
-                brief_text += f"\n自查：看看{inspect_index}"
             await event.send(
                 MessageChain().message(brief_text),
             )
             queue.append(int(row["id"]))
-            sent_image_ids.append(int(row["id"]))
             self.db.record_send_log(
                 getattr(event, "unified_msg_origin", "default"),
                 int(row["id"]),
@@ -798,12 +696,11 @@ class PJSKPicPlugin(Star):
 
         if sent == 0:
             return "send_failed"
-        self._remember_inspect_images(event, sent_image_ids, source="tag_image")
         return None
 
-    @filter.regex(r"^(?:看看|看下|看一看|看|来张|来一张|发一张|来点).+", priority=sys.maxsize)
+    @filter.regex(r"^(?!(?:看看|看下|看一看|看一下|看)\s*[0-9０-９]+\s*$)(?:看看|看下|看一看|看一下|看|来张|来一张|发一张|来点).+", priority=sys.maxsize)
     async def send_image_by_natural_language(self, event: AstrMessageEvent):
-        if await self._handle_numeric_inspect_message(event):
+        if await self._handle_direct_image_id_message(event):
             event.stop_event()
             return
         query = extract_query_from_text(event.message_str)
@@ -997,16 +894,7 @@ class PJSKPicPlugin(Star):
         if image_path is not None and image_path.exists():
             await event.send(MessageChain().file_image(str(image_path)))
 
-        self._remember_inspect_images(event, [int(image_id)], source="image_detail")
         yield event.plain_result(self._build_image_detail_text(detail))
-
-    @pjsk_gallery.command("看看")
-    async def inspect_recent_image_command(self, event: AstrMessageEvent, index: int):
-        image_id, error = self._get_inspect_image_id(event, int(index))
-        if image_id is None:
-            await event.send(MessageChain().message(error))
-            return
-        await self._send_image_detail_by_id(event, image_id, prefix=f"自查序号 {int(index)} -> 图片 #{image_id}")
 
     @pjsk_gallery.command("别名添加")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1506,17 +1394,15 @@ class PJSKPicPlugin(Star):
         )
 
         preview_limit = min(5, len(ordered_image_ids))
-        displayed_image_ids = ordered_image_ids[:preview_limit]
-        self._remember_inspect_images(event, displayed_image_ids, source="review_list")
-        for index, image_id in enumerate(displayed_image_ids, start=1):
+        for index, image_id in enumerate(ordered_image_ids[:preview_limit], start=1):
             await self._send_review_group_preview(event, grouped.get(image_id, []), display_index=index)
 
         if len(ordered_image_ids) > preview_limit:
             yield event.plain_result(
-                f"其余 {len(ordered_image_ids) - preview_limit} 张图片未展开。可用 /pjsk图库 审核查看 <review_id> 查看单条审核；已展开图片可用 看看1~看看{preview_limit} 自查。",
+                f"其余 {len(ordered_image_ids) - preview_limit} 张图片未展开。可用 /pjsk图库 审核查看 <review_id> 查看单条审核。",
             )
             return
-        yield event.plain_result(f"可继续使用 /pjsk图库 审核查看 <review_id> 查看单条审核；已展开图片可用 看看1~看看{preview_limit} 自查。")
+        yield event.plain_result("可继续使用 /pjsk图库 审核查看 <review_id> 查看单条审核。")
 
     @pjsk_gallery.command("审核查看")
     @filter.permission_type(filter.PermissionType.ADMIN)

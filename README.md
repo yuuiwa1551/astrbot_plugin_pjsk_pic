@@ -152,7 +152,6 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 - `/pp 统计`
 - `/pp 查看 <tag>`
 - `/pp 看图 <image_id>`
-- `/pp 看看 <序号>`
 - `/pp 别名添加 <tag> <alias>`
 - `/pp 别名删除 <tag> <alias>`
 - `/pp 别名查看 <tag>`
@@ -184,7 +183,7 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 - `/pp 恢复图 <image_id>`
 - `/pp 面板地址`
 
-`看看<序号>` / `/pp 看看 <序号>` 用于管理员自查当前会话最近一次展示的图片列表。例如 `/pp 审核列表` 展开 5 张图后，可发送 `看看1` 查看第 1 张的图片详情、来源、tag 与管理操作提示。数据库图片 ID 可使用 `/pp 看图 <image_id>`，也可自然语言发送 `看看id<image_id>` 查看。
+数据库图片 ID 可使用 `/pp 看图 <image_id>`，也可自然语言发送 `看看id<image_id>` 查看。纯数字写法如 `看看1` 不再代表最近展示列表序号。
 
 ## 4. 配置说明
 
@@ -200,14 +199,10 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
   - 是否允许 tag / alias 模糊匹配
 - `recent_dedupe_count`
   - 每个会话最近去重的图片数量
-- `numeric_inspect_enabled`
-  - 是否启用 `看看<序号>` 自查入口与 `看看id<image_id>` 图片 ID 查看入口
-- `numeric_inspect_admin_only`
-  - `看看<序号>` / `看看id<image_id>` 是否仅管理员可用，默认开启
-- `numeric_inspect_ttl_minutes`
-  - `看看<序号>` 自查序号缓存有效时间
-- `numeric_inspect_max_items`
-  - 每个会话最多记录多少张最近展示图片供序号自查
+- `image_id_lookup_enabled`
+  - 是否启用 `看看id<image_id>` 图片 ID 查看入口
+- `image_id_lookup_admin_only`
+  - `看看id<image_id>` 是否仅管理员可用，默认开启
 - `enable_llm_tool`
   - 是否开启 LLM 发图工具
 
@@ -421,6 +416,12 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 - 当前插件版本：`0.14.9`
 
 ## 10. 更新记录
+
+### v0.14.11
+
+- 移除 `看看<序号>` / `/pp 看看 <序号>` 最近展示列表序号自查功能
+- 发图结果和审核列表不再写入或提示 `自查：看看N`
+- `看看id<image_id>` 图片 ID 查看入口改用独立配置项 `image_id_lookup_enabled` / `image_id_lookup_admin_only`
 
 ### v0.14.10
 
