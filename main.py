@@ -4,6 +4,7 @@ import asyncio
 import re
 import sys
 import shutil
+import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,10 @@ class PJSKPicPlugin(Star):
     OPEN_REVIEW_STATUSES = ("pending", "uncertain", "rejected")
     SENDABLE_REVIEW_STATUSES = {"approved", "manual_approved"}
     NUMERIC_INSPECT_PATTERN = re.compile(r"^\s*(?:看看|看下|看一看|看)\s*([0-9０-９]+)\s*$")
+    DIRECT_IMAGE_ID_PATTERN = re.compile(
+        r"^\s*(?:看看|看下|看一看|看一下|看)\s*(?:(?:图片|图)\s*)?(?:id|编号|#)\s*(?:[:：#号=为是-]\s*)?([0-9０-９]+)\s*(?:的?(?:图片|图))?\s*$",
+        re.IGNORECASE,
+    )
 
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -264,7 +269,18 @@ class PJSKPicPlugin(Star):
         return items[index - 1], ""
 
     def _parse_numeric_inspect_index(self, message: str) -> int | None:
-        match = self.NUMERIC_INSPECT_PATTERN.match(str(message or ""))
+        text = unicodedata.normalize("NFKC", str(message or ""))
+        match = self.NUMERIC_INSPECT_PATTERN.match(text)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    def _parse_direct_image_id(self, message: str) -> int | None:
+        text = unicodedata.normalize("NFKC", str(message or ""))
+        match = self.DIRECT_IMAGE_ID_PATTERN.match(text)
         if not match:
             return None
         try:
@@ -297,6 +313,26 @@ class PJSKPicPlugin(Star):
         return True
 
     async def _handle_numeric_inspect_message(self, event: AstrMessageEvent) -> bool:
+        direct_image_id = self._parse_direct_image_id(event.message_str)
+        if direct_image_id is not None:
+            if not self._numeric_inspect_enabled():
+                await event.send(MessageChain().message("图片 ID 查看入口当前未启用。"))
+                return True
+            if not self._can_use_numeric_inspect(event):
+                await event.send(MessageChain().message("这个图片 ID 查看入口当前仅管理员可用。"))
+                return True
+            if direct_image_id <= 0:
+                await event.send(MessageChain().message("图片 ID 需要大于 0，例如：看看id123"))
+                return True
+            sent = await self._send_image_detail_by_id(
+                event,
+                direct_image_id,
+                prefix=f"图片 ID #{direct_image_id}",
+            )
+            if sent:
+                self._remember_inspect_images(event, [direct_image_id], source="image_id_lookup")
+            return True
+
         index = self._parse_numeric_inspect_index(event.message_str)
         if index is None:
             return False
