@@ -13,6 +13,7 @@ from .db import ImageIndexDB
 from .matcher import normalize_tag_name
 from .pixiv_backfill_service import PixivBackfillService
 from .pixiv_search_service import PixivSearchService
+from .pixiv_tag_terms import known_pixiv_query_terms as shared_known_pixiv_query_terms
 from .tag_identity_service import TagIdentityService
 
 WEBUI_STATIC_DIR = Path(__file__).resolve().parent / "webui_static"
@@ -2089,6 +2090,7 @@ class GalleryWebUI:
         tag_name: str,
         *,
         cache: dict[str, dict[str, Any] | None] | None = None,
+        compact: bool = False,
     ) -> dict[str, Any] | None:
         normalized = normalize_tag_name(tag_name)
         if cache is not None and normalized in cache:
@@ -2101,22 +2103,28 @@ class GalleryWebUI:
             return None
         canonical_name = str(row["name"])
         payload = {
+            "id": int(row["id"]),
             "name": canonical_name,
             "is_character": bool(row["is_character"]),
-            "aliases": self.db.list_aliases(canonical_name),
-            "platform_terms": self.db.get_platform_terms_for_tag(
-                tag_name=canonical_name,
-                platform="pixiv",
-                purpose="match",
-                include_aliases=False,
-                include_primary=False,
-            ),
-            "suggested_terms": self.db.suggest_platform_terms_for_tag(
-                tag_name=canonical_name,
-                platform="pixiv",
-                limit=8,
-            ),
         }
+        if not compact:
+            payload.update(
+                {
+                    "aliases": self.db.list_aliases(canonical_name),
+                    "platform_terms": self.db.get_platform_terms_for_tag(
+                        tag_name=canonical_name,
+                        platform="pixiv",
+                        purpose="match",
+                        include_aliases=False,
+                        include_primary=False,
+                    ),
+                    "suggested_terms": self.db.suggest_platform_terms_for_tag(
+                        tag_name=canonical_name,
+                        platform="pixiv",
+                        limit=8,
+                    ),
+                }
+            )
         if cache is not None:
             cache[normalized] = dict(payload)
         return payload
@@ -2209,8 +2217,9 @@ class GalleryWebUI:
         review_statuses: tuple[str, ...] | None = None,
         source_term_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
         candidate_tag_cache: dict[str, dict[str, Any] | None] | None = None,
+        compact: bool = False,
     ) -> dict[str, Any] | None:
-        detail = self.db.get_image_detail(image_id)
+        detail = self.db.get_image_detail(image_id, sync_files=not compact)
         if not detail:
             return None
         image = detail.get("image", {})
@@ -2222,14 +2231,15 @@ class GalleryWebUI:
         translated_tags = self._dedupe_texts(extra.get("translated_tags", []))
 
         source_terms: list[dict[str, Any]] = []
-        seen_terms: set[str] = set()
-        for origin, terms in (("raw", raw_tags), ("translated", translated_tags)):
-            for term in terms:
-                normalized = normalize_tag_name(term)
-                if not normalized or normalized in seen_terms:
-                    continue
-                seen_terms.add(normalized)
-                source_terms.append(self._build_source_term_payload(term, origin, cache=source_term_cache))
+        if not compact:
+            seen_terms: set[str] = set()
+            for origin, terms in (("raw", raw_tags), ("translated", translated_tags)):
+                for term in terms:
+                    normalized = normalize_tag_name(term)
+                    if not normalized or normalized in seen_terms:
+                        continue
+                    seen_terms.add(normalized)
+                    source_terms.append(self._build_source_term_payload(term, origin, cache=source_term_cache))
 
         review_tasks = self._build_review_task_payloads(image_id, statuses=review_statuses)
 
@@ -2271,7 +2281,7 @@ class GalleryWebUI:
 
         candidate_tags: list[dict[str, Any]] = []
         for name in candidate_names[:12]:
-            payload = self._build_candidate_tag_payload(name, cache=candidate_tag_cache)
+            payload = self._build_candidate_tag_payload(name, cache=candidate_tag_cache, compact=True)
             if payload:
                 candidate_tags.append(payload)
 
@@ -2293,6 +2303,7 @@ class GalleryWebUI:
             "candidate_tags": candidate_tags,
             "review_tasks": review_tasks,
             "current_tags": current_tags,
+            "compact": compact,
         }
 
     async def ui_page(self, request: web.Request) -> web.Response:
@@ -2389,7 +2400,19 @@ class GalleryWebUI:
         payload = dict(detail)
         sources = payload.get("sources", [])
         source0 = sources[0] if sources else {}
-        payload["similar_image_ids"] = source0.get("extra", {}).get("similar_image_ids", [])
+        raw_similar_ids = source0.get("extra", {}).get("similar_image_ids", [])
+        similar_ids: list[int] = []
+        for item in raw_similar_ids:
+            try:
+                similar_id = int(item or 0)
+            except (TypeError, ValueError):
+                continue
+            if similar_id > 0:
+                similar_ids.append(similar_id)
+        payload["similar_image_ids"] = self.db.filter_ignored_similar_image_ids(
+            image_id,
+            similar_ids,
+        )
         payload["review_tasks"] = self._build_review_task_payloads(
             image_id,
             statuses=("pending", "uncertain", "rejected"),
@@ -2589,29 +2612,7 @@ class GalleryWebUI:
 
     @staticmethod
     def _known_pixiv_query_terms(*values: str) -> list[str]:
-        mapping = {
-            "初音未来": ["初音ミク"],
-            "初音未來": ["初音ミク"],
-            "hatsunemiku": ["初音ミク"],
-            "hatsune miku": ["初音ミク"],
-            "miku": ["初音ミク"],
-            "晓山瑞希": ["暁山瑞希"],
-            "暁山瑞希": ["暁山瑞希"],
-            "akiyama mizuki": ["暁山瑞希"],
-            "mzk": ["暁山瑞希"],
-        }
-        resolved: list[str] = []
-        seen: set[str] = set()
-        for value in values:
-            normalized = normalize_tag_name(value)
-            lowered = str(value or "").strip().casefold()
-            for key in (normalized, lowered):
-                for term in mapping.get(key, []):
-                    term_key = normalize_tag_name(term)
-                    if term and term_key not in seen:
-                        seen.add(term_key)
-                        resolved.append(term)
-        return resolved
+        return shared_known_pixiv_query_terms(*values)
 
     def _resolve_pixiv_search_tag(self, tag_text: str) -> dict[str, Any] | None:
         text = str(tag_text or "").strip()
@@ -2696,6 +2697,7 @@ class GalleryWebUI:
                 review_statuses=effective_statuses,
                 source_term_cache=source_term_cache,
                 candidate_tag_cache=candidate_tag_cache,
+                compact=True,
             )
             if item:
                 items.append(item)

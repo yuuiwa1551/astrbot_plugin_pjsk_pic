@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta
 
 from astrbot.api import logger
 
 from .matcher import normalize_tag_name
 from .pixiv_search_service import PixivSearchHit, PixivSearchService
+from .pixiv_tag_terms import known_pixiv_query_terms
+
+
+PIXIV_SUFFIX_RE = re.compile(
+    r"(?:\d+(?:users(?:入り|はいり)?|bookmarks?)|users入り|usersはいり)$",
+    re.IGNORECASE,
+)
+
+
+def _pixiv_term_variants(value: str) -> set[str]:
+    normalized = normalize_tag_name(value)
+    if not normalized:
+        return set()
+    variants = {normalized}
+    stripped = PIXIV_SUFFIX_RE.sub("", normalized).strip()
+    if stripped and stripped != normalized:
+        variants.add(stripped)
+    return variants
 
 
 class AutoCrawlService:
@@ -127,21 +146,18 @@ class AutoCrawlService:
         for row in tags:
             tag_name = str(row["name"])
             tag_id = int(row["id"])
-            query_terms = self.db.get_platform_terms_for_tag(
-                tag_name=tag_name,
-                platform="pixiv",
-                purpose="query",
-            )
-            primary_query_term = query_terms[0] if query_terms else tag_name
-            query_text = self.search_service.build_query(primary_query_term)
+            query_terms = self._query_terms_for_tag(tag_name)
+            primary_query_term = query_terms[0] if query_terms else ""
+            query_text = self.search_service.build_query(primary_query_term) if primary_query_term else ""
             self.db.upsert_crawl_subscription(
                 platform="pixiv",
                 tag_id=tag_id,
                 tag_name=tag_name,
                 query_text=query_text,
-                enabled=True,
+                enabled=bool(query_terms),
             )
-            enabled_normalized.add(normalize_tag_name(tag_name))
+            if query_terms:
+                enabled_normalized.add(normalize_tag_name(tag_name))
         self.db.disable_missing_crawl_subscriptions(platform="pixiv", keep_normalized_tags=enabled_normalized)
 
     def _is_due(self, row) -> bool:
@@ -159,11 +175,15 @@ class AutoCrawlService:
         if not tag_name:
             return {"queued": 0, "matched": 0, "skipped_existing": 0, "skipped_rejected": 0, "skipped_filtered": 0}
 
-        query_terms = self.db.get_platform_terms_for_tag(
-            tag_name=tag_name,
-            platform="pixiv",
-            purpose="query",
-        ) or [tag_name]
+        query_terms = self._query_terms_for_tag(tag_name)
+        if not query_terms:
+            self.db.update_crawl_subscription_state(
+                int(row["id"]),
+                last_checked_at=datetime.utcnow().isoformat(timespec="seconds"),
+                last_error="未配置可靠 Pixiv 搜索词，已跳过自动采集",
+                query_text="",
+            )
+            return {"queued": 0, "matched": 0, "skipped_existing": 0, "skipped_rejected": 0, "skipped_filtered": 0}
         hits: list[PixivSearchHit] = []
         seen_illust_ids: set[str] = set()
         wanted = self.max_results_per_tag()
@@ -216,9 +236,9 @@ class AutoCrawlService:
                 "pixiv",
                 hit.post_url,
                 [tag_name],
-                include_tags=[tag_name],
+                include_tags=[],
                 exclude_tags=[],
-                match_mode="partial",
+                match_mode="exact",
             )
             queued += 1
 
@@ -238,35 +258,60 @@ class AutoCrawlService:
             "skipped_filtered": skipped_filtered,
         }
 
+    def _query_terms_for_tag(self, tag_name: str) -> list[str]:
+        terms: list[str] = []
+        seen: set[str] = set()
+
+        def append(value: str) -> None:
+            text = str(value or "").strip()
+            normalized = normalize_tag_name(text)
+            if not text or not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            terms.append(text)
+
+        for term in known_pixiv_query_terms(tag_name):
+            append(term)
+        for term in self.db.get_platform_terms_for_tag(
+            tag_name=tag_name,
+            platform="pixiv",
+            purpose="query",
+            include_aliases=False,
+            include_primary=False,
+        ):
+            append(term)
+        return terms
+
     def _matches_target_tag(self, tag_name: str, hit: PixivSearchHit) -> bool:
         target = normalize_tag_name(tag_name)
         if not target:
             return False
-        target_terms = self.db.get_platform_terms_for_tag(
-            tag_name=tag_name,
-            platform="pixiv",
-            purpose="match",
-        ) or [tag_name]
-        normalized_target_terms = {
-            normalize_tag_name(term)
-            for term in target_terms
-            if normalize_tag_name(term)
-        }
+        target_terms = [
+            *known_pixiv_query_terms(tag_name),
+            *self.db.get_platform_terms_for_tag(
+                tag_name=tag_name,
+                platform="pixiv",
+                purpose="match",
+                include_aliases=False,
+                include_primary=True,
+            ),
+        ]
+        normalized_target_terms: set[str] = set()
+        for term in target_terms or [tag_name]:
+            normalized_target_terms.update(_pixiv_term_variants(term))
         candidates = [*(hit.raw_tags or []), *(hit.translated_tags or [])]
         seen: set[str] = set()
         for tag in candidates:
-            normalized = normalize_tag_name(tag)
-            if not normalized or normalized in seen:
+            variants = _pixiv_term_variants(tag)
+            if not variants:
                 continue
-            seen.add(normalized)
+            normalized = next(iter(variants))
+            if normalized in seen:
+                continue
+            seen.update(variants)
             platform_match = self.db.resolve_platform_term("pixiv", tag)
             if platform_match.matched and normalize_tag_name(platform_match.tag_name or "") == target:
                 return True
-            direct_match = self.db.resolve_tag(tag, allow_fuzzy=False)
-            if direct_match.matched and normalize_tag_name(direct_match.tag_name or "") == target:
-                return True
-            if normalized in normalized_target_terms:
-                return True
-            if any(normalized in candidate or candidate in normalized for candidate in normalized_target_terms):
+            if variants & normalized_target_terms:
                 return True
         return False

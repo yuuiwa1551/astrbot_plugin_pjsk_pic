@@ -276,6 +276,17 @@ class ImageIndexDB:
                     FOREIGN KEY(target_tag_id) REFERENCES tags(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS image_similarity_ignores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id_low INTEGER NOT NULL,
+                    image_id_high INTEGER NOT NULL,
+                    reason TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(image_id_low, image_id_high),
+                    FOREIGN KEY(image_id_low) REFERENCES images(id),
+                    FOREIGN KEY(image_id_high) REFERENCES images(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_images_active ON images(is_active);
                 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
                 CREATE INDEX IF NOT EXISTS idx_image_files_image_id ON image_files(image_id);
@@ -283,14 +294,19 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_image_tags_tag_id ON image_tags(tag_id);
                 CREATE INDEX IF NOT EXISTS idx_image_tags_review_status ON image_tags(review_status);
                 CREATE INDEX IF NOT EXISTS idx_sources_platform ON sources(platform);
+                CREATE INDEX IF NOT EXISTS idx_sources_image_platform ON sources(image_id, platform);
                 CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status ON crawl_jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_crawl_subscriptions_platform ON crawl_subscriptions(platform, enabled);
                 CREATE INDEX IF NOT EXISTS idx_pixiv_backfill_tasks_status ON pixiv_backfill_tasks(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
+                CREATE INDEX IF NOT EXISTS idx_review_tasks_status_image ON review_tasks(status, image_id, id);
+                CREATE INDEX IF NOT EXISTS idx_review_tasks_image_status ON review_tasks(image_id, status);
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 CREATE INDEX IF NOT EXISTS idx_platform_tag_terms_tag_id ON platform_tag_terms(tag_id, platform);
                 CREATE INDEX IF NOT EXISTS idx_rejected_sources_platform ON rejected_sources(platform, normalized_post_url);
                 CREATE INDEX IF NOT EXISTS idx_tag_merge_identity_candidates_status ON tag_merge_identity_candidates(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_image_similarity_ignores_low ON image_similarity_ignores(image_id_low);
+                CREATE INDEX IF NOT EXISTS idx_image_similarity_ignores_high ON image_similarity_ignores(image_id_high);
                 """
             )
             try:
@@ -593,6 +609,128 @@ class ImageIndexDB:
                 matches.append((distance, row))
         matches.sort(key=lambda item: (item[0], -int(item[1]["id"])))
         return [row for _, row in matches[:limit]]
+
+    @staticmethod
+    def _similarity_pair(image_id1: int, image_id2: int) -> tuple[int, int]:
+        left = int(image_id1 or 0)
+        right = int(image_id2 or 0)
+        return (left, right) if left <= right else (right, left)
+
+    def add_similarity_ignore(self, image_id1: int, image_id2: int, reason: str = "") -> tuple[bool, str]:
+        low, high = self._similarity_pair(image_id1, image_id2)
+        if low <= 0 or high <= 0:
+            return False, "图片 ID 必须是正整数。"
+        if low == high:
+            return False, "不能忽略同一张图片与自身的重复关系。"
+        reason_text = str(reason or "").strip()
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM images WHERE id IN (?, ?)",
+                (low, high),
+            ).fetchall()
+            if len(rows) != 2:
+                return False, f"图片不存在或不完整：#{low} / #{high}"
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM image_similarity_ignores
+                WHERE image_id_low = ? AND image_id_high = ?
+                LIMIT 1
+                """,
+                (low, high),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE image_similarity_ignores
+                    SET reason = ?, created_at = ?
+                    WHERE id = ?
+                    """,
+                    (reason_text, now, int(existing["id"])),
+                )
+                return True, f"已更新重复忽略：#{low} <-> #{high}"
+            conn.execute(
+                """
+                INSERT INTO image_similarity_ignores(image_id_low, image_id_high, reason, created_at)
+                VALUES(?, ?, ?, ?)
+                """,
+                (low, high, reason_text, now),
+            )
+        return True, f"已忽略疑似重复关系：#{low} <-> #{high}"
+
+    def remove_similarity_ignore(self, image_id1: int, image_id2: int) -> tuple[bool, str]:
+        low, high = self._similarity_pair(image_id1, image_id2)
+        if low <= 0 or high <= 0 or low == high:
+            return False, "图片 ID 无效。"
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM image_similarity_ignores WHERE image_id_low = ? AND image_id_high = ?",
+                (low, high),
+            )
+        if int(cursor.rowcount or 0) <= 0:
+            return False, f"没有找到重复忽略记录：#{low} <-> #{high}"
+        return True, f"已恢复疑似重复提示：#{low} <-> #{high}"
+
+    def list_similarity_ignores(self, image_id: int | None = None, *, limit: int = 50) -> list[sqlite3.Row]:
+        resolved_limit = max(1, min(int(limit or 50), 200))
+        with self._lock, self._connect() as conn:
+            if image_id and int(image_id) > 0:
+                return conn.execute(
+                    """
+                    SELECT id, image_id_low, image_id_high, reason, created_at
+                    FROM image_similarity_ignores
+                    WHERE image_id_low = ? OR image_id_high = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (int(image_id), int(image_id), resolved_limit),
+                ).fetchall()
+            return conn.execute(
+                """
+                SELECT id, image_id_low, image_id_high, reason, created_at
+                FROM image_similarity_ignores
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (resolved_limit,),
+            ).fetchall()
+
+    def filter_ignored_similar_image_ids(self, image_id: int, similar_image_ids: Iterable[int]) -> list[int]:
+        base_id = int(image_id or 0)
+        if base_id <= 0:
+            return [int(item) for item in similar_image_ids if int(item or 0) > 0]
+        candidates = []
+        seen: set[int] = set()
+        pairs: list[tuple[int, int, int]] = []
+        for raw in similar_image_ids:
+            other_id = int(raw or 0)
+            if other_id <= 0 or other_id == base_id or other_id in seen:
+                continue
+            seen.add(other_id)
+            low, high = self._similarity_pair(base_id, other_id)
+            candidates.append(other_id)
+            pairs.append((other_id, low, high))
+        if not pairs:
+            return []
+        clauses: list[str] = []
+        params: list[int] = []
+        for _, low, high in pairs:
+            clauses.append("(image_id_low = ? AND image_id_high = ?)")
+            params.extend([low, high])
+        with self._lock, self._connect() as conn:
+            ignored = {
+                (int(row["image_id_low"]), int(row["image_id_high"]))
+                for row in conn.execute(
+                    f"""
+                    SELECT image_id_low, image_id_high
+                    FROM image_similarity_ignores
+                    WHERE {' OR '.join(clauses)}
+                    """,
+                    params,
+                ).fetchall()
+            }
+        return [other_id for other_id, low, high in pairs if (low, high) not in ignored]
 
     def get_image_row(self, image_id: int) -> sqlite3.Row | None:
         with self._lock, self._connect() as conn:
@@ -4420,9 +4558,10 @@ class ImageIndexDB:
             row = conn.execute(sql, params).fetchone()
         return int(row["total"] or 0) if row else 0
 
-    def get_image_detail(self, image_id: int) -> dict[str, Any] | None:
+    def get_image_detail(self, image_id: int, *, sync_files: bool = True) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
-            self._sync_image_file_state(conn, image_id)
+            if sync_files:
+                self._sync_image_file_state(conn, image_id)
             image = conn.execute('SELECT * FROM images WHERE id = ?', (image_id,)).fetchone()
             if not image:
                 return None

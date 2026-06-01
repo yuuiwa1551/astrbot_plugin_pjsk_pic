@@ -283,16 +283,11 @@ watch(
 async function runLiveRefresh(): Promise<void> {
   if (autoRefreshRunning || busyCount.value > 0 || document.visibilityState === 'hidden') return;
   const page = activePage.value;
-  if (page !== 'jobs' && page !== 'pixiv-review') return;
+  if (page !== 'jobs') return;
   if (preview.open) return;
-  if (page === 'pixiv-review' && selectedPixivIds().length) return;
   autoRefreshRunning = true;
   try {
-    if (page === 'jobs') {
-      await loadJobs();
-    } else if (page === 'pixiv-review') {
-      await loadPixivReviewImages();
-    }
+    await loadJobs();
   } catch (error) {
     console.debug('live refresh skipped', error);
   } finally {
@@ -303,7 +298,7 @@ async function runLiveRefresh(): Promise<void> {
 onMounted(() => {
   autoRefreshTimer = window.setInterval(() => {
     void runLiveRefresh();
-  }, 6000);
+  }, 15000);
 });
 
 onBeforeUnmount(() => {
@@ -1481,6 +1476,7 @@ async function executeMerge(): Promise<void> {
                   >
                     {{ term.origin === 'translated' ? '译' : '原' }}·{{ term.term }}{{ term.resolved_tag_name ? ` → ${term.resolved_tag_name}` : '' }}
                   </button>
+                  <span v-if="item.compact && !(item.source_terms || []).length" class="muted">点击预览后加载来源词</span>
                 </div>
               </div>
               <div class="muted">归入主 tag：{{ (pixiv.selectedTags[item.image_id] || [])[0] || '无' }}；alias / 搜索词：{{ (pixiv.selectedTerms[item.image_id] || []).join('、') || '无' }}</div>

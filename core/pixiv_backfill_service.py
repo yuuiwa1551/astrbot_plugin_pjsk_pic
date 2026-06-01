@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from astrbot.api import logger
@@ -10,6 +11,23 @@ from .db import utcnow_str
 from .matcher import normalize_tag_name
 from .pixiv_search_service import PixivSearchHit, PixivSearchService
 from .pixiv_tag_terms import known_pixiv_query_terms
+
+
+PIXIV_SUFFIX_RE = re.compile(
+    r"(?:\d+(?:users(?:入り|はいり)?|bookmarks?)|users入り|usersはいり)$",
+    re.IGNORECASE,
+)
+
+
+def _pixiv_term_variants(value: str) -> set[str]:
+    normalized = normalize_tag_name(value)
+    if not normalized:
+        return set()
+    variants = {normalized}
+    stripped = PIXIV_SUFFIX_RE.sub("", normalized).strip()
+    if stripped and stripped != normalized:
+        variants.add(stripped)
+    return variants
 
 
 class PixivBackfillService:
@@ -217,9 +235,9 @@ class PixivBackfillService:
                         "pixiv",
                         hit.post_url,
                         [tag_name],
-                        include_tags=include_tags,
+                        include_tags=[],
                         exclude_tags=exclude_tags,
-                        match_mode="partial",
+                        match_mode="exact",
                     )
                     stats["queued"] += 1
                 self.db.update_pixiv_backfill_task(task_id, **stats)
@@ -242,32 +260,33 @@ class PixivBackfillService:
         target = normalize_tag_name(tag_name)
         if not target:
             return False
-        target_terms = self.db.get_platform_terms_for_tag(
-            tag_name=tag_name,
-            platform="pixiv",
-            purpose="match",
-        ) or [tag_name]
-        normalized_target_terms = {
-            normalize_tag_name(term)
-            for term in target_terms
-            if normalize_tag_name(term)
-        }
+        target_terms = [
+            *known_pixiv_query_terms(tag_name),
+            *self.db.get_platform_terms_for_tag(
+                tag_name=tag_name,
+                platform="pixiv",
+                purpose="match",
+                include_aliases=False,
+                include_primary=True,
+            ),
+        ] or [tag_name]
+        normalized_target_terms: set[str] = set()
+        for term in target_terms:
+            normalized_target_terms.update(_pixiv_term_variants(term))
         candidates = [*(hit.raw_tags or []), *(hit.translated_tags or [])]
         seen: set[str] = set()
         for tag in candidates:
-            normalized = normalize_tag_name(tag)
-            if not normalized or normalized in seen:
+            variants = _pixiv_term_variants(tag)
+            if not variants:
                 continue
-            seen.add(normalized)
+            normalized = next(iter(variants))
+            if normalized in seen:
+                continue
+            seen.update(variants)
             platform_match = self.db.resolve_platform_term("pixiv", tag)
             if platform_match.matched and normalize_tag_name(platform_match.tag_name or "") == target:
                 return True
-            direct_match = self.db.resolve_tag(tag, allow_fuzzy=False)
-            if direct_match.matched and normalize_tag_name(direct_match.tag_name or "") == target:
-                return True
-            if normalized in normalized_target_terms:
-                return True
-            if any(normalized in candidate or candidate in normalized for candidate in normalized_target_terms):
+            if variants & normalized_target_terms:
                 return True
         return False
 

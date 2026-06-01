@@ -173,7 +173,10 @@ class ImportedImageService:
                     width=width,
                     height=height,
                     format=format_name,
-                    similar_image_ids=[int(row["id"]) for row in similar_rows if int(row["id"]) != image_id],
+                    similar_image_ids=self.db.filter_ignored_similar_image_ids(
+                        image_id,
+                        [int(row["id"]) for row in similar_rows if int(row["id"]) != image_id],
+                    ),
                 )
 
             existing = self.db.get_image_row(target_id)
@@ -188,7 +191,10 @@ class ImportedImageService:
                 width=int(existing["width"] or width) if existing else width,
                 height=int(existing["height"] or height) if existing else height,
                 format=str(existing["format"] or format_name) if existing else format_name,
-                similar_image_ids=[int(row["id"]) for row in similar_rows if int(row["id"]) != target_id],
+                similar_image_ids=self.db.filter_ignored_similar_image_ids(
+                    target_id,
+                    [int(row["id"]) for row in similar_rows if int(row["id"]) != target_id],
+                ),
             )
 
         if not file_path.exists():
@@ -212,7 +218,10 @@ class ImportedImageService:
             width=width,
             height=height,
             format=format_name,
-            similar_image_ids=[int(row["id"]) for row in similar_rows if int(row["id"]) != image_id],
+            similar_image_ids=self.db.filter_ignored_similar_image_ids(
+                image_id,
+                [int(row["id"]) for row in similar_rows if int(row["id"]) != image_id],
+            ),
         )
 
     @staticmethod

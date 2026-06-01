@@ -91,4 +91,5 @@ export interface PixivReviewItem {
   candidate_tags?: TagItem[];
   review_tasks?: ReviewTask[];
   current_tags?: Dict[];
+  compact?: boolean;
 }

@@ -1559,6 +1559,40 @@ class PJSKPicPlugin(Star):
             f"可用命令：/pjsk图库 看图 {image_id}"
         )
 
+    @pjsk_gallery.command("重复忽略")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def ignore_duplicate_pair(self, event: AstrMessageEvent, image_id1: int, image_id2: int, reason: str = ""):
+        ok, message = self.db.add_similarity_ignore(int(image_id1), int(image_id2), reason)
+        if not ok:
+            yield event.plain_result(f"重复忽略失败：{message}")
+            return
+        suffix = f"\n原因：{reason}" if str(reason or "").strip() else ""
+        yield event.plain_result(f"{message}{suffix}\n后续投稿 / 采集疑似重复提示会过滤这对图片。")
+
+    @pjsk_gallery.command("重复恢复")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def restore_duplicate_pair_warning(self, event: AstrMessageEvent, image_id1: int, image_id2: int):
+        ok, message = self.db.remove_similarity_ignore(int(image_id1), int(image_id2))
+        yield event.plain_result(message if ok else f"重复恢复失败：{message}")
+
+    @pjsk_gallery.command("重复忽略列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_duplicate_pair_ignores(self, event: AstrMessageEvent, image_id: int = 0):
+        rows = self.db.list_similarity_ignores(int(image_id or 0) or None, limit=20)
+        if not rows:
+            scope = f" #{int(image_id)}" if int(image_id or 0) > 0 else ""
+            yield event.plain_result(f"当前没有{scope}相关的重复忽略记录。")
+            return
+        lines = ["重复忽略记录："]
+        for row in rows:
+            reason = str(row["reason"] or "").strip()
+            lines.append(
+                f"#{row['id']}：{row['image_id_low']} <-> {row['image_id_high']}"
+                + (f"；原因：{reason}" if reason else "")
+            )
+        lines.append("可用 /pp 重复恢复 <id1> <id2> 恢复疑似重复提示。")
+        yield event.plain_result("\n".join(lines))
+
     @pjsk_gallery.command("面板地址")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def show_webui_address(self, event: AstrMessageEvent):

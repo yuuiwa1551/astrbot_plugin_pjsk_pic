@@ -427,6 +427,7 @@ class SubmissionService:
         lines.append("审核结果：" + self._review_status_text(item))
         if item.similar_image_ids:
             lines.append("检测到疑似重复图片：" + "、".join(str(image_id) for image_id in item.similar_image_ids[:10]))
+            lines.append(f"若人工确认不是重复，可用：/pp 重复忽略 {item.image_id} <疑似image_id>")
         return "\n".join(lines)
 
     def _build_batch_reply(self, result: SubmissionResult) -> str:
@@ -455,6 +456,7 @@ class SubmissionService:
                 detail = f"#{item.image_index} image_id={item.image_id}，审核：{self._review_status_text(item)}"
                 if item.similar_image_ids:
                     detail += f"，疑似重复：{'、'.join(str(image_id) for image_id in item.similar_image_ids[:5])}"
+                    detail += f"；忽略：/pp 重复忽略 {item.image_id} <疑似image_id>"
                 lines.append(detail)
             if len(successful_items) > 10:
                 lines.append(f"……其余 {len(successful_items) - 10} 张已省略。")
