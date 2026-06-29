@@ -5,5 +5,7 @@ webui/node_modules/
 webui/dist/
 plan.md
 *?plan.md
+docs/*plan*.md
+docs/*计划*.md
 data/plugin_data/
 data/config/
