@@ -841,6 +841,11 @@ class PJSKPicPlugin(Star):
             f"跳过 {result['skipped']}，失效 {result['missing_marked_inactive']}"
         )
 
+    @pjsk_gallery.command("帮助", alias={"help", "菜单", "命令"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def show_gallery_help(self, event: AstrMessageEvent, section: str = ""):
+        yield event.plain_result(self._build_gallery_help_text(section))
+
     @pjsk_gallery.command("统计")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def show_stats(self, event: AstrMessageEvent):
@@ -1613,3 +1618,82 @@ class PJSKPicPlugin(Star):
     @staticmethod
     def _format_crawl_tags(tags: list[str], *, fallback: str = "-") -> str:
         return "、".join(str(tag).strip() for tag in tags if str(tag).strip()) or fallback
+
+    @staticmethod
+    def _build_gallery_help_text(section: str = "") -> str:
+        key = str(section or "").strip().lower()
+        aliases = {
+            "投稿": "submission",
+            "tg": "submission",
+            "submit": "submission",
+            "submission": "submission",
+            "tag": "tag",
+            "标签": "tag",
+            "别名": "tag",
+            "alias": "tag",
+            "审核": "review",
+            "review": "review",
+            "采集": "crawl",
+            "抓图": "crawl",
+            "crawl": "crawl",
+            "pixiv": "crawl",
+        }
+        topic = aliases.get(key, "")
+        if topic == "submission":
+            return "\n".join(
+                [
+                    "PJSK 投稿命令：",
+                    "/投稿 <tag> 或 /tg <tag>：附图投稿到指定 tag",
+                    "/投稿 <tag> 别名 <alias1,alias2>：投稿时顺手补 alias",
+                    "/tg <tag> alias <alias1,alias2>：同上",
+                    "也可以先回复一条带图消息，再发送投稿命令。",
+                ]
+            )
+        if topic == "tag":
+            return "\n".join(
+                [
+                    "PJSK tag / alias 管理：",
+                    "/pp 查看 <tag>：查看图片数和别名",
+                    "/pp tag列表 [全部|普通|关键词]：列出主 tag",
+                    "/pp 别名添加 <tag> <alias1,alias2>",
+                    "/pp 别名删除 <tag> <alias1,alias2>",
+                    "/pp tag合并 <目标tag> <来源tag1,来源tag2>",
+                    "/pp 主tag切换 <旧tag或alias> <新主tag>",
+                ]
+            )
+        if topic == "review":
+            return "\n".join(
+                [
+                    "PJSK 审核命令：",
+                    "/pp 审核列表 [status]：查看最近审核任务",
+                    "/pp 审核查看 [review_id]：查看单条或下一条待审",
+                    "/pp 审核通过 <review_id>",
+                    "/pp 审核拒绝 <review_id>",
+                    "/pp 投稿审核状态",
+                    "/pp 投稿审核开启 或 /pp 投稿审核关闭",
+                ]
+            )
+        if topic == "crawl":
+            return "\n".join(
+                [
+                    "PJSK 采集命令：",
+                    "/pp 采集添加 <platform> <url> [tags_csv]",
+                    "/pp 采集列表",
+                    "/pp 采集诊断",
+                    "/pp 失败列表 [platform]",
+                    "/pp 失败重试 <job_id|全部>",
+                    "/pp 自动采集状态",
+                    "/pp 历史回填添加 <tag> [页数上限] [扫描上限] [入队上限]",
+                ]
+            )
+        return "\n".join(
+            [
+                "PJSK 图库常用命令：",
+                "发图：看看初音未来 / 来张 miku / 看看id123",
+                "投稿：/tg <tag>，可用 /pp 帮助 投稿 查看 alias 写法",
+                "管理：/pp 统计、/pp 查看 <tag>、/pp 看图 <image_id>",
+                "面板：/pp 面板地址",
+                "分组帮助：/pp 帮助 投稿 / tag / 审核 / 采集",
+                "完整维护操作建议优先使用 WebUI。",
+            ]
+        )
