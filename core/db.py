@@ -3437,14 +3437,28 @@ class ImageIndexDB:
         *,
         platform: str = 'pixiv',
         reason: str = '',
+        require_open_review: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
         platform_text = str(platform or 'pixiv').strip().lower() or 'pixiv'
         now = utcnow_str()
         rejected_reason = str(reason or '').strip() or f'{platform_text} 人工拒绝图片'
         with self._lock, self._connect() as conn:
+            if require_open_review:
+                conn.execute('BEGIN IMMEDIATE')
             image = conn.execute('SELECT id FROM images WHERE id = ? AND is_active = 1 LIMIT 1', (int(image_id),)).fetchone()
             if not image:
                 return False, {'message': f'图片不存在：{image_id}'}
+            if require_open_review:
+                open_task = conn.execute(
+                    "SELECT 1 FROM review_tasks WHERE image_id = ? AND status IN ('pending', 'uncertain') LIMIT 1",
+                    (int(image_id),),
+                ).fetchone()
+                if not open_task:
+                    return False, {
+                        'message': f'图片 #{image_id} 已不在待审队列中。',
+                        'code': 'stale_review',
+                        'image_id': int(image_id),
+                    }
             source = conn.execute(
                 """
                 SELECT post_url
@@ -4113,6 +4127,130 @@ class ImageIndexDB:
             row = conn.execute(count_sql, params).fetchone()
         return int(row["total"] or 0) if row else 0
 
+    @staticmethod
+    def _normalize_review_statuses(statuses: Iterable[str] | None = None) -> list[str]:
+        return split_status_filter(statuses or ["pending", "uncertain"])
+
+    def get_random_pixiv_review_image(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        candidate_tag_id: int | None = None,
+        exclude_image_ids: Iterable[int] | None = None,
+    ) -> sqlite3.Row | None:
+        normalized_statuses = self._normalize_review_statuses(statuses)
+        if not normalized_statuses:
+            return None
+        status_placeholders = ",".join("?" for _ in normalized_statuses)
+        sql = f"""
+            SELECT i.id AS image_id,
+                   i.file_path,
+                   MAX(rt.id) AS latest_review_id,
+                   COUNT(DISTINCT rt.id) AS review_task_count
+            FROM images i
+            JOIN review_tasks rt ON rt.image_id = i.id
+            WHERE i.is_active = 1
+              AND rt.status IN ({status_placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM sources s
+                  WHERE s.image_id = i.id AND s.platform = 'pixiv'
+              )
+        """
+        params: list[Any] = list(normalized_statuses)
+        wanted_tag_id = int(candidate_tag_id or 0)
+        if wanted_tag_id > 0:
+            sql += f"""
+              AND EXISTS (
+                  SELECT 1
+                  FROM review_tasks rt_filter
+                  WHERE rt_filter.image_id = i.id
+                    AND rt_filter.tag_id = ?
+                    AND rt_filter.status IN ({status_placeholders})
+              )
+            """
+            params.append(wanted_tag_id)
+            params.extend(normalized_statuses)
+
+        excluded = sorted(
+            {
+                int(item)
+                for item in (exclude_image_ids or [])
+                if int(item or 0) > 0
+            }
+        )[:500]
+        if excluded:
+            placeholders = ",".join("?" for _ in excluded)
+            sql += f" AND i.id NOT IN ({placeholders})"
+            params.extend(excluded)
+        sql += " GROUP BY i.id ORDER BY RANDOM() LIMIT 1"
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchone()
+
+    def count_open_pixiv_review_images(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        candidate_tag_id: int | None = None,
+    ) -> int:
+        normalized_statuses = self._normalize_review_statuses(statuses)
+        if not normalized_statuses:
+            return 0
+        status_placeholders = ",".join("?" for _ in normalized_statuses)
+        sql = f"""
+            SELECT COUNT(DISTINCT i.id) AS total
+            FROM images i
+            JOIN review_tasks rt ON rt.image_id = i.id
+            WHERE i.is_active = 1
+              AND rt.status IN ({status_placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM sources s
+                  WHERE s.image_id = i.id AND s.platform = 'pixiv'
+              )
+        """
+        params: list[Any] = list(normalized_statuses)
+        wanted_tag_id = int(candidate_tag_id or 0)
+        if wanted_tag_id > 0:
+            sql += f"""
+              AND EXISTS (
+                  SELECT 1
+                  FROM review_tasks rt_filter
+                  WHERE rt_filter.image_id = i.id
+                    AND rt_filter.tag_id = ?
+                    AND rt_filter.status IN ({status_placeholders})
+              )
+            """
+            params.append(wanted_tag_id)
+            params.extend(normalized_statuses)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def is_open_pixiv_review_image(
+        self,
+        image_id: int,
+        *,
+        statuses: Iterable[str] | None = None,
+    ) -> bool:
+        normalized_statuses = self._normalize_review_statuses(statuses)
+        if not normalized_statuses:
+            return False
+        placeholders = ",".join("?" for _ in normalized_statuses)
+        sql = f"""
+            SELECT 1
+            FROM images i
+            JOIN review_tasks rt ON rt.image_id = i.id
+            WHERE i.id = ?
+              AND i.is_active = 1
+              AND rt.status IN ({placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM sources s
+                  WHERE s.image_id = i.id AND s.platform = 'pixiv'
+              )
+            LIMIT 1
+        """
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, (int(image_id), *normalized_statuses)).fetchone() is not None
+
     def build_pixiv_review_search_context(self, keyword: str, *, platform: str = 'pixiv') -> dict[str, Any]:
         keyword_text = str(keyword or '').strip()
         normalized_keyword = normalize_tag_name(keyword_text)
@@ -4289,6 +4427,7 @@ class ImageIndexDB:
         platform: str = 'pixiv',
         reason: str = '',
         reject_unselected: bool = True,
+        require_open_review: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
         requested_tags: list[str] = []
         seen_tags: set[str] = set()
@@ -4320,9 +4459,22 @@ class ImageIndexDB:
         rejected_reason = str(reason or '').strip() or f'{platform_text} 人工审批拒绝'
 
         with self._lock, self._connect() as conn:
+            if require_open_review:
+                conn.execute('BEGIN IMMEDIATE')
             image = conn.execute('SELECT id FROM images WHERE id = ? AND is_active = 1 LIMIT 1', (image_id,)).fetchone()
             if not image:
                 return False, {'message': f'图片不存在：{image_id}'}
+            if require_open_review:
+                open_task = conn.execute(
+                    "SELECT 1 FROM review_tasks WHERE image_id = ? AND status IN ('pending', 'uncertain') LIMIT 1",
+                    (image_id,),
+                ).fetchone()
+                if not open_task:
+                    return False, {
+                        'message': f'图片 #{image_id} 已不在待审队列中。',
+                        'code': 'stale_review',
+                        'image_id': image_id,
+                    }
             source_exists = conn.execute(
                 'SELECT 1 FROM sources WHERE image_id = ? AND platform = ? LIMIT 1',
                 (image_id, platform_text),

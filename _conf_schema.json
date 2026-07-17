@@ -29,6 +29,31 @@
     "description": "看看id<image_id> 图片 ID 查看入口是否仅管理员可用。建议保持开启，以免普通群友看到来源、文件路径和审核状态等管理信息。",
     "default": true
   },
+  "qq_review_enabled": {
+    "type": "bool",
+    "description": "是否向所有群友开放 /pp 随机审核 与审图指令。关闭后不会影响管理员旧审核命令和 WebUI。",
+    "default": true
+  },
+  "qq_review_claim_ttl_seconds": {
+    "type": "int",
+    "description": "群友随机领取一张待审图后的占用秒数，范围 60-3600；过期后其他群友可以重新抽到。",
+    "default": 600
+  },
+  "qq_review_recent_count": {
+    "type": "int",
+    "description": "每位群友最近抽到或跳过的图片去重窗口，范围 1-200。",
+    "default": 30
+  },
+  "qq_review_source_term_limit": {
+    "type": "int",
+    "description": "QQ 审核消息最多展示多少个 Pixiv 原始/翻译来源词，范围 0-30。",
+    "default": 12
+  },
+  "qq_review_auto_next": {
+    "type": "bool",
+    "description": "群友通过、拒绝或跳过一张图片后是否自动发送下一张待审图。",
+    "default": true
+  },
   "enable_llm_tool": {
     "type": "bool",
     "description": "是否向 LLM 暴露本插件的工具能力。",

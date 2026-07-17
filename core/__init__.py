@@ -8,6 +8,7 @@ from .indexer import LibraryIndexer
 from .matcher import extract_query_from_text, normalize_tag_name
 from .pixiv_backfill_service import PixivBackfillService
 from .pixiv_search_service import PixivSearchHit, PixivSearchService
+from .qq_review_service import QQReviewSession, QQReviewSessionService
 from .models import CrawlCandidate, ImportedImage, MatchResult, ReviewDecision
 from .phash import compute_image_phash, hamming_distance
 from .review_service import ReviewService
@@ -38,6 +39,8 @@ __all__ = [
     "PixivBackfillService",
     "PixivSearchHit",
     "PixivSearchService",
+    "QQReviewSession",
+    "QQReviewSessionService",
     "parse_crawl_rule_text",
     "parse_tag_csv",
 ]

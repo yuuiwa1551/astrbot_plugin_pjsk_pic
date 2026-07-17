@@ -23,6 +23,8 @@ from .core import (
     ImportedImageService,
     LibraryIndexer,
     PixivBackfillService,
+    QQReviewSession,
+    QQReviewSessionService,
     ReviewService,
     SubmissionNotifyService,
     SubmissionService,
@@ -72,6 +74,7 @@ class PJSKPicPlugin(Star):
         )
         self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
+        self.qq_review_service = QQReviewSessionService(self.db, config)
         self.webui = GalleryWebUI(
             self.db,
             self.crawl_service,
@@ -105,6 +108,7 @@ class PJSKPicPlugin(Star):
                 logger.error(f"[PJSKPic] 独立 WebUI 启动失败: {exc}", exc_info=True)
 
     async def terminate(self) -> None:
+        await self.qq_review_service.clear()
         await self.webui.stop()
         await self.auto_crawl_service.stop()
         await self.pixiv_backfill_service.stop()
@@ -356,6 +360,158 @@ class PJSKPicPlugin(Star):
             await self._send_review_task_detail(event, row)
             return True
         await event.send(MessageChain().message("当前没有更多待审核图片。"))
+        return False
+
+    def _qq_review_enabled(self) -> bool:
+        return bool(self.config.get("qq_review_enabled", True))
+
+    def _qq_review_auto_next(self) -> bool:
+        return bool(self.config.get("qq_review_auto_next", True))
+
+    def _qq_review_source_term_limit(self) -> int:
+        raw_value = self.config.get("qq_review_source_term_limit", 12)
+        value = int(raw_value) if raw_value is not None and str(raw_value).strip() else 12
+        return min(max(value, 0), 30)
+
+    @staticmethod
+    def _qq_review_identity(event: AstrMessageEvent) -> tuple[str, str]:
+        origin = str(getattr(event, "unified_msg_origin", "default") or "default")
+        try:
+            reviewer_id = str(event.get_sender_id() or "unknown")
+        except Exception:
+            reviewer_id = "unknown"
+        return origin, reviewer_id
+
+    def _resolve_qq_review_tag(self, raw_query: str) -> tuple[str | None, str, list[str]]:
+        query = str(raw_query or "").strip()
+        if not query:
+            return None, "", []
+        direct = self.db.resolve_tag(query, allow_fuzzy=False)
+        if direct.matched and direct.tag_name:
+            return str(direct.tag_name), str(direct.match_type or ""), []
+        platform = self.db.resolve_platform_term("pixiv", query)
+        if platform.matched and platform.tag_name:
+            return str(platform.tag_name), str(platform.match_type or "platform:pixiv"), []
+        fuzzy = self.db.resolve_tag(
+            query,
+            allow_fuzzy=True,
+            candidate_limit=int(self.config.get("ambiguous_candidate_limit", 5) or 5),
+        )
+        if fuzzy.matched and fuzzy.tag_name:
+            return None, "", [str(fuzzy.tag_name)]
+        return None, "", [str(item) for item in (fuzzy.candidates or [])]
+
+    async def _send_qq_review_session(
+        self,
+        event: AstrMessageEvent,
+        session: QQReviewSession,
+        *,
+        remaining: int | None = None,
+    ) -> bool:
+        image_path = self._review_image_path(session.image_id)
+        if image_path is None:
+            return False
+
+        detail = self.db.get_image_detail(session.image_id, sync_files=False) or {}
+        tasks = self.db.get_review_tasks_for_image(
+            session.image_id,
+            statuses=QQReviewSessionService.OPEN_STATUSES,
+        )
+        candidate_tags = []
+        seen_candidates: set[str] = set()
+        for task in tasks:
+            tag_name = str(task["tag_name"] or "").strip()
+            key = tag_name.casefold()
+            if tag_name and key not in seen_candidates:
+                seen_candidates.add(key)
+                candidate_tags.append(tag_name)
+
+        pixiv_source = next(
+            (
+                item
+                for item in list(detail.get("sources") or [])
+                if str(item.get("platform") or "").strip().lower() == "pixiv"
+            ),
+            {},
+        )
+        extra = pixiv_source.get("extra") if isinstance(pixiv_source.get("extra"), dict) else {}
+        source_terms: list[str] = []
+        seen_terms: set[str] = set()
+        for value in [
+            *list(pixiv_source.get("raw_tags") or []),
+            *list(extra.get("translated_tags") or []),
+        ]:
+            text = str(value or "").strip()
+            key = text.casefold()
+            if text and key not in seen_terms:
+                seen_terms.add(key)
+                source_terms.append(text)
+        source_limit = self._qq_review_source_term_limit()
+        visible_terms = source_terms[:source_limit] if source_limit > 0 else []
+        if source_limit > 0 and len(source_terms) > source_limit:
+            visible_terms.append(f"…另 {len(source_terms) - source_limit} 个")
+
+        lines = [
+            f"Pixiv 群友审核 · 图片 #{session.image_id}",
+            "候选 tag：" + ("、".join(candidate_tags) if candidate_tags else "无"),
+        ]
+        if session.filter_tag_name:
+            lines.append(f"当前筛选：{session.filter_tag_name}")
+        title = str(extra.get("title") or "").strip()
+        author = str(pixiv_source.get("author") or "").strip()
+        if title:
+            lines.append(f"标题：{title}")
+        if author:
+            lines.append(f"作者：{author}")
+        if visible_terms:
+            lines.append("Pixiv 来源词：" + "、".join(visible_terms))
+        post_url = str(pixiv_source.get("post_url") or "").strip()
+        if post_url:
+            lines.append(f"来源：{post_url}")
+        if remaining is not None:
+            lines.append(f"当前队列：约 {max(0, int(remaining))} 张待审")
+        lines.extend(
+            [
+                "通过并归类：/pp 审图通过 <最终tag>",
+                "整图不要：/pp 审图拒绝 [原因]",
+                "换一张：/pp 审图跳过",
+                "提示：整图拒绝会阻止这个 Pixiv 作品以后再次被抓取。",
+            ]
+        )
+        await event.send(MessageChain().file_image(str(image_path)))
+        await event.send(MessageChain().message("\n".join(lines)))
+        return True
+
+    async def _claim_and_send_qq_review(
+        self,
+        event: AstrMessageEvent,
+        *,
+        filter_tag_id: int = 0,
+        filter_tag_name: str = "",
+        replace_current: bool = True,
+    ) -> bool:
+        origin, reviewer_id = self._qq_review_identity(event)
+        for _ in range(3):
+            session, remaining = await self.qq_review_service.claim_next(
+                origin=origin,
+                reviewer_id=reviewer_id,
+                filter_tag_id=filter_tag_id,
+                filter_tag_name=filter_tag_name,
+                replace_current=replace_current,
+            )
+            if session is None:
+                scope = f"候选 tag“{filter_tag_name}”下" if filter_tag_name else ""
+                await event.send(MessageChain().message(f"当前{scope}没有可领取的 Pixiv 待审图片。"))
+                return False
+            if await self._send_qq_review_session(event, session, remaining=remaining):
+                return True
+            await self.qq_review_service.release_current(
+                origin=origin,
+                reviewer_id=reviewer_id,
+                remember=True,
+            )
+            replace_current = True
+        await event.send(MessageChain().message("连续抽到文件不可用的待审记录，请稍后重试或联系管理员检查图库文件。"))
         return False
 
     def _resolve_existing_tag_name(self, raw_query: str, *, allow_fuzzy: bool = False) -> tuple[str | None, str]:
@@ -1367,6 +1523,168 @@ class PJSKPicPlugin(Star):
         ok, message = await self.crawl_service.retry_job(int(job_id))
         yield event.plain_result(message if ok else f"重试失败：{message}")
 
+    @pjsk_gallery.command("审图帮助")
+    async def show_qq_review_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "\n".join(
+                [
+                    "PJSK 群友审图命令：",
+                    "/pp 随机审核 [候选tag]：随机领取一张 Pixiv 待审图",
+                    "/pp 审图通过 <最终tag>：归入指定现有主 tag",
+                    "/pp 审图拒绝 [原因]：整图拒绝并阻止以后重复抓取",
+                    "/pp 审图跳过：不修改审核结果并换一张",
+                    "/pp 审图当前：重发当前领取的图片",
+                    "/pp 审图结束：释放当前图片并退出",
+                    "如果图片有价值但候选 tag 错了，请用“审图通过 正确tag”，不要整图拒绝。",
+                ]
+            )
+        )
+
+    @pjsk_gallery.command("随机审核", alias={"抽审"})
+    async def claim_random_qq_review(self, event: AstrMessageEvent, candidate_tag: str = ""):
+        if not self._qq_review_enabled():
+            yield event.plain_result("群友审图当前未启用。")
+            return
+        filter_tag_id = 0
+        filter_tag_name = ""
+        query = str(candidate_tag or "").strip()
+        if query:
+            resolved, _, candidates = self._resolve_qq_review_tag(query)
+            if not resolved:
+                hint = f"你想找的是不是：{'、'.join(candidates)}" if candidates else "请使用已经存在的主 tag、alias 或 Pixiv 平台词。"
+                yield event.plain_result(f"没有精确找到候选 tag“{query}”。{hint}")
+                return
+            row = self.db.get_tag_row(resolved)
+            if row is None:
+                yield event.plain_result(f"候选 tag 不存在：{resolved}")
+                return
+            filter_tag_id = int(row["id"])
+            filter_tag_name = str(row["name"])
+        await self._claim_and_send_qq_review(
+            event,
+            filter_tag_id=filter_tag_id,
+            filter_tag_name=filter_tag_name,
+            replace_current=True,
+        )
+
+    @pjsk_gallery.command("审图通过")
+    async def approve_current_qq_review(self, event: AstrMessageEvent, tag_name: str = ""):
+        if not self._qq_review_enabled():
+            yield event.plain_result("群友审图当前未启用。")
+            return
+        query = str(tag_name or "").strip()
+        if not query:
+            yield event.plain_result("请指定最终 tag，例如：/pp 审图通过 晓山瑞希")
+            return
+        resolved, match_type, candidates = self._resolve_qq_review_tag(query)
+        if not resolved:
+            hint = f"你想选的是不是：{'、'.join(candidates)}" if candidates else "请先在图库中建立这个主 tag。"
+            yield event.plain_result(f"没有精确找到 tag“{query}”，未提交审核。{hint}")
+            return
+        origin, reviewer_id = self._qq_review_identity(event)
+        ok, result = await self.qq_review_service.approve_current(
+            origin=origin,
+            reviewer_id=reviewer_id,
+            tag_name=resolved,
+        )
+        if not ok:
+            await event.send(MessageChain().message(f"处理失败：{result.get('message') or '未知错误'}"))
+            if result.get("code") == "stale_session" and self._qq_review_auto_next():
+                await self._claim_and_send_qq_review(event)
+            return
+        await event.send(
+            MessageChain().message(
+                f"已通过图片 #{int(result.get('image_id', 0) or 0)}，归入 {resolved}"
+                + (f"（{match_type}）" if match_type else "")
+            )
+        )
+        if self._qq_review_auto_next():
+            await self._claim_and_send_qq_review(
+                event,
+                filter_tag_id=int(result.get("filter_tag_id", 0) or 0),
+                filter_tag_name=str(result.get("filter_tag_name", "") or ""),
+            )
+
+    @pjsk_gallery.command("审图拒绝")
+    async def reject_current_qq_review(self, event: AstrMessageEvent, reason: str = ""):
+        if not self._qq_review_enabled():
+            yield event.plain_result("群友审图当前未启用。")
+            return
+        origin, reviewer_id = self._qq_review_identity(event)
+        ok, result = await self.qq_review_service.reject_current(
+            origin=origin,
+            reviewer_id=reviewer_id,
+            reason=reason,
+        )
+        if not ok:
+            await event.send(MessageChain().message(f"处理失败：{result.get('message') or '未知错误'}"))
+            if result.get("code") == "stale_session" and self._qq_review_auto_next():
+                await self._claim_and_send_qq_review(event)
+            return
+        await event.send(
+            MessageChain().message(
+                f"已整图拒绝图片 #{int(result.get('image_id', 0) or 0)}；该 Pixiv 作品以后不会再次进入采集队列。"
+            )
+        )
+        if self._qq_review_auto_next():
+            await self._claim_and_send_qq_review(
+                event,
+                filter_tag_id=int(result.get("filter_tag_id", 0) or 0),
+                filter_tag_name=str(result.get("filter_tag_name", "") or ""),
+            )
+
+    @pjsk_gallery.command("审图跳过")
+    async def skip_current_qq_review(self, event: AstrMessageEvent):
+        if not self._qq_review_enabled():
+            yield event.plain_result("群友审图当前未启用。")
+            return
+        origin, reviewer_id = self._qq_review_identity(event)
+        session = await self.qq_review_service.release_current(
+            origin=origin,
+            reviewer_id=reviewer_id,
+            remember=True,
+        )
+        if session is None:
+            yield event.plain_result("当前没有领取中的审核图片，请先发送 /pp 随机审核。")
+            return
+        await event.send(MessageChain().message(f"已跳过图片 #{session.image_id}，审核状态未改变。"))
+        await self._claim_and_send_qq_review(
+            event,
+            filter_tag_id=session.filter_tag_id,
+            filter_tag_name=session.filter_tag_name,
+        )
+
+    @pjsk_gallery.command("审图当前")
+    async def show_current_qq_review(self, event: AstrMessageEvent):
+        if not self._qq_review_enabled():
+            yield event.plain_result("群友审图当前未启用。")
+            return
+        origin, reviewer_id = self._qq_review_identity(event)
+        session = await self.qq_review_service.get_current(origin=origin, reviewer_id=reviewer_id)
+        if session is None:
+            yield event.plain_result("当前没有领取中的审核图片，请先发送 /pp 随机审核。")
+            return
+        remaining = self.db.count_open_pixiv_review_images(
+            statuses=QQReviewSessionService.OPEN_STATUSES,
+            candidate_tag_id=session.filter_tag_id or None,
+        )
+        if not await self._send_qq_review_session(event, session, remaining=remaining):
+            await self.qq_review_service.release_current(origin=origin, reviewer_id=reviewer_id, remember=True)
+            yield event.plain_result("当前图片文件不可用，已释放领取；请重新发送 /pp 随机审核。")
+
+    @pjsk_gallery.command("审图结束")
+    async def end_current_qq_review(self, event: AstrMessageEvent):
+        origin, reviewer_id = self._qq_review_identity(event)
+        session = await self.qq_review_service.release_current(
+            origin=origin,
+            reviewer_id=reviewer_id,
+            remember=False,
+        )
+        if session is None:
+            yield event.plain_result("当前没有进行中的群友审图会话。")
+            return
+        yield event.plain_result(f"已结束审图并释放图片 #{session.image_id}。")
+
     @pjsk_gallery.command("审核列表")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def list_review_tasks(self, event: AstrMessageEvent, status: str = ""):
@@ -1665,6 +1983,9 @@ class PJSKPicPlugin(Star):
             return "\n".join(
                 [
                     "PJSK 审核命令：",
+                    "/pp 随机审核 [候选tag]：群友随机领取 Pixiv 待审图",
+                    "/pp 审图通过 <最终tag> / 审图拒绝 [原因] / 审图跳过",
+                    "/pp 审图当前 / 审图结束 / 审图帮助",
                     "/pp 审核列表 [status]：查看最近审核任务",
                     "/pp 审核查看 [review_id]：查看单条或下一条待审",
                     "/pp 审核通过 <review_id>",
@@ -1691,6 +2012,7 @@ class PJSKPicPlugin(Star):
                 "PJSK 图库常用命令：",
                 "发图：看看初音未来 / 来张 miku / 看看id123",
                 "投稿：/tg <tag>，可用 /pp 帮助 投稿 查看 alias 写法",
+                "群友审图：/pp 随机审核，可用 /pp 审图帮助 查看完整流程",
                 "管理：/pp 统计、/pp 查看 <tag>、/pp 看图 <image_id>",
                 "面板：/pp 面板地址",
                 "分组帮助：/pp 帮助 投稿 / tag / 审核 / 采集",
