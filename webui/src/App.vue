@@ -105,6 +105,8 @@ const pixiv = reactive({
 let pixivSearchTimer: number | null = null;
 let autoRefreshTimer: number | null = null;
 let autoRefreshRunning = false;
+let galleryLoadSeq = 0;
+let pixivReviewLoadSeq = 0;
 
 const platform = reactive({
   tagFilter: '',
@@ -319,6 +321,7 @@ async function loadSummary(): Promise<void> {
 }
 
 async function loadImages(): Promise<void> {
+  const requestSeq = ++galleryLoadSeq;
   const q = new URLSearchParams({
     keyword: gallery.keyword,
     tag: gallery.tag,
@@ -328,6 +331,7 @@ async function loadImages(): Promise<void> {
     limit: String(gallery.limit),
   });
   const data = await fetchJson<PaginatedResponse<ImageItem>>(`/api/images?${q.toString()}`);
+  if (requestSeq !== galleryLoadSeq) return;
   gallery.items = data.items || [];
   applyPagination(gallery, data);
 }
@@ -577,6 +581,7 @@ function prunePixivSelections(): void {
 }
 
 async function loadPixivReviewImages(): Promise<void> {
+  const requestSeq = ++pixivReviewLoadSeq;
   const q = new URLSearchParams({
     status: pixiv.status,
     keyword: pixiv.keyword.trim(),
@@ -584,6 +589,7 @@ async function loadPixivReviewImages(): Promise<void> {
     limit: String(pixiv.limit),
   });
   const data = await fetchJson<PaginatedResponse<PixivReviewItem> & { search_context?: Dict }>(`/api/pixiv-review-images?${q.toString()}`);
+  if (requestSeq !== pixivReviewLoadSeq) return;
   pixiv.items = data.items || [];
   pixiv.searchContext = data.search_context || null;
   pixiv.batchPreview = [];
@@ -1161,7 +1167,7 @@ async function executeMerge(): Promise<void> {
         <div v-else class="grid">
           <article v-for="item in gallery.items" :key="item.id" class="item image-card">
             <div class="thumb">
-              <img :src="imageFileUrl(item.id)" loading="lazy" alt="" @click="openImagePreview(item.id)" />
+              <img :src="imageFileUrl(item.id)" loading="lazy" decoding="async" alt="" @click="openImagePreview(item.id)" />
               <button type="button" @click="openImagePreview(item.id)">预览</button>
             </div>
             <div class="item-body">
@@ -1424,7 +1430,7 @@ async function executeMerge(): Promise<void> {
         <div v-else class="grid review-grid">
           <article v-for="item in pixiv.items" :key="item.image_id" class="item image-card" :class="{ selected: pixiv.selectedImages[item.image_id] }">
             <div class="thumb">
-              <img :src="imageFileUrl(item.image_id)" loading="lazy" alt="" @click="openPixivPreview(item.image_id)" />
+              <img :src="imageFileUrl(item.image_id)" loading="lazy" decoding="async" alt="" @click="openPixivPreview(item.image_id)" />
               <button type="button" @click="openPixivPreview(item.image_id)">预览</button>
             </div>
             <div class="item-body">

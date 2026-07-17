@@ -17,6 +17,7 @@ from .pixiv_tag_terms import known_pixiv_query_terms as shared_known_pixiv_query
 from .tag_identity_service import TagIdentityService
 
 WEBUI_STATIC_DIR = Path(__file__).resolve().parent / "webui_static"
+IMAGE_FILE_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600"}
 
 
 def _bounded_int(value: Any, default: int, *, min_value: int, max_value: int) -> int:
@@ -2364,7 +2365,7 @@ class GalleryWebUI:
         items: list[dict] = []
         for row in rows:
             image_id = int(row["id"])
-            detail = self.db.get_image_detail(image_id) or {}
+            detail = self.db.get_image_detail(image_id, sync_files=False) or {}
             sources = detail.get("sources", [])
             source0 = sources[0] if sources else {}
             items.append(
@@ -2424,14 +2425,13 @@ class GalleryWebUI:
         if denied is not None:
             return denied
         image_id = int(request.query.get("image_id", 0) or 0)
-        detail = self.db.get_image_detail(image_id)
-        if not detail:
-            return self._json_response({"error": "image_not_found"}, status=404)
         resolved_path = self.db.get_image_file_path(image_id)
-        path = Path(resolved_path) if resolved_path else Path(str(detail["image"]["file_path"]))
+        if not resolved_path:
+            return self._json_response({"error": "image_not_found"}, status=404)
+        path = Path(resolved_path)
         if not path.exists():
             return self._json_response({"error": "file_not_found"}, status=404)
-        return web.FileResponse(path)
+        return web.FileResponse(path, headers=dict(IMAGE_FILE_CACHE_HEADERS))
 
     async def api_tags(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)
