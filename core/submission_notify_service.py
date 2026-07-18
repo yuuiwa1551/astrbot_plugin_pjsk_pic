@@ -118,9 +118,9 @@ class SubmissionNotifyService:
             preview = "、".join(str(review_id) for review_id in review_ids[:10])
             lines.append(f"待处理 review_id：{preview}")
             if len(review_ids) == 1:
-                lines.append(f"处理命令：/pjsk图库 审核通过 {review_ids[0]}；/pjsk图库 审核拒绝 {review_ids[0]}")
+                lines.append(f"处理命令：.pjsk图库 审核通过 {review_ids[0]}；.pjsk图库 审核拒绝 {review_ids[0]}")
             else:
-                lines.append("可先用：/pjsk图库 审核查看 <review_id>")
+                lines.append("可先用：.pjsk图库 审核查看 <review_id>")
         return "\n".join(lines)
 
     async def notify(self, event, result: SubmissionResult) -> int:

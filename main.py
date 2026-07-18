@@ -323,7 +323,7 @@ class PJSKPicPlugin(Star):
             )
         if rows:
             review_id = int(rows[0]["id"])
-            lines.append(f"查看详情：/pjsk图库 审核查看 {review_id}")
+            lines.append(f"查看详情：.pjsk图库 审核查看 {review_id}")
         lines.append(f"图片详情：看看id{image_id}")
         await event.send(MessageChain().message("\n\n".join(lines)))
 
@@ -339,8 +339,8 @@ class PJSKPicPlugin(Star):
                 f"image_id：{task['image_id']}\n"
                 f"来源：{task['source_type'] or '-'}\n"
                 f"原因：{task['reason'] or '-'}\n"
-                f"通过：/pjsk图库 审核通过 {task['id']}\n"
-                f"拒绝：/pjsk图库 审核拒绝 {task['id']}"
+                f"通过：.pjsk图库 审核通过 {task['id']}\n"
+                f"拒绝：.pjsk图库 审核拒绝 {task['id']}"
             ),
         )
 
@@ -472,9 +472,9 @@ class PJSKPicPlugin(Star):
             lines.append(f"当前队列：约 {max(0, int(remaining))} 张待审")
         lines.extend(
             [
-                "通过并归类：/pp 审图通过 <最终tag>",
-                "整图不要：/pp 审图拒绝 [原因]",
-                "换一张：/pp 审图跳过",
+                "通过并归类：.pp 审图通过 <最终tag>",
+                "整图不要：.pp 审图拒绝 [原因]",
+                "换一张：.pp 审图跳过",
                 "提示：整图拒绝会阻止这个 Pixiv 作品以后再次被抓取。",
             ]
         )
@@ -907,7 +907,7 @@ class PJSKPicPlugin(Star):
     async def submit_image_by_user_command(self, event: AstrMessageEvent):
         await self._handle_submission_event(
             event,
-            missing_tag_reply="\u8BF7\u5728\u6295\u7A3F\u547D\u4EE4\u540E\u63D0\u4F9B\u89D2\u8272 tag\uFF0C\u4F8B\u5982\uFF1A/tg \u521D\u97F3\u672A\u6765",
+            missing_tag_reply="\u8BF7\u5728\u6295\u7A3F\u547D\u4EE4\u540E\u63D0\u4F9B\u89D2\u8272 tag\uFF0C\u4F8B\u5982\uFF1A.tg \u521D\u97F3\u672A\u6765",
         )
 
     @filter.regex(r"^\s*(?:@.+?\(\d+\)\s+)*(?:[/!！.。．])?(?:投稿|tg)\s+.+$")
@@ -919,7 +919,7 @@ class PJSKPicPlugin(Star):
     async def alias_shortcut(self, event: AstrMessageEvent):
         target_input, alias_values = self._parse_alias_command_args(event.message_str)
         if not target_input:
-            yield event.plain_result("用法：/alias <tag或alias> [新alias1,新alias2]")
+            yield event.plain_result("用法：.alias <tag或alias> [新alias1,新alias2]")
             return
 
         canonical_tag_name, match_type = self._resolve_existing_tag_name(target_input, allow_fuzzy=False)
@@ -947,7 +947,7 @@ class PJSKPicPlugin(Star):
     async def unalias_shortcut(self, event: AstrMessageEvent):
         target_input, alias_values = self._parse_shortcut_args(event.message_str, {"unalias", "删别名"})
         if not target_input or not alias_values:
-            yield event.plain_result("用法：/unalias <tag或alias> <alias1,alias2>")
+            yield event.plain_result("用法：.unalias <tag或alias> <alias1,alias2>")
             return
 
         canonical_tag_name, match_type = self._resolve_existing_tag_name(target_input, allow_fuzzy=False)
@@ -1161,7 +1161,7 @@ class PJSKPicPlugin(Star):
     async def merge_tags_command(self, event: AstrMessageEvent, target_tag_name: str, source_tags: str):
         source_values = self._parse_alias_csv(source_tags)
         if not source_values:
-            yield event.plain_result("用法：/pjsk图库 tag合并 <目标tag> <来源tag1,来源tag2>")
+            yield event.plain_result("用法：.pjsk图库 tag合并 <目标tag> <来源tag1,来源tag2>")
             return
 
         ok, summary = self.db.merge_tags(target_tag_name, source_values)
@@ -1240,20 +1240,20 @@ class PJSKPicPlugin(Star):
             yield event.plain_result("当前没有普通 tag 需要清理。")
             return
         lines = [
-            "以下普通 tag 清理后会被删除；如需保留，请先用 /pjsk图库 tag合并 归并到角色主 tag：",
+            "以下普通 tag 清理后会被删除；如需保留，请先用 .pjsk图库 tag合并 归并到角色主 tag：",
         ]
         for row in rows[:60]:
             lines.append(f"- {row['name']}（图 {int(row['image_count'] or 0)}，alias {int(row['alias_count'] or 0)}）")
         if len(rows) > 60:
             lines.append(f"其余 {len(rows) - 60} 个未展开。")
-        lines.append("执行命令：/pjsk图库 tag清理执行 确认")
+        lines.append("执行命令：.pjsk图库 tag清理执行 确认")
         yield event.plain_result("\n".join(lines))
 
     @pjsk_gallery.command("tag清理执行")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def execute_tag_cleanup(self, event: AstrMessageEvent, confirm_text: str = ""):
         if str(confirm_text or "").strip().lower() not in {"确认", "confirm", "yes", "y"}:
-            yield event.plain_result("该操作会删除所有普通 tag 及其图片关联。确认执行：/pjsk图库 tag清理执行 确认")
+            yield event.plain_result("该操作会删除所有普通 tag 及其图片关联。确认执行：.pjsk图库 tag清理执行 确认")
             return
         summary = self.db.cleanup_non_character_tags()
         self._sync_auto_crawl_subscriptions_safe()
@@ -1365,7 +1365,7 @@ class PJSKPicPlugin(Star):
                 + f"   错误：{self._short_text(str(latest_subscription_error['last_error'] or ''), 180) or '-'}\n"
                 + f"   更新：{latest_subscription_error['updated_at']}"
             )
-        lines.append("失败任务可用 /pp 失败列表 查看，或 /pp 失败重试 <job_id> 重新入队。")
+        lines.append("失败任务可用 .pp 失败列表 查看，或 .pp 失败重试 <job_id> 重新入队。")
         yield event.plain_result("\n".join(lines))
 
     @pjsk_gallery.command("失败列表")
@@ -1382,7 +1382,7 @@ class PJSKPicPlugin(Star):
         lines = ["最近失败采集任务："]
         for index, row in enumerate(rows, start=1):
             lines.append(self._format_crawl_job_brief(row, index=index))
-        lines.append("可用 /pp 失败重试 <job_id> 或 /pp 失败重试 全部。")
+        lines.append("可用 .pp 失败重试 <job_id> 或 .pp 失败重试 全部。")
         yield event.plain_result("\n\n".join(lines))
 
     @pjsk_gallery.command("失败重试")
@@ -1410,7 +1410,7 @@ class PJSKPicPlugin(Star):
         try:
             numeric_job_id = int(target)
         except ValueError:
-            yield event.plain_result("用法：/pp 失败重试 <job_id|全部>")
+            yield event.plain_result("用法：.pp 失败重试 <job_id|全部>")
             return
         ok, message = await self.crawl_service.retry_job(numeric_job_id)
         yield event.plain_result(message if ok else f"重试失败：{message}")
@@ -1529,12 +1529,12 @@ class PJSKPicPlugin(Star):
             "\n".join(
                 [
                     "PJSK 群友审图命令：",
-                    "/pp 随机审核 [候选tag]：随机领取一张 Pixiv 待审图",
-                    "/pp 审图通过 <最终tag>：归入指定现有主 tag",
-                    "/pp 审图拒绝 [原因]：整图拒绝并阻止以后重复抓取",
-                    "/pp 审图跳过：不修改审核结果并换一张",
-                    "/pp 审图当前：重发当前领取的图片",
-                    "/pp 审图结束：释放当前图片并退出",
+                    ".pp 随机审核 [候选tag]：随机领取一张 Pixiv 待审图",
+                    ".pp 审图通过 <最终tag>：归入指定现有主 tag",
+                    ".pp 审图拒绝 [原因]：整图拒绝并阻止以后重复抓取",
+                    ".pp 审图跳过：不修改审核结果并换一张",
+                    ".pp 审图当前：重发当前领取的图片",
+                    ".pp 审图结束：释放当前图片并退出",
                     "如果图片有价值但候选 tag 错了，请用“审图通过 正确tag”，不要整图拒绝。",
                 ]
             )
@@ -1574,7 +1574,7 @@ class PJSKPicPlugin(Star):
             return
         query = str(tag_name or "").strip()
         if not query:
-            yield event.plain_result("请指定最终 tag，例如：/pp 审图通过 晓山瑞希")
+            yield event.plain_result("请指定最终 tag，例如：.pp 审图通过 晓山瑞希")
             return
         resolved, match_type, candidates = self._resolve_qq_review_tag(query)
         if not resolved:
@@ -1645,7 +1645,7 @@ class PJSKPicPlugin(Star):
             remember=True,
         )
         if session is None:
-            yield event.plain_result("当前没有领取中的审核图片，请先发送 /pp 随机审核。")
+            yield event.plain_result("当前没有领取中的审核图片，请先发送 .pp 随机审核。")
             return
         await event.send(MessageChain().message(f"已跳过图片 #{session.image_id}，审核状态未改变。"))
         await self._claim_and_send_qq_review(
@@ -1662,7 +1662,7 @@ class PJSKPicPlugin(Star):
         origin, reviewer_id = self._qq_review_identity(event)
         session = await self.qq_review_service.get_current(origin=origin, reviewer_id=reviewer_id)
         if session is None:
-            yield event.plain_result("当前没有领取中的审核图片，请先发送 /pp 随机审核。")
+            yield event.plain_result("当前没有领取中的审核图片，请先发送 .pp 随机审核。")
             return
         remaining = self.db.count_open_pixiv_review_images(
             statuses=QQReviewSessionService.OPEN_STATUSES,
@@ -1670,7 +1670,7 @@ class PJSKPicPlugin(Star):
         )
         if not await self._send_qq_review_session(event, session, remaining=remaining):
             await self.qq_review_service.release_current(origin=origin, reviewer_id=reviewer_id, remember=True)
-            yield event.plain_result("当前图片文件不可用，已释放领取；请重新发送 /pp 随机审核。")
+            yield event.plain_result("当前图片文件不可用，已释放领取；请重新发送 .pp 随机审核。")
 
     @pjsk_gallery.command("审图结束")
     async def end_current_qq_review(self, event: AstrMessageEvent):
@@ -1722,10 +1722,10 @@ class PJSKPicPlugin(Star):
 
         if len(ordered_image_ids) > preview_limit:
             yield event.plain_result(
-                f"其余 {len(ordered_image_ids) - preview_limit} 张图片未展开。可用 /pjsk图库 审核查看 <review_id> 查看单条审核。",
+                f"其余 {len(ordered_image_ids) - preview_limit} 张图片未展开。可用 .pjsk图库 审核查看 <review_id> 查看单条审核。",
             )
             return
-        yield event.plain_result("可继续使用 /pjsk图库 审核查看 <review_id> 查看单条审核。")
+        yield event.plain_result("可继续使用 .pjsk图库 审核查看 <review_id> 查看单条审核。")
 
     @pjsk_gallery.command("审核查看")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1797,7 +1797,7 @@ class PJSKPicPlugin(Star):
 
         image = dict(detail.get("image") or {})
         if int(image.get("is_active") or 0) != 1:
-            yield event.plain_result(f"图片 #{image_id} 当前已不在可发送状态；可用 /pjsk图库 看图 {image_id} 查看详情。")
+            yield event.plain_result(f"图片 #{image_id} 当前已不在可发送状态；可用 .pjsk图库 看图 {image_id} 查看详情。")
             return
 
         current_path = self._find_detail_image_path(detail, prefer_active=True)
@@ -1879,7 +1879,7 @@ class PJSKPicPlugin(Star):
         yield event.plain_result(
             f"已恢复图片 #{image_id}\n"
             f"恢复路径：{restore_path}\n"
-            f"可用命令：/pjsk图库 看图 {image_id}"
+            f"可用命令：.pjsk图库 看图 {image_id}"
         )
 
     @pjsk_gallery.command("重复忽略")
@@ -1913,7 +1913,7 @@ class PJSKPicPlugin(Star):
                 f"#{row['id']}：{row['image_id_low']} <-> {row['image_id_high']}"
                 + (f"；原因：{reason}" if reason else "")
             )
-        lines.append("可用 /pp 重复恢复 <id1> <id2> 恢复疑似重复提示。")
+        lines.append("可用 .pp 重复恢复 <id1> <id2> 恢复疑似重复提示。")
         yield event.plain_result("\n".join(lines))
 
     @pjsk_gallery.command("面板地址")
@@ -1961,9 +1961,9 @@ class PJSKPicPlugin(Star):
             return "\n".join(
                 [
                     "PJSK 投稿命令：",
-                    "/投稿 <tag> 或 /tg <tag>：附图投稿到指定 tag",
-                    "/投稿 <tag> 别名 <alias1,alias2>：投稿时顺手补 alias",
-                    "/tg <tag> alias <alias1,alias2>：同上",
+                    ".投稿 <tag> 或 .tg <tag>：附图投稿到指定 tag",
+                    ".投稿 <tag> 别名 <alias1,alias2>：投稿时顺手补 alias",
+                    ".tg <tag> alias <alias1,alias2>：同上",
                     "也可以先回复一条带图消息，再发送投稿命令。",
                 ]
             )
@@ -1971,51 +1971,51 @@ class PJSKPicPlugin(Star):
             return "\n".join(
                 [
                     "PJSK tag / alias 管理：",
-                    "/pp 查看 <tag>：查看图片数和别名",
-                    "/pp tag列表 [全部|普通|关键词]：列出主 tag",
-                    "/pp 别名添加 <tag> <alias1,alias2>",
-                    "/pp 别名删除 <tag> <alias1,alias2>",
-                    "/pp tag合并 <目标tag> <来源tag1,来源tag2>",
-                    "/pp 主tag切换 <旧tag或alias> <新主tag>",
+                    ".pp 查看 <tag>：查看图片数和别名",
+                    ".pp tag列表 [全部|普通|关键词]：列出主 tag",
+                    ".pp 别名添加 <tag> <alias1,alias2>",
+                    ".pp 别名删除 <tag> <alias1,alias2>",
+                    ".pp tag合并 <目标tag> <来源tag1,来源tag2>",
+                    ".pp 主tag切换 <旧tag或alias> <新主tag>",
                 ]
             )
         if topic == "review":
             return "\n".join(
                 [
                     "PJSK 审核命令：",
-                    "/pp 随机审核 [候选tag]：群友随机领取 Pixiv 待审图",
-                    "/pp 审图通过 <最终tag> / 审图拒绝 [原因] / 审图跳过",
-                    "/pp 审图当前 / 审图结束 / 审图帮助",
-                    "/pp 审核列表 [status]：查看最近审核任务",
-                    "/pp 审核查看 [review_id]：查看单条或下一条待审",
-                    "/pp 审核通过 <review_id>",
-                    "/pp 审核拒绝 <review_id>",
-                    "/pp 投稿审核状态",
-                    "/pp 投稿审核开启 或 /pp 投稿审核关闭",
+                    ".pp 随机审核 [候选tag]：群友随机领取 Pixiv 待审图",
+                    ".pp 审图通过 <最终tag>；.pp 审图拒绝 [原因]；.pp 审图跳过",
+                    ".pp 审图当前；.pp 审图结束；.pp 审图帮助",
+                    ".pp 审核列表 [status]：查看最近审核任务",
+                    ".pp 审核查看 [review_id]：查看单条或下一条待审",
+                    ".pp 审核通过 <review_id>",
+                    ".pp 审核拒绝 <review_id>",
+                    ".pp 投稿审核状态",
+                    ".pp 投稿审核开启 或 .pp 投稿审核关闭",
                 ]
             )
         if topic == "crawl":
             return "\n".join(
                 [
                     "PJSK 采集命令：",
-                    "/pp 采集添加 <platform> <url> [tags_csv]",
-                    "/pp 采集列表",
-                    "/pp 采集诊断",
-                    "/pp 失败列表 [platform]",
-                    "/pp 失败重试 <job_id|全部>",
-                    "/pp 自动采集状态",
-                    "/pp 历史回填添加 <tag> [页数上限] [扫描上限] [入队上限]",
+                    ".pp 采集添加 <platform> <url> [tags_csv]",
+                    ".pp 采集列表",
+                    ".pp 采集诊断",
+                    ".pp 失败列表 [platform]",
+                    ".pp 失败重试 <job_id|全部>",
+                    ".pp 自动采集状态",
+                    ".pp 历史回填添加 <tag> [页数上限] [扫描上限] [入队上限]",
                 ]
             )
         return "\n".join(
             [
                 "PJSK 图库常用命令：",
-                "发图：看看初音未来 / 来张 miku / 看看id123",
-                "投稿：/tg <tag>，可用 /pp 帮助 投稿 查看 alias 写法",
-                "群友审图：/pp 随机审核，可用 /pp 审图帮助 查看完整流程",
-                "管理：/pp 统计、/pp 查看 <tag>、/pp 看图 <image_id>",
-                "面板：/pp 面板地址",
-                "分组帮助：/pp 帮助 投稿 / tag / 审核 / 采集",
+                "发图：看看初音未来、来张 miku、看看id123",
+                "投稿：.tg <tag>，可用 .pp 帮助 投稿 查看 alias 写法",
+                "群友审图：.pp 随机审核，可用 .pp 审图帮助 查看完整流程",
+                "管理：.pp 统计、.pp 查看 <tag>、.pp 看图 <image_id>",
+                "面板：.pp 面板地址",
+                "分组帮助：.pp 帮助 投稿、tag、审核、采集",
                 "完整维护操作建议优先使用 WebUI。",
             ]
         )

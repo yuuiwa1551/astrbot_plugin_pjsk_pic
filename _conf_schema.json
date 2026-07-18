@@ -31,7 +31,7 @@
   },
   "qq_review_enabled": {
     "type": "bool",
-    "description": "是否向所有群友开放 /pp 随机审核 与审图指令。关闭后不会影响管理员旧审核命令和 WebUI。",
+    "description": "是否向所有群友开放 .pp 随机审核 与审图指令。关闭后不会影响管理员旧审核命令和 WebUI。",
     "default": true
   },
   "qq_review_claim_ttl_seconds": {
