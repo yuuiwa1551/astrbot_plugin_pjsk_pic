@@ -1,13 +1,14 @@
 ﻿from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 import json
 import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .matcher import normalize_tag_name
 from .models import APPROVED_STATUSES, MatchResult
@@ -52,7 +53,8 @@ class ImageIndexDB:
         self._lock = threading.RLock()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
@@ -60,7 +62,14 @@ class ImageIndexDB:
             conn.execute("PRAGMA temp_store=MEMORY;")
         except sqlite3.OperationalError:
             pass
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -180,6 +189,38 @@ class ImageIndexDB:
                     FOREIGN KEY(tag_id) REFERENCES tags(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS crawl_subscription_terms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subscription_id INTEGER NOT NULL,
+                    query_term TEXT NOT NULL,
+                    normalized_term TEXT NOT NULL,
+                    query_text TEXT DEFAULT '',
+                    position INTEGER DEFAULT 0,
+                    enabled INTEGER DEFAULT 1,
+                    last_seen_source_uid TEXT DEFAULT '',
+                    last_checked_at TEXT DEFAULT '',
+                    last_success_at TEXT DEFAULT '',
+                    last_error TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(subscription_id, normalized_term),
+                    FOREIGN KEY(subscription_id) REFERENCES crawl_subscriptions(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS crawl_discoveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    source_uid TEXT NOT NULL,
+                    post_url TEXT NOT NULL,
+                    tags_text TEXT DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    crawl_job_id INTEGER DEFAULT 0,
+                    last_error TEXT DEFAULT '',
+                    discovered_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(platform, source_uid)
+                );
+
                 CREATE TABLE IF NOT EXISTS pixiv_backfill_tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tag_id INTEGER DEFAULT 0,
@@ -297,6 +338,8 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_sources_image_platform ON sources(image_id, platform);
                 CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status ON crawl_jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_crawl_subscriptions_platform ON crawl_subscriptions(platform, enabled);
+                CREATE INDEX IF NOT EXISTS idx_crawl_subscription_terms_subscription ON crawl_subscription_terms(subscription_id, enabled, position);
+                CREATE INDEX IF NOT EXISTS idx_crawl_discoveries_status ON crawl_discoveries(platform, status, id);
                 CREATE INDEX IF NOT EXISTS idx_pixiv_backfill_tasks_status ON pixiv_backfill_tasks(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status_image ON review_tasks(status, image_id, id);
@@ -1363,6 +1406,12 @@ class ImageIndexDB:
                         now,
                         int(target_subscription['id']),
                     ),
+                )
+                self._merge_crawl_subscription_terms_conn(
+                    conn,
+                    source_subscription_id=int(row['id']),
+                    target_subscription_id=int(target_subscription['id']),
+                    now=now,
                 )
                 conn.execute('DELETE FROM crawl_subscriptions WHERE id = ?', (int(row['id']),))
                 subscriptions_removed += 1
@@ -3194,7 +3243,6 @@ class ImageIndexDB:
                     continue
 
                 source_id = int(source_row['id'])
-                source_name = str(source_row['name'])
                 source_normalized = str(source_row['normalized_name'] or '')
                 if source_id == target_id or source_normalized == target_normalized:
                     summary['skipped'].append(f'{source_text}（已归并到 {target_name}）')
@@ -4888,11 +4936,23 @@ class ImageIndexDB:
             platform_term_cursor = conn.execute(f'DELETE FROM platform_tag_terms WHERE tag_id IN ({id_placeholders})', tag_ids)
 
             subscription_sql = f'DELETE FROM crawl_subscriptions WHERE tag_id IN ({id_placeholders})'
+            subscription_select_sql = f'SELECT id FROM crawl_subscriptions WHERE tag_id IN ({id_placeholders})'
             subscription_params: list[Any] = list(tag_ids)
             if normalized_names:
                 normalized_placeholders = ','.join('?' for _ in normalized_names)
                 subscription_sql += f' OR normalized_tag IN ({normalized_placeholders})'
+                subscription_select_sql += f' OR normalized_tag IN ({normalized_placeholders})'
                 subscription_params.extend(normalized_names)
+            subscription_ids = [
+                int(row['id'])
+                for row in conn.execute(subscription_select_sql, subscription_params).fetchall()
+            ]
+            if subscription_ids:
+                subscription_placeholders = ','.join('?' for _ in subscription_ids)
+                conn.execute(
+                    f'DELETE FROM crawl_subscription_terms WHERE subscription_id IN ({subscription_placeholders})',
+                    subscription_ids,
+                )
             subscription_cursor = conn.execute(subscription_sql, subscription_params)
             tag_cursor = conn.execute(f'DELETE FROM tags WHERE id IN ({id_placeholders})', tag_ids)
 
@@ -4965,6 +5025,16 @@ class ImageIndexDB:
                     'UPDATE crawl_subscriptions SET enabled = 0, updated_at = ? WHERE platform = ?',
                     (now, platform),
                 )
+            conn.execute(
+                """
+                UPDATE crawl_subscription_terms
+                SET enabled = 0, updated_at = ?
+                WHERE subscription_id IN (
+                    SELECT id FROM crawl_subscriptions WHERE platform = ? AND enabled = 0
+                )
+                """,
+                (now, platform),
+            )
 
     def list_crawl_subscriptions(self, *, platform: str = '', enabled_only: bool = False, limit: int = 200) -> list[sqlite3.Row]:
         sql = 'SELECT * FROM crawl_subscriptions'
@@ -5016,3 +5086,438 @@ class ImageIndexDB:
         params.append(subscription_id)
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE crawl_subscriptions SET {', '.join(fields)} WHERE id = ?", params)
+
+    @staticmethod
+    def _merge_csv_values(*values: str | Iterable[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if isinstance(value, str):
+                items = value.replace('，', ',').split(',')
+            else:
+                items = [str(item) for item in value]
+            for item in items:
+                text = str(item or '').strip()
+                key = normalize_tag_name(text)
+                if not text or not key or key in seen:
+                    continue
+                seen.add(key)
+                result.append(text)
+        return result
+
+    @classmethod
+    def _merge_crawl_job_values_conn(
+        cls,
+        conn: sqlite3.Connection,
+        job_id: int,
+        *,
+        tags: Iterable[str] = (),
+        include_tags: Iterable[str] = (),
+        exclude_tags: Iterable[str] = (),
+        now: str,
+    ) -> None:
+        row = conn.execute('SELECT * FROM crawl_jobs WHERE id = ? LIMIT 1', (int(job_id),)).fetchone()
+        if not row:
+            return
+        merged_tags = cls._merge_csv_values(str(row['tags_text'] or ''), tags)
+        merged_include = cls._merge_csv_values(str(row['include_tags_text'] or ''), include_tags)
+        merged_exclude = cls._merge_csv_values(str(row['exclude_tags_text'] or ''), exclude_tags)
+        conn.execute(
+            """
+            UPDATE crawl_jobs
+            SET tags_text = ?, include_tags_text = ?, exclude_tags_text = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (','.join(merged_tags), ','.join(merged_include), ','.join(merged_exclude), now, int(job_id)),
+        )
+
+    def get_or_create_crawl_job(
+        self,
+        platform: str,
+        source_url: str,
+        tags: list[str],
+        *,
+        include_tags: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        match_mode: str = 'exact',
+    ) -> tuple[int, bool]:
+        platform_text = str(platform or '').strip().lower()
+        raw_url = str(source_url or '').strip()
+        normalized_url = self.normalize_source_post_url(platform_text, raw_url) or raw_url
+        if not platform_text or not normalized_url:
+            raise ValueError('采集平台和来源 URL 不能为空')
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM crawl_jobs
+                WHERE platform = ? AND source_url IN (?, ?)
+                ORDER BY
+                    CASE status
+                        WHEN 'pending' THEN 0
+                        WHEN 'retry' THEN 0
+                        WHEN 'running' THEN 0
+                        WHEN 'failed' THEN 1
+                        ELSE 2
+                    END,
+                    id DESC
+                LIMIT 1
+                """,
+                (platform_text, raw_url, normalized_url),
+            ).fetchone()
+            if row:
+                self._merge_crawl_job_values_conn(
+                    conn,
+                    int(row['id']),
+                    tags=tags,
+                    include_tags=include_tags or [],
+                    exclude_tags=exclude_tags or [],
+                    now=now,
+                )
+                return int(row['id']), False
+
+            cursor = conn.execute(
+                """
+                INSERT INTO crawl_jobs(
+                    platform, source_url, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
+                    status, progress, error_log, result_summary, attempt_count, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
+                """,
+                (
+                    platform_text,
+                    normalized_url,
+                    ','.join(self._merge_csv_values(tags)),
+                    ','.join(self._merge_csv_values(include_tags or [])),
+                    ','.join(self._merge_csv_values(exclude_tags or [])),
+                    str(match_mode or 'exact').strip().lower() or 'exact',
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid), True
+
+    def sync_crawl_subscription_terms(
+        self,
+        subscription_id: int,
+        terms: list[tuple[str, str]],
+    ) -> list[sqlite3.Row]:
+        now = utcnow_str()
+        normalized_terms: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        for query_term, query_text in terms:
+            term_text = str(query_term or '').strip()
+            normalized = normalize_tag_name(term_text)
+            if not term_text or not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            normalized_terms.append((term_text, normalized, str(query_text or '').strip()))
+
+        with self._lock, self._connect() as conn:
+            parent = conn.execute(
+                'SELECT * FROM crawl_subscriptions WHERE id = ? LIMIT 1',
+                (int(subscription_id),),
+            ).fetchone()
+            if not parent:
+                return []
+            existing_rows = conn.execute(
+                'SELECT * FROM crawl_subscription_terms WHERE subscription_id = ? ORDER BY position ASC, id ASC',
+                (int(subscription_id),),
+            ).fetchall()
+            existing_by_term = {str(row['normalized_term']): row for row in existing_rows}
+            conn.execute(
+                'UPDATE crawl_subscription_terms SET enabled = 0, updated_at = ? WHERE subscription_id = ?',
+                (now, int(subscription_id)),
+            )
+            legacy_last_seen = str(parent['last_seen_source_uid'] or '').strip()
+            for position, (term_text, normalized, query_text) in enumerate(normalized_terms):
+                existing = existing_by_term.get(normalized)
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE crawl_subscription_terms
+                        SET query_term = ?, query_text = ?, position = ?, enabled = 1, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (term_text, query_text, position, now, int(existing['id'])),
+                    )
+                    continue
+                seed_last_seen = legacy_last_seen if not existing_rows and position == 0 else ''
+                conn.execute(
+                    """
+                    INSERT INTO crawl_subscription_terms(
+                        subscription_id, query_term, normalized_term, query_text, position, enabled,
+                        last_seen_source_uid, last_checked_at, last_success_at, last_error,
+                        created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, 1, ?, '', '', '', ?, ?)
+                    """,
+                    (
+                        int(subscription_id),
+                        term_text,
+                        normalized,
+                        query_text,
+                        position,
+                        seed_last_seen,
+                        now,
+                        now,
+                    ),
+                )
+            return conn.execute(
+                """
+                SELECT * FROM crawl_subscription_terms
+                WHERE subscription_id = ? AND enabled = 1
+                ORDER BY position ASC, id ASC
+                """,
+                (int(subscription_id),),
+            ).fetchall()
+
+    def list_crawl_subscription_terms(
+        self,
+        subscription_id: int,
+        *,
+        enabled_only: bool = True,
+    ) -> list[sqlite3.Row]:
+        sql = 'SELECT * FROM crawl_subscription_terms WHERE subscription_id = ?'
+        params: list[Any] = [int(subscription_id)]
+        if enabled_only:
+            sql += ' AND enabled = 1'
+        sql += ' ORDER BY position ASC, id ASC'
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def update_crawl_subscription_term_state(
+        self,
+        term_id: int,
+        *,
+        last_seen_source_uid: str | None = None,
+        last_checked_at: str | None = None,
+        last_success_at: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        fields = ['updated_at = ?']
+        params: list[Any] = [utcnow_str()]
+        if last_seen_source_uid is not None:
+            fields.append('last_seen_source_uid = ?')
+            params.append(str(last_seen_source_uid))
+        if last_checked_at is not None:
+            fields.append('last_checked_at = ?')
+            params.append(str(last_checked_at))
+        if last_success_at is not None:
+            fields.append('last_success_at = ?')
+            params.append(str(last_success_at))
+        if last_error is not None:
+            fields.append('last_error = ?')
+            params.append(str(last_error))
+        params.append(int(term_id))
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE crawl_subscription_terms SET {', '.join(fields)} WHERE id = ?", params)
+
+    def refresh_crawl_subscription_state(self, subscription_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM crawl_subscription_terms
+                WHERE subscription_id = ? AND enabled = 1
+                ORDER BY position ASC, id ASC
+                """,
+                (int(subscription_id),),
+            ).fetchall()
+            if not rows:
+                return
+            primary = rows[0]
+            last_checked_at = max((str(row['last_checked_at'] or '') for row in rows), default='')
+            last_success_at = max((str(row['last_success_at'] or '') for row in rows), default='')
+            errors = [
+                f"{str(row['query_term'] or '').strip()}: {str(row['last_error'] or '').strip()}"
+                for row in rows
+                if str(row['last_error'] or '').strip()
+            ]
+            conn.execute(
+                """
+                UPDATE crawl_subscriptions
+                SET last_seen_source_uid = ?, last_checked_at = ?, last_success_at = ?,
+                    last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(primary['last_seen_source_uid'] or ''),
+                    last_checked_at,
+                    last_success_at,
+                    '；'.join(errors[:3]),
+                    utcnow_str(),
+                    int(subscription_id),
+                ),
+            )
+
+    def upsert_crawl_discovery(
+        self,
+        *,
+        platform: str,
+        source_uid: str,
+        post_url: str,
+        tags: Iterable[str],
+    ) -> tuple[sqlite3.Row, bool]:
+        platform_text = str(platform or '').strip().lower()
+        post_url_text = self.normalize_source_post_url(platform_text, post_url) or str(post_url or '').strip()
+        source_uid_text = str(source_uid or '').strip() or self._source_uid_from_post_url(platform_text, post_url_text)
+        if not platform_text or not source_uid_text or not post_url_text:
+            raise ValueError('发现记录缺少平台、来源 ID 或 URL')
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                'SELECT * FROM crawl_discoveries WHERE platform = ? AND source_uid = ? LIMIT 1',
+                (platform_text, source_uid_text),
+            ).fetchone()
+            if existing:
+                merged_tags = self._merge_csv_values(str(existing['tags_text'] or ''), tags)
+                conn.execute(
+                    """
+                    UPDATE crawl_discoveries
+                    SET post_url = ?, tags_text = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (post_url_text, ','.join(merged_tags), now, int(existing['id'])),
+                )
+                crawl_job_id = int(existing['crawl_job_id'] or 0)
+                if crawl_job_id > 0:
+                    self._merge_crawl_job_values_conn(
+                        conn,
+                        crawl_job_id,
+                        tags=merged_tags,
+                        now=now,
+                    )
+                row = conn.execute('SELECT * FROM crawl_discoveries WHERE id = ?', (int(existing['id']),)).fetchone()
+                if not row:
+                    raise RuntimeError('更新发现记录失败')
+                return row, False
+
+            cursor = conn.execute(
+                """
+                INSERT INTO crawl_discoveries(
+                    platform, source_uid, post_url, tags_text, status, crawl_job_id,
+                    last_error, discovered_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, 'pending', 0, '', ?, ?)
+                """,
+                (platform_text, source_uid_text, post_url_text, ','.join(self._merge_csv_values(tags)), now, now),
+            )
+            row = conn.execute('SELECT * FROM crawl_discoveries WHERE id = ?', (int(cursor.lastrowid),)).fetchone()
+            if not row:
+                raise RuntimeError('创建发现记录失败')
+            return row, True
+
+    def list_pending_crawl_discoveries(self, *, platform: str, limit: int = 30) -> list[sqlite3.Row]:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM crawl_discoveries
+                WHERE platform = ? AND status = 'pending'
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (str(platform or '').strip().lower(), max(1, int(limit or 1))),
+            ).fetchall()
+
+    def mark_crawl_discovery_submitted(self, discovery_id: int, crawl_job_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE crawl_discoveries
+                SET status = 'submitted', crawl_job_id = ?, last_error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (int(crawl_job_id), utcnow_str(), int(discovery_id)),
+            )
+
+    def mark_crawl_discovery_resolved(self, discovery_id: int, *, status: str) -> None:
+        resolved_status = str(status or '').strip().lower()
+        if resolved_status not in {'imported', 'rejected'}:
+            raise ValueError(f'不支持的发现记录完成状态：{status}')
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE crawl_discoveries
+                SET status = ?, last_error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (resolved_status, utcnow_str(), int(discovery_id)),
+            )
+
+    def mark_crawl_discovery_error(self, discovery_id: int, error: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE crawl_discoveries
+                SET status = 'pending', last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (str(error or '')[:1000], utcnow_str(), int(discovery_id)),
+            )
+
+    def count_crawl_discoveries_by_status(self, *, platform: str = '') -> dict[str, int]:
+        sql = 'SELECT status, COUNT(*) AS total FROM crawl_discoveries'
+        params: list[Any] = []
+        if platform:
+            sql += ' WHERE platform = ?'
+            params.append(str(platform or '').strip().lower())
+        sql += ' GROUP BY status'
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return {str(row['status'] or ''): int(row['total'] or 0) for row in rows}
+
+    @classmethod
+    def _merge_crawl_subscription_terms_conn(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        source_subscription_id: int,
+        target_subscription_id: int,
+        now: str,
+    ) -> None:
+        rows = conn.execute(
+            'SELECT * FROM crawl_subscription_terms WHERE subscription_id = ? ORDER BY position ASC, id ASC',
+            (int(source_subscription_id),),
+        ).fetchall()
+        for row in rows:
+            existing = conn.execute(
+                """
+                SELECT * FROM crawl_subscription_terms
+                WHERE subscription_id = ? AND normalized_term = ?
+                LIMIT 1
+                """,
+                (int(target_subscription_id), str(row['normalized_term'])),
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    'UPDATE crawl_subscription_terms SET subscription_id = ?, updated_at = ? WHERE id = ?',
+                    (int(target_subscription_id), now, int(row['id'])),
+                )
+                continue
+
+            source_success = str(row['last_success_at'] or '')
+            target_success = str(existing['last_success_at'] or '')
+            preferred = row if source_success > target_success else existing
+            conn.execute(
+                """
+                UPDATE crawl_subscription_terms
+                SET query_term = ?, query_text = ?, position = ?, enabled = ?,
+                    last_seen_source_uid = ?, last_checked_at = ?, last_success_at = ?,
+                    last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(preferred['query_term'] or ''),
+                    str(preferred['query_text'] or ''),
+                    min(int(existing['position'] or 0), int(row['position'] or 0)),
+                    1 if int(existing['enabled'] or 0) or int(row['enabled'] or 0) else 0,
+                    str(preferred['last_seen_source_uid'] or ''),
+                    max(str(existing['last_checked_at'] or ''), str(row['last_checked_at'] or '')),
+                    max(target_success, source_success),
+                    str(preferred['last_error'] or ''),
+                    now,
+                    int(existing['id']),
+                ),
+            )
+            conn.execute('DELETE FROM crawl_subscription_terms WHERE id = ?', (int(row['id']),))

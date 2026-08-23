@@ -11,17 +11,27 @@ from .crawl_tag_rules import CrawlTagRules
 from .db import ImageIndexDB
 from .importer import ImportedImageService
 from .matcher import normalize_tag_name
+from .pixiv_app_api import PixivAppClient
 from .pixiv_tag_terms import known_pixiv_query_terms
 from .review_service import ReviewService
 from .tag_cleaner import TagCleaner
 
 
 class CrawlService:
-    def __init__(self, *, db: ImageIndexDB, importer: ImportedImageService, reviewer: ReviewService, config) -> None:
+    def __init__(
+        self,
+        *,
+        db: ImageIndexDB,
+        importer: ImportedImageService,
+        reviewer: ReviewService,
+        config,
+        pixiv_client: PixivAppClient | None = None,
+    ) -> None:
         self.db = db
         self.importer = importer
         self.reviewer = reviewer
         self.config = config
+        self.pixiv_client = pixiv_client
         self.tag_cleaner = TagCleaner(config)
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._queued_ids: set[int] = set()
@@ -81,6 +91,33 @@ class CrawlService:
         await self._enqueue_job(job_id)
         return job_id
 
+    async def submit_job_once(
+        self,
+        platform: str,
+        source_url: str,
+        tags: list[str],
+        *,
+        include_tags: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        match_mode: str = "exact",
+    ) -> tuple[int, bool]:
+        normalized_platform = CrawlAdapterFactory.normalize_platform(platform)
+        if not CrawlAdapterFactory.supports(normalized_platform):
+            raise ValueError(f"暂不支持的平台：{platform}")
+        if self.db.is_rejected_source_post_url(source_url, platform=normalized_platform):
+            raise ValueError(f"该来源已被人工拒绝，已跳过：{source_url}")
+        job_id, created = self.db.get_or_create_crawl_job(
+            normalized_platform,
+            source_url,
+            tags,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            match_mode=match_mode,
+        )
+        if created:
+            await self._enqueue_job(job_id)
+        return job_id, created
+
     async def retry_job(self, job_id: int) -> tuple[bool, str]:
         row = self.db.get_crawl_job(job_id)
         if not row:
@@ -133,7 +170,11 @@ class CrawlService:
             platform=platform,
         )
         match_mode = str(row["tag_match_mode"] or "exact").strip().lower() or "exact"
-        adapter = CrawlAdapterFactory.create(platform, config=self.config)
+        adapter = CrawlAdapterFactory.create(
+            platform,
+            config=self.config,
+            pixiv_client=self.pixiv_client,
+        )
         max_candidates = max(1, int(self.config.get("crawler_max_candidates", 6) or 6))
         timeout_seconds = max(5, int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20))
         retry_times = max(1, int(self.config.get("platform_retry_times", 2) or 2))

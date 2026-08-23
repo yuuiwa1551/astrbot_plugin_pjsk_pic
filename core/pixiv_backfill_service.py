@@ -9,6 +9,7 @@ from astrbot.api import logger
 
 from .db import utcnow_str
 from .matcher import normalize_tag_name
+from .pixiv_app_api import PixivAppClient
 from .pixiv_search_service import PixivSearchHit, PixivSearchService
 from .pixiv_tag_terms import known_pixiv_query_terms
 
@@ -31,11 +32,11 @@ def _pixiv_term_variants(value: str) -> set[str]:
 
 
 class PixivBackfillService:
-    def __init__(self, *, db, crawl_service, config) -> None:
+    def __init__(self, *, db, crawl_service, config, pixiv_client: PixivAppClient | None = None) -> None:
         self.db = db
         self.crawl_service = crawl_service
         self.config = config
-        self.search_service = PixivSearchService(config)
+        self.search_service = PixivSearchService(config, pixiv_client=pixiv_client)
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._queued_ids: set[int] = set()
         self._worker_task: asyncio.Task | None = None
@@ -158,9 +159,6 @@ class PixivBackfillService:
 
         tag_name = str(row["tag_name"] or "").strip()
         query_terms = self._query_terms_from_row(row)
-        include_tags = self._unique_texts(
-            [tag_name, *query_terms, *self._csv_texts(str(row["include_tags_text"] or ""))]
-        )
         exclude_tags = self._csv_texts(str(row["exclude_tags_text"] or ""))
         max_pages = self._bounded_int(row["max_pages"], 20, 1, 100)
         max_results = self._bounded_int(row["max_results"], 200, 1, 2000)
@@ -225,13 +223,10 @@ class PixivBackfillService:
                     if self.db.is_rejected_source_post_url(hit.post_url, platform="pixiv"):
                         stats["skipped_rejected"] += 1
                         continue
-                    if self.db.has_source_post_url(hit.post_url, platform="pixiv") or self.db.has_crawl_job_source_url(
-                        hit.post_url,
-                        platform="pixiv",
-                    ):
+                    if self.db.has_source_post_url(hit.post_url, platform="pixiv"):
                         stats["skipped_existing"] += 1
                         continue
-                    await self.crawl_service.submit_job(
+                    _, created = await self.crawl_service.submit_job_once(
                         "pixiv",
                         hit.post_url,
                         [tag_name],
@@ -239,7 +234,10 @@ class PixivBackfillService:
                         exclude_tags=exclude_tags,
                         match_mode="exact",
                     )
-                    stats["queued"] += 1
+                    if created:
+                        stats["queued"] += 1
+                    else:
+                        stats["skipped_existing"] += 1
                 self.db.update_pixiv_backfill_task(task_id, **stats)
                 if stats["scanned"] >= max_results or stats["queued"] >= max_new_jobs:
                     break

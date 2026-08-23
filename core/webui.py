@@ -11,6 +11,7 @@ from astrbot.api import logger
 from .crawl_tag_rules import parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
 from .matcher import normalize_tag_name
+from .pixiv_app_api import PixivAppClient
 from .pixiv_backfill_service import PixivBackfillService
 from .pixiv_search_service import PixivSearchService
 from .pixiv_tag_terms import known_pixiv_query_terms as shared_known_pixiv_query_terms
@@ -1837,6 +1838,7 @@ class GalleryWebUI:
         crawl_service,
         *,
         pixiv_backfill_service: PixivBackfillService | None = None,
+        pixiv_client: PixivAppClient | None = None,
         context=None,
         config=None,
     ) -> None:
@@ -1846,9 +1848,11 @@ class GalleryWebUI:
             db=db,
             crawl_service=crawl_service,
             config=config if config is not None else getattr(crawl_service, "config", {}),
+            pixiv_client=pixiv_client,
         )
         self.context = context
         self.config = config if config is not None else getattr(crawl_service, "config", {})
+        self.pixiv_client = pixiv_client or PixivAppClient(self.config)
         self.host = "0.0.0.0"
         self.port = 9099
         self.access_token = ""
@@ -2503,7 +2507,7 @@ class GalleryWebUI:
             canonical_name = ""
             query_terms = [tag_text]
         query_terms = self._dedupe_texts(query_terms)[:5]
-        search_service = PixivSearchService(self.config)
+        search_service = PixivSearchService(self.config, pixiv_client=self.pixiv_client)
         timeout_seconds = _bounded_int(
             self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)),
             20,

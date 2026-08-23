@@ -22,6 +22,7 @@ from .core import (
     ImageIndexDB,
     ImportedImageService,
     LibraryIndexer,
+    PixivAppClient,
     PixivBackfillService,
     QQReviewSession,
     QQReviewSessionService,
@@ -48,6 +49,7 @@ class PJSKPicPlugin(Star):
         self.config = config
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_pjsk_pic")
         self.db = ImageIndexDB(self.data_dir / "image_index.db")
+        self.pixiv_client = PixivAppClient(config)
         self.indexer = LibraryIndexer(self.db)
         self.importer = ImportedImageService(
             self.db,
@@ -62,16 +64,19 @@ class PJSKPicPlugin(Star):
             importer=self.importer,
             reviewer=self.reviewer,
             config=config,
+            pixiv_client=self.pixiv_client,
         )
         self.auto_crawl_service = AutoCrawlService(
             db=self.db,
             crawl_service=self.crawl_service,
             config=config,
+            pixiv_client=self.pixiv_client,
         )
         self.pixiv_backfill_service = PixivBackfillService(
             db=self.db,
             crawl_service=self.crawl_service,
             config=config,
+            pixiv_client=self.pixiv_client,
         )
         self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
@@ -80,6 +85,7 @@ class PJSKPicPlugin(Star):
             self.db,
             self.crawl_service,
             pixiv_backfill_service=self.pixiv_backfill_service,
+            pixiv_client=self.pixiv_client,
             context=context,
             config=config,
         )
@@ -114,6 +120,7 @@ class PJSKPicPlugin(Star):
         await self.auto_crawl_service.stop()
         await self.pixiv_backfill_service.stop()
         await self.crawl_service.stop()
+        self.pixiv_client.close()
 
     def _library_root(self) -> Path:
         configured = str(self.config.get("library_root", "") or "").strip()
@@ -715,7 +722,7 @@ class PJSKPicPlugin(Star):
             f"当前路径：{image.get('file_path') or '-'}\n"
             f"tag：{tag_text}\n"
             f"来源：\n" + "\n".join(source_lines) + "\n"
-            f"文件位置：\n" + "\n".join(location_lines)
+            "文件位置：\n" + "\n".join(location_lines)
         )
 
     def _trash_root(self) -> Path:
@@ -1421,6 +1428,7 @@ class PJSKPicPlugin(Star):
     async def auto_crawl_status(self, event: AstrMessageEvent):
         stats = self.db.get_stats()
         rows = self.db.list_crawl_subscriptions(platform="pixiv", enabled_only=True, limit=200)
+        discovery_stats = self.db.count_crawl_discoveries_by_status(platform="pixiv")
         yield event.plain_result(
             "Pixiv 自动采集状态：\n"
             f"已启用：{'是' if self.auto_crawl_service.enabled() else '否'}\n"
@@ -1429,6 +1437,7 @@ class PJSKPicPlugin(Star):
             f"检索词后缀：{self.config.get('pixiv_auto_crawl_query_suffix', 'user') or 'user'}\n"
             f"轮询间隔：{self.auto_crawl_service.interval_minutes()} 分钟\n"
             f"自动订阅数：{len(rows)} / 统计 {stats['crawl_subscriptions']}\n"
+            f"待提交发现：{discovery_stats.get('pending', 0)}\n"
             f"单轮最多新任务：{self.auto_crawl_service.max_new_jobs_per_cycle()}\n"
             f"每个 tag 最多检查：{self.auto_crawl_service.max_results_per_tag()} 条结果"
         )
@@ -1463,8 +1472,10 @@ class PJSKPicPlugin(Star):
         yield event.plain_result(
             "Pixiv 自动采集执行完成：\n"
             f"订阅 {summary['subscriptions']} 个，检查 {summary['checked']} 个，"
-            f"命中过滤 {summary['matched']} 个，入队 {summary['queued']} 个，"
+            f"命中过滤 {summary['matched']} 个，新发现 {summary['discovered']} 个，"
+            f"入队 {summary['queued']} 个，"
             f"已存在跳过 {summary['skipped_existing']} 个，"
+            f"已拒绝跳过 {summary['skipped_rejected']} 个，"
             f"过滤跳过 {summary['skipped_filtered']} 个，错误 {summary['errors']} 个。"
         )
 

@@ -11,6 +11,7 @@ from .pixiv_search_service import PixivSearchHit, PixivSearchService
 from .qq_review_service import QQReviewSession, QQReviewSessionService
 from .models import CrawlCandidate, ImportedImage, MatchResult, ReviewDecision
 from .phash import compute_image_phash, hamming_distance
+from .pixiv_app_api import PixivAppClient
 from .review_service import ReviewService
 from .submission_notify_service import SubmissionNotifyService
 from .submission_service import SubmissionService
@@ -37,6 +38,7 @@ __all__ = [
     "hamming_distance",
     "normalize_tag_name",
     "PixivBackfillService",
+    "PixivAppClient",
     "PixivSearchHit",
     "PixivSearchService",
     "QQReviewSession",

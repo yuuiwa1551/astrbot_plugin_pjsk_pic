@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .adapters import BaseCrawlAdapter, PixivAdapter, XAdapter, XiaohongshuAdapter
+from .pixiv_app_api import PixivAppClient
 
 
 class GenericCrawlAdapter(BaseCrawlAdapter):
@@ -22,10 +23,16 @@ class CrawlAdapterFactory:
         return cls.normalize_platform(platform) in cls.SUPPORTED_PLATFORMS
 
     @classmethod
-    def create(cls, platform: str, config: dict | None = None) -> BaseCrawlAdapter:
+    def create(
+        cls,
+        platform: str,
+        config: dict | None = None,
+        *,
+        pixiv_client: PixivAppClient | None = None,
+    ) -> BaseCrawlAdapter:
         normalized = cls.normalize_platform(platform)
         if normalized == "pixiv":
-            return PixivAdapter(config=config)
+            return PixivAdapter(config=config, pixiv_client=pixiv_client)
         if normalized == "x":
             return XAdapter(config=config)
         if normalized == "xiaohongshu":

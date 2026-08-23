@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from .pixiv_app_api import PixivAppAPIError, extract_offset_from_next_url, search_illusts
+from .pixiv_app_api import PixivAppAPIError, PixivAppClient, extract_offset_from_next_url
 from .pixiv_tag_safety import append_pixiv_safety_tags
 
 
@@ -25,11 +25,12 @@ class PixivSearchPage:
 
 
 class PixivSearchService:
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, pixiv_client: PixivAppClient | None = None) -> None:
         self.config = config
+        self.pixiv_client = pixiv_client or PixivAppClient(config)
 
     def refresh_token(self) -> str:
-        return str(self.config.get("pixiv_refresh_token", "") or "").strip()
+        return self.pixiv_client.refresh_token()
 
     def query_suffix(self) -> str:
         return str(self.config.get("pixiv_auto_crawl_query_suffix", "user") or "user").strip()
@@ -81,9 +82,8 @@ class PixivSearchService:
         if not refresh_token:
             raise PixivAppAPIError("未配置 Pixiv refresh token")
 
-        payload = search_illusts(
+        payload = self.pixiv_client.search_illusts(
             self.build_query(tag_name),
-            refresh_token=refresh_token,
             search_target="partial_match_for_tags",
             sort="date_desc",
             search_ai_type=0,
@@ -116,9 +116,8 @@ class PixivSearchService:
         wanted = max(1, int(max_results or 1))
 
         while remaining_pages > 0 and len(results) < wanted:
-            payload = search_illusts(
+            payload = self.pixiv_client.search_illusts(
                 query,
-                refresh_token=refresh_token,
                 search_target="partial_match_for_tags",
                 sort="date_desc",
                 search_ai_type=0,

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import re
-import urllib.parse
 
 from .common import BaseCrawlAdapter
 from ..models import CrawlCandidate
-from ..pixiv_app_api import PixivAppAPIError, fetch_illust_detail
+from ..pixiv_app_api import PixivAppAPIError, PixivAppClient
 from ..pixiv_tag_safety import append_pixiv_safety_tags
 
 PIXIV_ID_PATTERN = re.compile(r"(?:artworks/|illust_id=)(\d+)")
@@ -14,8 +13,9 @@ PIXIV_IMAGE_PATTERN = re.compile(r"https://i\.pximg\.net/[^\s\"'<>\\]+")
 
 
 class PixivAdapter(BaseCrawlAdapter):
-    def __init__(self, config: dict | None = None) -> None:
+    def __init__(self, config: dict | None = None, *, pixiv_client: PixivAppClient | None = None) -> None:
         super().__init__("pixiv", config=config)
+        self.pixiv_client = pixiv_client or PixivAppClient(self.config)
 
     async def fetch_candidates(self, source_url: str, *, max_candidates: int = 8, timeout_seconds: int = 20) -> list[CrawlCandidate]:
         source_uid = self.extract_source_uid(source_url, "")
@@ -93,9 +93,8 @@ class PixivAdapter(BaseCrawlAdapter):
         timeout_seconds: int,
     ) -> list[CrawlCandidate]:
         try:
-            illust = fetch_illust_detail(
+            illust = self.pixiv_client.fetch_illust_detail(
                 illust_id,
-                refresh_token=self.refresh_token(),
                 timeout_seconds=timeout_seconds,
             )
         except PixivAppAPIError as exc:
