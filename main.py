@@ -31,6 +31,7 @@ from .core import (
     extract_query_from_text,
     parse_crawl_rule_text,
 )
+from .core.command_compat import expose_group_subcommands_at_root
 from .core.webui import GalleryWebUI
 
 
@@ -2010,6 +2011,7 @@ class PJSKPicPlugin(Star):
         return "\n".join(
             [
                 "PJSK 图库常用命令：",
+                "管理子命令可省略 pp，例如 .统计；原 .pp 统计 仍可使用。",
                 "发图：看看初音未来、来张 miku、看看id123",
                 "投稿：.tg <tag>，可用 .pp 帮助 投稿 查看 alias 写法",
                 "群友审图：.pp 随机审核，可用 .pp 审图帮助 查看完整流程",
@@ -2019,3 +2021,6 @@ class PJSKPicPlugin(Star):
                 "完整维护操作建议优先使用 WebUI。",
             ]
         )
+
+
+DIRECT_GALLERY_COMMANDS = expose_group_subcommands_at_root(PJSKPicPlugin.pjsk_gallery)
