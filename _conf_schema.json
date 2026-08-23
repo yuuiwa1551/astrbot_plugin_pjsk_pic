@@ -201,7 +201,7 @@
   },
   "pixiv_auto_crawl_character_only": {
     "type": "bool",
-    "description": "自动抓取 Pixiv 时是否仅处理角色标签（is_character=1）。",
+    "description": "自动抓取 Pixiv 时是否仅处理启用状态的角色主 tag（tag_type=character 且 status=active）；关闭时也不会处理待确认或归档 tag。",
     "default": true
   },
   "pixiv_auto_crawl_interval_minutes": {

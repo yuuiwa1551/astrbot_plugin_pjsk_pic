@@ -29,8 +29,13 @@ from .core import (
     ReviewService,
     SubmissionNotifyService,
     SubmissionService,
+    TagGovernanceService,
     extract_query_from_text,
+    normalize_tag_status,
+    normalize_tag_type,
     parse_crawl_rule_text,
+    tag_status_label,
+    tag_type_label,
 )
 from .core.command_compat import expose_group_subcommands_at_root
 from .core.webui import GalleryWebUI
@@ -79,6 +84,7 @@ class PJSKPicPlugin(Star):
             pixiv_client=self.pixiv_client,
         )
         self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
+        self.tag_governance_service = TagGovernanceService(self.db)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
         self.qq_review_service = QQReviewSessionService(self.db, config)
         self.webui = GalleryWebUI(
@@ -820,6 +826,12 @@ class PJSKPicPlugin(Star):
                 await event.send(MessageChain().message(msg))
             return "tag_not_found"
 
+        matched_tag_row = self.db.get_tag_row_by_id(int(match.tag_id or 0))
+        if matched_tag_row and str(matched_tag_row["status"] or "active") != "active":
+            if not silent_on_tool:
+                await event.send(MessageChain().message(f"“{match.tag_name}”这个 tag 当前未启用。"))
+            return "tag_inactive"
+
         send_count = max(1, min(int(count or 1), 3))
         sent = 0
         queue = self._recent_queue(getattr(event, "unified_msg_origin", "default"))
@@ -1036,7 +1048,8 @@ class PJSKPicPlugin(Star):
             yield event.plain_result(f"没有找到 tag：{tag_name}")
             return
         alias_text = "、".join(aliases) if aliases else "无"
-        character_text = "是" if row and int(row["is_character"]) == 1 else "否"
+        type_text = tag_type_label(str(row["tag_type"] or "other")) if row else "其他"
+        status_text = tag_status_label(str(row["status"] or "active")) if row else "启用"
         lines = []
         if match_type == "exact_alias":
             lines.append(f"输入“{tag_name}”命中 alias，已归并到主 tag。")
@@ -1044,7 +1057,8 @@ class PJSKPicPlugin(Star):
             f"tag：{canonical_tag_name}\n"
             f"可发送图片数：{count}\n"
             f"全部图片数：{all_count}\n"
-            f"角色 tag：{character_text}\n"
+            f"类型：{type_text}\n"
+            f"状态：{status_text}\n"
             f"别名：{alias_text}"
         )
         yield event.plain_result("\n".join(lines))
@@ -1151,14 +1165,15 @@ class PJSKPicPlugin(Star):
         if character_only is True:
             header = "当前角色主 tag："
         elif character_only is False:
-            header = "当前普通 tag（建议清理或先合并）："
+            header = "当前非角色主 tag："
         else:
             header = "当前全部主 tag："
         lines = [header]
         for row in rows[:60]:
-            state = "角色" if int(row["is_character"] or 0) == 1 else "普通"
+            type_text = tag_type_label(str(row["tag_type"] or "other"))
+            status_text = tag_status_label(str(row["status"] or "active"))
             lines.append(
-                f"- {row['name']}（{state}，图 {int(row['image_count'] or 0)}，alias {int(row['alias_count'] or 0)}）"
+                f"- {row['name']}（{type_text}/{status_text}，图 {int(row['image_count'] or 0)}，alias {int(row['alias_count'] or 0)}）"
             )
         if len(rows) > 60:
             lines.append(f"其余 {len(rows) - 60} 个未展开，可加关键词继续筛。")
@@ -1240,18 +1255,108 @@ class PJSKPicPlugin(Star):
             self._sync_auto_crawl_subscriptions_safe()
         yield event.plain_result(message if ok else f"设置失败：{message}")
 
+    @pjsk_gallery.command("tag规范报告")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def show_tag_governance_report(self, event: AstrMessageEvent):
+        report = await asyncio.to_thread(self.tag_governance_service.format_report)
+        yield event.plain_result(report)
+
+    @pjsk_gallery.command("tag提案")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_tag_proposals_command(self, event: AstrMessageEvent, limit: int = 10):
+        resolved_limit = max(1, min(30, int(limit or 10)))
+        rows = self.db.list_tag_proposals(status="pending", limit=resolved_limit)
+        if not rows:
+            yield event.plain_result("当前没有待处理的 tag 提案。")
+            return
+        lines = [f"待处理 tag 提案（{len(rows)} 条）："]
+        lines.extend(self.tag_governance_service.format_proposal(row) for row in rows)
+        lines.append("通过：.pp tag提案通过 <id> <角色|CP|主题|其他>")
+        lines.append("归并：.pp tag提案归并 <id> <现有tag>")
+        lines.append("拒绝：.pp tag提案拒绝 <id> [原因]")
+        yield event.plain_result("\n".join(lines))
+
+    @pjsk_gallery.command("tag提案通过")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def approve_tag_proposal_command(self, event: AstrMessageEvent, proposal_id: int, tag_type: str):
+        resolved_type = normalize_tag_type(tag_type)
+        if resolved_type is None:
+            yield event.plain_result("类型无效，可用：角色、CP、主题、其他。")
+            return
+        ok, summary = self.db.approve_tag_proposal(int(proposal_id), resolved_type)
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
+        message = str(summary.get("message") or "tag 提案处理失败。")
+        if ok:
+            message += f"\n类型：{tag_type_label(resolved_type)}；状态：启用。"
+        yield event.plain_result(message if ok else f"处理失败：{message}")
+
+    @pjsk_gallery.command("tag提案归并")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def merge_tag_proposal_command(self, event: AstrMessageEvent, proposal_id: int, target_tag_name: str):
+        ok, summary = self.db.merge_tag_proposal(int(proposal_id), target_tag_name)
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
+        message = str(summary.get("message") or "tag 提案归并失败。")
+        if ok and bool(summary.get("alias_added")):
+            message += "\n提案名已添加为该主 tag 的 alias。"
+        yield event.plain_result(message if ok else f"归并失败：{message}")
+
+    @pjsk_gallery.command("tag提案拒绝")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def reject_tag_proposal_command(self, event: AstrMessageEvent, proposal_id: int, reason: str = ""):
+        ok, message = self.db.reject_tag_proposal(int(proposal_id), reason)
+        yield event.plain_result(message if ok else f"拒绝失败：{message}")
+
+    @pjsk_gallery.command("tag类型")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def set_tag_type_command(self, event: AstrMessageEvent, tag_name: str, tag_type: str):
+        canonical_tag_name, _ = self._resolve_existing_tag_name(tag_name, allow_fuzzy=False)
+        if not canonical_tag_name:
+            yield event.plain_result(f"设置失败：没有找到 tag 或 alias：{tag_name}")
+            return
+        resolved_type = normalize_tag_type(tag_type)
+        if resolved_type is None:
+            yield event.plain_result("类型无效，可用：角色、CP、主题、其他。")
+            return
+        ok, message = self.db.set_tag_type(canonical_tag_name, resolved_type)
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
+            message = f"已将 {canonical_tag_name} 类型设置为：{tag_type_label(resolved_type)}。"
+        yield event.plain_result(message if ok else f"设置失败：{message}")
+
+    @pjsk_gallery.command("tag状态")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def set_tag_status_command(self, event: AstrMessageEvent, tag_name: str, status: str):
+        canonical_tag_name, _ = self._resolve_existing_tag_name(tag_name, allow_fuzzy=False)
+        if not canonical_tag_name:
+            yield event.plain_result(f"设置失败：没有找到 tag 或 alias：{tag_name}")
+            return
+        resolved_status = normalize_tag_status(status)
+        if resolved_status is None:
+            yield event.plain_result("状态无效，可用：启用、待确认、归档。")
+            return
+        ok, message = self.db.set_tag_status(canonical_tag_name, resolved_status)
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
+            message = f"已将 {canonical_tag_name} 状态设置为：{tag_status_label(resolved_status)}。"
+        yield event.plain_result(message if ok else f"设置失败：{message}")
+
     @pjsk_gallery.command("tag清理预览")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def preview_tag_cleanup(self, event: AstrMessageEvent):
         rows = self.db.preview_non_character_tag_cleanup(limit=200)
         if not rows:
-            yield event.plain_result("当前没有普通 tag 需要清理。")
+            yield event.plain_result("当前没有满足安全条件的其他 tag。")
             return
         lines = [
-            "以下普通 tag 清理后会被删除；如需保留，请先用 .pjsk图库 tag合并 归并到角色主 tag：",
+            "以下其他 tag 没有已通过图片或治理依赖，可安全移除其拒绝关联；受保护项不会出现：",
         ]
         for row in rows[:60]:
-            lines.append(f"- {row['name']}（图 {int(row['image_count'] or 0)}，alias {int(row['alias_count'] or 0)}）")
+            lines.append(
+                f"- {row['name']}（关联 {int(row['image_link_count'] or 0)}，"
+                f"已通过 {int(row['approved_count'] or 0)}，alias {int(row['alias_count'] or 0)}）"
+            )
         if len(rows) > 60:
             lines.append(f"其余 {len(rows) - 60} 个未展开。")
         lines.append("执行命令：.pjsk图库 tag清理执行 确认")
@@ -1261,17 +1366,21 @@ class PJSKPicPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def execute_tag_cleanup(self, event: AstrMessageEvent, confirm_text: str = ""):
         if str(confirm_text or "").strip().lower() not in {"确认", "confirm", "yes", "y"}:
-            yield event.plain_result("该操作会删除所有普通 tag 及其图片关联。确认执行：.pjsk图库 tag清理执行 确认")
+            yield event.plain_result(
+                "该操作只删除当前安全候选；有已通过图片、开放审核、alias、平台词、订阅、提案或身份候选的 tag 会保留。"
+                "确认执行：.pjsk图库 tag清理执行 确认"
+            )
             return
         summary = self.db.cleanup_non_character_tags()
         self._sync_auto_crawl_subscriptions_safe()
         yield event.plain_result(
-            "普通 tag 清理完成：\n"
+            "安全 tag 清理完成：\n"
             f"删除 tag {summary['tags_removed']} 个，"
             f"图片关联 {summary['image_links_removed']} 条，"
             f"审核任务 {summary['review_tasks_removed']} 条，"
             f"alias {summary['aliases_removed']} 条，"
-            f"自动订阅 {summary['subscriptions_removed']} 条。"
+            f"自动订阅 {summary['subscriptions_removed']} 条；"
+            f"受保护 tag {summary['protected_tags']} 个未处理。"
         )
 
     @pjsk_gallery.command("采集添加")
@@ -1977,6 +2086,7 @@ class PJSKPicPlugin(Star):
                     ".投稿 <tag> 别名 <alias1,alias2>：投稿时顺手补 alias",
                     ".tg <tag> alias <alias1,alias2>：同上",
                     "也可以先回复一条带图消息，再发送投稿命令。",
+                    "陌生 tag 会登记为提案，不会自动建主 tag 或导入图片；管理员确认后需重新投稿。",
                 ]
             )
         if topic == "tag":
@@ -1989,6 +2099,12 @@ class PJSKPicPlugin(Star):
                     ".pp 别名删除 <tag> <alias1,alias2>",
                     ".pp tag合并 <目标tag> <来源tag1,来源tag2>",
                     ".pp 主tag切换 <旧tag或alias> <新主tag>",
+                    ".pp tag规范报告；.pp tag提案 [数量]",
+                    ".pp tag提案通过 <id> <角色|CP|主题|其他>",
+                    ".pp tag提案归并 <id> <现有tag>；.pp tag提案拒绝 <id> [原因]",
+                    ".pp tag类型 <tag> <角色|CP|主题|其他>",
+                    ".pp tag状态 <tag> <启用|待确认|归档>",
+                    ".pp tag清理预览；.pp tag清理执行 确认（仅安全候选）",
                 ]
             )
         if topic == "review":
@@ -2029,7 +2145,7 @@ class PJSKPicPlugin(Star):
                 "管理：.pp 统计、.pp 查看 <tag>、.pp 看图 <image_id>",
                 "面板：.pp 面板地址",
                 "分组帮助：.pp 帮助 投稿、tag、审核、采集",
-                "完整维护操作建议优先使用 WebUI。",
+                "tag 规范和提案审核可直接使用 QQ 管理指令完成。",
             ]
         )
 

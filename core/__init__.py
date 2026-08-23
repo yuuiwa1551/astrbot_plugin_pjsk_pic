@@ -16,6 +16,13 @@ from .review_service import ReviewService
 from .submission_notify_service import SubmissionNotifyService
 from .submission_service import SubmissionService
 from .tag_cleaner import TagCleaner
+from .tag_governance_service import TagGovernanceService
+from .tag_policy import (
+    normalize_tag_status,
+    normalize_tag_type,
+    tag_status_label,
+    tag_type_label,
+)
 
 __all__ = [
     "AutoCrawlService",
@@ -24,6 +31,7 @@ __all__ = [
     "CrawlService",
     "CrawlTagRules",
     "TagCleaner",
+    "TagGovernanceService",
     "ImageIndexDB",
     "ImportedImage",
     "ImportedImageService",
@@ -45,4 +53,8 @@ __all__ = [
     "QQReviewSessionService",
     "parse_crawl_rule_text",
     "parse_tag_csv",
+    "normalize_tag_status",
+    "normalize_tag_type",
+    "tag_status_label",
+    "tag_type_label",
 ]

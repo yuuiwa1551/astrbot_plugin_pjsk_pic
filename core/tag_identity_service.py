@@ -129,9 +129,9 @@ class TagIdentityService:
             if left_name_chars and right_name_chars
             else 0.0
         )
-        if shared_chars and shared_ratio >= 0.4:
-            score += 28 + min(35, int(shared_ratio * 50)) + min(10, len(shared_chars) * 3)
-            reasons.append(f"角色名 CJK 重合约 {shared_ratio:.0%}：{''.join(shared_chars)}")
+        if len(shared_chars) >= 2 and shared_ratio >= 0.75:
+            score += 55 + min(25, int((shared_ratio - 0.75) * 100))
+            reasons.append(f"角色名 CJK 高重合（{shared_ratio:.0%}）：{''.join(shared_chars)}")
 
         matched_terms: list[dict[str, Any]] = []
         common_norms = set(left_terms) & set(right_terms)
@@ -150,23 +150,23 @@ class TagIdentityService:
                 }
             )
             if left_payload["source"] == "name" or right_payload["source"] == "name":
-                score += 40
+                score += 55
             elif "platform" in {left_payload["source"], right_payload["source"]}:
-                score += 28
+                score += 45
             else:
-                score += 18
+                score += 35
             if len(matched_terms) >= 8:
                 break
         if matched_terms:
-            reasons.append("Pixiv 平台词 / 历史词存在交叉命中")
+            reasons.append("人工 alias / Pixiv 平台词存在明确交叉命中")
 
         cross_hits = self._cross_name_hits(left, right, left_terms, right_terms)
         if cross_hits:
             matched_terms.extend(cross_hits)
-            score += min(50, 25 * len(cross_hits))
-            reasons.append("一侧的 alias / Pixiv 词命中另一侧主 tag")
+            score += min(70, 55 * len(cross_hits))
+            reasons.append("一侧的人工 alias / Pixiv 平台词精确命中另一侧主 tag")
 
-        if score < 40:
+        if score < 55:
             return None
 
         source, target = self._orient_pair(left, right)
@@ -196,42 +196,21 @@ class TagIdentityService:
 
     def _collect_terms(self, entry: dict[str, Any]) -> dict[str, dict[str, str]]:
         terms: dict[str, dict[str, str]] = {}
-        anchor_norms: set[str] = set()
 
-        def push(value: str, source: str, *, anchor: bool = False) -> None:
+        def push(value: str, source: str) -> None:
             text = str(value or "").strip()
             normalized = normalize_tag_name(text)
             if not text or not normalized or self._is_generic_term(normalized):
                 return
-            if anchor:
-                anchor_norms.add(normalized)
             terms.setdefault(normalized, {"text": text, "source": source})
 
-        push(str(entry.get("name", "")), "name", anchor=True)
+        push(str(entry.get("name", "")), "name")
         for alias in entry.get("aliases") or []:
-            push(str(alias), "alias", anchor=True)
+            push(str(alias), "alias")
         for item in entry.get("platform_terms") or []:
             if isinstance(item, dict):
-                push(str(item.get("term", "")), "platform", anchor=True)
-        for item in entry.get("history_terms") or []:
-            if isinstance(item, dict):
-                history_term = str(item.get("term", ""))
-                if self._history_term_resembles_entry(history_term, entry, anchor_norms):
-                    push(history_term, "history")
+                push(str(item.get("term", "")), "platform")
         return terms
-
-    def _history_term_resembles_entry(self, term: str, entry: dict[str, Any], anchor_norms: set[str]) -> bool:
-        text = str(term or "").strip()
-        normalized = normalize_tag_name(text)
-        if not text or not normalized or self._is_generic_term(normalized):
-            return False
-        if normalized in anchor_norms:
-            return True
-        name_chars = self._cjk_chars(str(entry.get("name", "")))
-        term_chars = self._cjk_chars(text)
-        if len(name_chars & term_chars) >= 2:
-            return True
-        return False
 
     @staticmethod
     def _cjk_chars(text: str) -> set[str]:
@@ -304,14 +283,6 @@ class TagIdentityService:
                     "confidence": float(item.get("confidence", 0) or 0),
                 }
                 for item in (entry.get("platform_terms") or [])[:20]
-                if isinstance(item, dict)
-            ],
-            "history_terms": [
-                {
-                    "term": str(item.get("term", "")),
-                    "count": int(item.get("count", 0) or 0),
-                }
-                for item in (entry.get("history_terms") or [])[:20]
                 if isinstance(item, dict)
             ],
         }

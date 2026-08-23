@@ -13,6 +13,7 @@ from typing import Any, Iterable, Iterator
 from .matcher import normalize_tag_name
 from .models import APPROVED_STATUSES, MatchResult
 from .phash import hamming_distance
+from .tag_policy import TAG_STATUSES, TAG_TYPES, normalize_tag_status, normalize_tag_type
 
 IMAGE_TAG_STATUS_PRIORITY = {
     "manual_approved": 5,
@@ -102,6 +103,8 @@ class ImageIndexDB:
                     name TEXT NOT NULL UNIQUE,
                     normalized_name TEXT NOT NULL UNIQUE,
                     is_character INTEGER DEFAULT 0,
+                    tag_type TEXT NOT NULL DEFAULT 'other',
+                    status TEXT NOT NULL DEFAULT 'active',
                     created_at TEXT NOT NULL
                 );
 
@@ -187,6 +190,25 @@ class ImageIndexDB:
                     updated_at TEXT NOT NULL,
                     UNIQUE(platform, normalized_tag),
                     FOREIGN KEY(tag_id) REFERENCES tags(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS tag_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proposed_name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    aliases_json TEXT DEFAULT '[]',
+                    submitter_id TEXT DEFAULT '',
+                    submitter_name TEXT DEFAULT '',
+                    platform_name TEXT DEFAULT '',
+                    session_id TEXT DEFAULT '',
+                    message_id TEXT DEFAULT '',
+                    occurrence_count INTEGER DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    resolved_tag_id INTEGER DEFAULT 0,
+                    reason TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(resolved_tag_id) REFERENCES tags(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS crawl_subscription_terms (
@@ -350,6 +372,8 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_tag_merge_identity_candidates_status ON tag_merge_identity_candidates(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_image_similarity_ignores_low ON image_similarity_ignores(image_id_low);
                 CREATE INDEX IF NOT EXISTS idx_image_similarity_ignores_high ON image_similarity_ignores(image_id_high);
+                CREATE INDEX IF NOT EXISTS idx_tag_proposals_status ON tag_proposals(status, updated_at, id);
+                CREATE INDEX IF NOT EXISTS idx_tag_proposals_normalized ON tag_proposals(normalized_name, status);
                 """
             )
             try:
@@ -357,8 +381,13 @@ class ImageIndexDB:
             except sqlite3.OperationalError:
                 pass
 
+            tag_columns_before_migration = self._table_columns(conn, 'tags')
+            had_tag_type = 'tag_type' in tag_columns_before_migration
+
             self._ensure_column(conn, 'images', 'phash', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'tags', 'is_character', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'tags', 'tag_type', "TEXT NOT NULL DEFAULT 'other'")
+            self._ensure_column(conn, 'tags', 'status', "TEXT NOT NULL DEFAULT 'active'")
             self._ensure_column(conn, 'image_tags', 'score', 'REAL DEFAULT 1.0')
             self._ensure_column(conn, 'image_tags', 'review_status', "TEXT DEFAULT 'approved'")
             self._ensure_column(conn, 'image_tags', 'review_reason', "TEXT DEFAULT ''")
@@ -374,6 +403,23 @@ class ImageIndexDB:
             self._ensure_column(conn, 'crawl_subscriptions', 'last_checked_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscriptions', 'last_success_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscriptions', 'last_error', "TEXT DEFAULT ''")
+            if not had_tag_type:
+                conn.execute(
+                    "UPDATE tags SET tag_type = CASE WHEN is_character = 1 THEN 'character' ELSE 'other' END"
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE tags
+                    SET tag_type = CASE WHEN is_character = 1 THEN 'character' ELSE 'other' END
+                    WHERE tag_type IS NULL OR tag_type = '' OR tag_type NOT IN ('character', 'pairing', 'theme', 'other')
+                    """
+                )
+            conn.execute(
+                "UPDATE tags SET status = 'active' WHERE status IS NULL OR status = '' OR status NOT IN ('active', 'pending', 'archived')"
+            )
+            conn.execute("UPDATE tags SET is_character = CASE WHEN tag_type = 'character' THEN 1 ELSE 0 END")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_governance ON tags(status, tag_type, name)")
             self._ensure_file_locations_initialized(conn)
 
     @staticmethod
@@ -1029,40 +1075,92 @@ class ImageIndexDB:
                 self._sync_image_file_state(conn, image_id)
         return count
 
-    def get_or_create_tag(self, tag_name: str, is_character: bool | None = None) -> int:
+    def get_or_create_tag(
+        self,
+        tag_name: str,
+        is_character: bool | None = None,
+        *,
+        tag_type: str | None = None,
+        status: str | None = None,
+    ) -> int:
         normalized = normalize_tag_name(tag_name)
         if not normalized:
             raise ValueError('tag 不能为空')
+        requested_type = normalize_tag_type(tag_type)
+        if tag_type is not None and requested_type is None:
+            raise ValueError(f'不支持的 tag 类型：{tag_type}')
+        if requested_type is None and is_character is True:
+            requested_type = 'character'
+        requested_status = normalize_tag_status(status)
+        if status is not None and requested_status is None:
+            raise ValueError(f'不支持的 tag 状态：{status}')
         now = utcnow_str()
         with self._lock, self._connect() as conn:
-            row = conn.execute('SELECT id, is_character FROM tags WHERE normalized_name = ?', (normalized,)).fetchone()
+            row = conn.execute('SELECT id, is_character, tag_type, status FROM tags WHERE normalized_name = ?', (normalized,)).fetchone()
             if row:
-                if is_character is True and int(row['is_character']) != 1:
-                    conn.execute('UPDATE tags SET is_character = 1 WHERE id = ?', (row['id'],))
+                updates: list[str] = []
+                params: list[Any] = []
+                if requested_type is not None and str(row['tag_type'] or '') != requested_type:
+                    updates.extend(['tag_type = ?', 'is_character = ?'])
+                    params.extend([requested_type, 1 if requested_type == 'character' else 0])
+                if requested_status is not None and str(row['status'] or '') != requested_status:
+                    updates.append('status = ?')
+                    params.append(requested_status)
+                if updates:
+                    params.append(int(row['id']))
+                    conn.execute(f"UPDATE tags SET {', '.join(updates)} WHERE id = ?", params)
                 return int(row['id'])
+            resolved_type = requested_type or 'other'
+            resolved_status = requested_status or 'active'
             cursor = conn.execute(
-                'INSERT INTO tags(name, normalized_name, is_character, created_at) VALUES(?, ?, ?, ?)',
-                (tag_name.strip(), normalized, 1 if is_character else 0, now),
+                'INSERT INTO tags(name, normalized_name, is_character, tag_type, status, created_at) VALUES(?, ?, ?, ?, ?, ?)',
+                (tag_name.strip(), normalized, 1 if resolved_type == 'character' else 0, resolved_type, resolved_status, now),
             )
             return int(cursor.lastrowid)
 
-    def create_or_get_tag(self, tag_name: str, is_character: bool | None = None) -> tuple[bool, dict[str, Any]]:
+    def create_or_get_tag(
+        self,
+        tag_name: str,
+        is_character: bool | None = None,
+        *,
+        tag_type: str | None = None,
+        status: str | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
         tag_text = str(tag_name or '').strip()
         normalized = normalize_tag_name(tag_text)
         if not tag_text or not normalized:
             return False, {'message': 'tag 不能为空'}
+        requested_type = normalize_tag_type(tag_type)
+        if tag_type is not None and requested_type is None:
+            return False, {'message': f'不支持的 tag 类型：{tag_type}'}
+        if requested_type is None and is_character is True:
+            requested_type = 'character'
+        requested_status = normalize_tag_status(status)
+        if status is not None and requested_status is None:
+            return False, {'message': f'不支持的 tag 状态：{status}'}
         now = utcnow_str()
         with self._lock, self._connect() as conn:
             row = conn.execute('SELECT * FROM tags WHERE normalized_name = ? LIMIT 1', (normalized,)).fetchone()
             created = False
             if row:
-                if is_character is True and int(row['is_character'] or 0) != 1:
-                    conn.execute('UPDATE tags SET is_character = 1 WHERE id = ?', (int(row['id']),))
+                updates: list[str] = []
+                params: list[Any] = []
+                if requested_type is not None and str(row['tag_type'] or '') != requested_type:
+                    updates.extend(['tag_type = ?', 'is_character = ?'])
+                    params.extend([requested_type, 1 if requested_type == 'character' else 0])
+                if requested_status is not None and str(row['status'] or '') != requested_status:
+                    updates.append('status = ?')
+                    params.append(requested_status)
+                if updates:
+                    params.append(int(row['id']))
+                    conn.execute(f"UPDATE tags SET {', '.join(updates)} WHERE id = ?", params)
                     row = conn.execute('SELECT * FROM tags WHERE id = ? LIMIT 1', (int(row['id']),)).fetchone()
             else:
+                resolved_type = requested_type or 'other'
+                resolved_status = requested_status or 'active'
                 cursor = conn.execute(
-                    'INSERT INTO tags(name, normalized_name, is_character, created_at) VALUES(?, ?, ?, ?)',
-                    (tag_text, normalized, 1 if is_character else 0, now),
+                    'INSERT INTO tags(name, normalized_name, is_character, tag_type, status, created_at) VALUES(?, ?, ?, ?, ?, ?)',
+                    (tag_text, normalized, 1 if resolved_type == 'character' else 0, resolved_type, resolved_status, now),
                 )
                 row = conn.execute('SELECT * FROM tags WHERE id = ? LIMIT 1', (int(cursor.lastrowid),)).fetchone()
                 created = True
@@ -1074,18 +1172,47 @@ class ImageIndexDB:
                 'id': int(row['id']),
                 'name': str(row['name']),
                 'is_character': bool(int(row['is_character'] or 0)),
+                'tag_type': str(row['tag_type'] or 'other'),
+                'status': str(row['status'] or 'active'),
             },
             'created': created,
         }
 
     def set_tag_character(self, tag_name: str, is_character: bool) -> tuple[bool, str]:
+        return self.set_tag_type(tag_name, 'character' if is_character else 'other')
+
+    def set_tag_type(self, tag_name: str, tag_type: str) -> tuple[bool, str]:
+        resolved_type = normalize_tag_type(tag_type)
+        if resolved_type is None:
+            return False, f'不支持的 tag 类型：{tag_type}'
         tag_id = self.get_tag_id(tag_name)
         if tag_id is None:
             return False, f'tag 不存在：{tag_name}'
         with self._lock, self._connect() as conn:
-            conn.execute('UPDATE tags SET is_character = ? WHERE id = ?', (1 if is_character else 0, tag_id))
-        state = '角色 tag' if is_character else '普通 tag'
-        return True, f'已将 {tag_name} 标记为：{state}'
+            row = conn.execute('SELECT name FROM tags WHERE id = ? LIMIT 1', (tag_id,)).fetchone()
+            conn.execute(
+                'UPDATE tags SET tag_type = ?, is_character = ? WHERE id = ?',
+                (resolved_type, 1 if resolved_type == 'character' else 0, tag_id),
+            )
+            if resolved_type != 'character':
+                conn.execute('UPDATE crawl_subscriptions SET enabled = 0, updated_at = ? WHERE tag_id = ?', (utcnow_str(), tag_id))
+        canonical_name = str(row['name']) if row else tag_name
+        return True, f'已将 {canonical_name} 类型设置为：{resolved_type}'
+
+    def set_tag_status(self, tag_name: str, status: str) -> tuple[bool, str]:
+        resolved_status = normalize_tag_status(status)
+        if resolved_status is None:
+            return False, f'不支持的 tag 状态：{status}'
+        tag_id = self.get_tag_id(tag_name)
+        if tag_id is None:
+            return False, f'tag 不存在：{tag_name}'
+        with self._lock, self._connect() as conn:
+            row = conn.execute('SELECT name FROM tags WHERE id = ? LIMIT 1', (tag_id,)).fetchone()
+            conn.execute('UPDATE tags SET status = ? WHERE id = ?', (resolved_status, tag_id))
+            if resolved_status != 'active':
+                conn.execute('UPDATE crawl_subscriptions SET enabled = 0, updated_at = ? WHERE tag_id = ?', (utcnow_str(), tag_id))
+        canonical_name = str(row['name']) if row else tag_name
+        return True, f'已将 {canonical_name} 状态设置为：{resolved_status}'
 
     def get_tag_row(self, tag_name: str) -> sqlite3.Row | None:
         normalized = normalize_tag_name(tag_name)
@@ -1095,6 +1222,226 @@ class ImageIndexDB:
     def get_tag_row_by_id(self, tag_id: int) -> sqlite3.Row | None:
         with self._lock, self._connect() as conn:
             return conn.execute('SELECT * FROM tags WHERE id = ?', (tag_id,)).fetchone()
+
+    @staticmethod
+    def _proposal_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        try:
+            aliases = json.loads(row['aliases_json'] or '[]')
+        except Exception:
+            aliases = []
+        if not isinstance(aliases, list):
+            aliases = []
+        return {
+            'id': int(row['id']),
+            'proposed_name': str(row['proposed_name'] or ''),
+            'normalized_name': str(row['normalized_name'] or ''),
+            'aliases': [str(item) for item in aliases if str(item).strip()],
+            'submitter_id': str(row['submitter_id'] or ''),
+            'submitter_name': str(row['submitter_name'] or ''),
+            'platform_name': str(row['platform_name'] or ''),
+            'session_id': str(row['session_id'] or ''),
+            'message_id': str(row['message_id'] or ''),
+            'occurrence_count': int(row['occurrence_count'] or 1),
+            'status': str(row['status'] or 'pending'),
+            'resolved_tag_id': int(row['resolved_tag_id'] or 0),
+            'reason': str(row['reason'] or ''),
+            'created_at': str(row['created_at'] or ''),
+            'updated_at': str(row['updated_at'] or ''),
+        }
+
+    def create_or_increment_tag_proposal(
+        self,
+        proposed_name: str,
+        *,
+        aliases: Iterable[str] = (),
+        submitter_id: str = '',
+        submitter_name: str = '',
+        platform_name: str = '',
+        session_id: str = '',
+        message_id: str = '',
+    ) -> dict[str, Any]:
+        name = str(proposed_name or '').strip()
+        normalized = normalize_tag_name(name)
+        if not name or not normalized:
+            raise ValueError('提案 tag 不能为空')
+        now = utcnow_str()
+        requested_aliases = self._dedupe_terms(aliases)
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM tag_proposals WHERE normalized_name = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+                (normalized,),
+            ).fetchone()
+            if existing:
+                try:
+                    existing_aliases = json.loads(existing['aliases_json'] or '[]')
+                except Exception:
+                    existing_aliases = []
+                merged_aliases = self._dedupe_terms([*(existing_aliases if isinstance(existing_aliases, list) else []), *requested_aliases])
+                conn.execute(
+                    """
+                    UPDATE tag_proposals
+                    SET proposed_name = ?, aliases_json = ?, submitter_id = ?, submitter_name = ?,
+                        platform_name = ?, session_id = ?, message_id = ?,
+                        occurrence_count = occurrence_count + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        name,
+                        json.dumps(merged_aliases, ensure_ascii=False),
+                        str(submitter_id or ''),
+                        str(submitter_name or ''),
+                        str(platform_name or ''),
+                        str(session_id or ''),
+                        str(message_id or ''),
+                        now,
+                        int(existing['id']),
+                    ),
+                )
+                row = conn.execute('SELECT * FROM tag_proposals WHERE id = ?', (int(existing['id']),)).fetchone()
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO tag_proposals(
+                        proposed_name, normalized_name, aliases_json,
+                        submitter_id, submitter_name, platform_name, session_id, message_id,
+                        occurrence_count, status, resolved_tag_id, reason, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', 0, '', ?, ?)
+                    """,
+                    (
+                        name,
+                        normalized,
+                        json.dumps(requested_aliases, ensure_ascii=False),
+                        str(submitter_id or ''),
+                        str(submitter_name or ''),
+                        str(platform_name or ''),
+                        str(session_id or ''),
+                        str(message_id or ''),
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute('SELECT * FROM tag_proposals WHERE id = ?', (int(cursor.lastrowid),)).fetchone()
+        result = self._proposal_row_to_dict(row)
+        if not result:
+            raise RuntimeError('tag 提案记录失败')
+        return result
+
+    def list_tag_proposals(self, *, status: str = 'pending', limit: int = 30) -> list[dict[str, Any]]:
+        normalized_status = str(status or '').strip().lower()
+        if normalized_status not in {'pending', 'approved', 'rejected'}:
+            normalized_status = 'pending'
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                'SELECT * FROM tag_proposals WHERE status = ? ORDER BY updated_at DESC, id DESC LIMIT ?',
+                (normalized_status, max(1, min(200, int(limit or 30)))),
+            ).fetchall()
+        return [item for row in rows if (item := self._proposal_row_to_dict(row)) is not None]
+
+    def get_tag_proposal(self, proposal_id: int) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute('SELECT * FROM tag_proposals WHERE id = ? LIMIT 1', (int(proposal_id),)).fetchone()
+        return self._proposal_row_to_dict(row)
+
+    def approve_tag_proposal(self, proposal_id: int, tag_type: str) -> tuple[bool, dict[str, Any]]:
+        resolved_type = normalize_tag_type(tag_type)
+        if resolved_type is None:
+            return False, {'message': f'不支持的 tag 类型：{tag_type}'}
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            proposal = conn.execute('SELECT * FROM tag_proposals WHERE id = ? LIMIT 1', (int(proposal_id),)).fetchone()
+            if not proposal:
+                return False, {'message': f'tag 提案不存在：#{int(proposal_id)}'}
+            if str(proposal['status'] or '') != 'pending':
+                return False, {'message': f'tag 提案 #{int(proposal_id)} 已处理：{proposal["status"]}'}
+            existing, match_type = self._resolve_tag_exact_conn(conn, str(proposal['proposed_name'] or ''))
+            if existing and match_type == 'exact_alias':
+                return False, {'message': f'提案名已经是 {existing["name"]} 的 alias，请使用 tag提案归并。'}
+            created = False
+            if existing:
+                tag_id = int(existing['id'])
+                conn.execute(
+                    'UPDATE tags SET tag_type = ?, is_character = ?, status = ? WHERE id = ?',
+                    (resolved_type, 1 if resolved_type == 'character' else 0, 'active', tag_id),
+                )
+                tag_name = str(existing['name'])
+            else:
+                cursor = conn.execute(
+                    'INSERT INTO tags(name, normalized_name, is_character, tag_type, status, created_at) VALUES(?, ?, ?, ?, ?, ?)',
+                    (
+                        str(proposal['proposed_name'] or '').strip(),
+                        str(proposal['normalized_name'] or ''),
+                        1 if resolved_type == 'character' else 0,
+                        resolved_type,
+                        'active',
+                        now,
+                    ),
+                )
+                tag_id = int(cursor.lastrowid)
+                tag_name = str(proposal['proposed_name'] or '').strip()
+                created = True
+            conn.execute(
+                "UPDATE tag_proposals SET status = 'approved', resolved_tag_id = ?, reason = ?, updated_at = ? WHERE id = ?",
+                (tag_id, f'approved_as:{resolved_type}', now, int(proposal_id)),
+            )
+        return True, {
+            'message': f'已通过 tag 提案 #{int(proposal_id)}：{tag_name}',
+            'tag_id': tag_id,
+            'tag_name': tag_name,
+            'tag_type': resolved_type,
+            'created': created,
+        }
+
+    def merge_tag_proposal(self, proposal_id: int, target_tag_name: str) -> tuple[bool, dict[str, Any]]:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            proposal = conn.execute('SELECT * FROM tag_proposals WHERE id = ? LIMIT 1', (int(proposal_id),)).fetchone()
+            if not proposal:
+                return False, {'message': f'tag 提案不存在：#{int(proposal_id)}'}
+            if str(proposal['status'] or '') != 'pending':
+                return False, {'message': f'tag 提案 #{int(proposal_id)} 已处理：{proposal["status"]}'}
+            target, _ = self._resolve_tag_exact_conn(conn, target_tag_name)
+            if not target:
+                return False, {'message': f'目标主 tag 不存在：{target_tag_name}'}
+            if str(target['status'] or 'active') != 'active':
+                return False, {'message': f'目标主 tag 未启用：{target["name"]}'}
+            target_id = int(target['id'])
+            proposal_name = str(proposal['proposed_name'] or '').strip()
+            existing, _ = self._resolve_tag_exact_conn(conn, proposal_name)
+            alias_added = False
+            if existing:
+                if int(existing['id']) != target_id:
+                    return False, {'message': f'提案名已被其他主 tag 使用：{existing["name"]}'}
+            elif normalize_tag_name(proposal_name) != str(target['normalized_name'] or ''):
+                ok, message = self._insert_alias_conn(conn, tag_id=target_id, alias=proposal_name, now=now)
+                if not ok:
+                    return False, {'message': message}
+                alias_added = True
+            conn.execute(
+                "UPDATE tag_proposals SET status = 'approved', resolved_tag_id = ?, reason = ?, updated_at = ? WHERE id = ?",
+                (target_id, 'merged_to_existing', now, int(proposal_id)),
+            )
+        return True, {
+            'message': f'已将 tag 提案 #{int(proposal_id)} 归并到：{target["name"]}',
+            'tag_id': target_id,
+            'tag_name': str(target['name']),
+            'alias_added': alias_added,
+        }
+
+    def reject_tag_proposal(self, proposal_id: int, reason: str = '') -> tuple[bool, str]:
+        with self._lock, self._connect() as conn:
+            proposal = conn.execute('SELECT * FROM tag_proposals WHERE id = ? LIMIT 1', (int(proposal_id),)).fetchone()
+            if not proposal:
+                return False, f'tag 提案不存在：#{int(proposal_id)}'
+            if str(proposal['status'] or '') != 'pending':
+                return False, f'tag 提案 #{int(proposal_id)} 已处理：{proposal["status"]}'
+            conn.execute(
+                "UPDATE tag_proposals SET status = 'rejected', reason = ?, updated_at = ? WHERE id = ?",
+                (str(reason or '').strip() or '管理员拒绝', utcnow_str(), int(proposal_id)),
+            )
+        return True, f'已拒绝 tag 提案 #{int(proposal_id)}：{proposal["proposed_name"]}'
 
     @staticmethod
     def _resolve_tag_exact_conn(conn: sqlite3.Connection, query: str) -> tuple[sqlite3.Row | None, str]:
@@ -1431,8 +1778,11 @@ class ImageIndexDB:
         ok, _ = self._insert_alias_conn(conn, tag_id=target_id, alias=str(source['name']), now=now)
         source_name_alias_added = ok
 
-        if int(source['is_character'] or 0) == 1 and int(target['is_character'] or 0) != 1:
-            conn.execute('UPDATE tags SET is_character = 1 WHERE id = ?', (target_id,))
+        if str(source['tag_type'] or 'other') == 'character' and str(target['tag_type'] or 'other') != 'character':
+            conn.execute(
+                "UPDATE tags SET tag_type = 'character', is_character = 1 WHERE id = ?",
+                (target_id,),
+            )
 
         return {
             'source_name': str(source['name']),
@@ -2565,13 +2915,13 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             tag_rows = conn.execute(
                 """
-                SELECT t.id, t.name, t.normalized_name, t.is_character,
+                SELECT t.id, t.name, t.normalized_name, t.is_character, t.tag_type, t.status,
                        COUNT(DISTINCT CASE WHEN it.review_status IN ('approved', 'manual_approved') AND i.is_active = 1 THEN i.id END) AS image_count
                 FROM tags t
                 LEFT JOIN image_tags it ON it.tag_id = t.id
                 LEFT JOIN images i ON i.id = it.image_id
-                WHERE t.is_character = 1
-                GROUP BY t.id, t.name, t.normalized_name, t.is_character
+                WHERE t.tag_type = 'character' AND t.status = 'active'
+                GROUP BY t.id, t.name, t.normalized_name, t.is_character, t.tag_type, t.status
                 ORDER BY image_count DESC, t.name ASC
                 LIMIT 240
                 """
@@ -2583,8 +2933,6 @@ class ImageIndexDB:
                 terms: list[tuple[str, str, int]] = []
                 for platform_row in self.list_platform_terms(tag_id=target_id, platform='pixiv', limit=80):
                     terms.append((str(platform_row['term'] or ''), 'platform_term', 8))
-                for suggestion in self.suggest_platform_terms_for_tag(tag_name=target_name, platform='pixiv', limit=15):
-                    terms.append((str(suggestion.get('term', '') or ''), 'history_term', min(7, int(suggestion.get('count', 0) or 0))))
                 seen_term_keys: set[str] = set()
                 for term, reason, weight in terms:
                     normalized_term = normalize_tag_name(term)
@@ -2661,13 +3009,13 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             tag_rows = conn.execute(
                 """
-                SELECT t.id, t.name, t.normalized_name, t.is_character,
+                SELECT t.id, t.name, t.normalized_name, t.is_character, t.tag_type, t.status,
                        COUNT(DISTINCT CASE WHEN it.review_status IN ('approved', 'manual_approved') AND i.is_active = 1 THEN i.id END) AS image_count
                 FROM tags t
                 LEFT JOIN image_tags it ON it.tag_id = t.id
                 LEFT JOIN images i ON i.id = it.image_id
-                WHERE t.is_character = 1
-                GROUP BY t.id, t.name, t.normalized_name, t.is_character
+                WHERE t.tag_type = 'character' AND t.status = 'active'
+                GROUP BY t.id, t.name, t.normalized_name, t.is_character, t.tag_type, t.status
                 ORDER BY image_count DESC, t.name ASC
                 LIMIT ?
                 """,
@@ -2690,59 +3038,14 @@ class ImageIndexDB:
                     """,
                     (tag_id, platform_text),
                 ).fetchall()
-                source_rows = conn.execute(
-                    """
-                    SELECT s.raw_tags, s.extra_json
-                    FROM sources s
-                    JOIN image_tags it ON it.image_id = s.image_id
-                    JOIN images i ON i.id = s.image_id
-                    WHERE s.platform = ?
-                      AND it.tag_id = ?
-                      AND i.is_active = 1
-                      AND it.review_status IN ('approved', 'manual_approved')
-                    ORDER BY s.id DESC
-                    LIMIT 260
-                    """,
-                    (platform_text, tag_id),
-                ).fetchall()
-                history_counter: Counter[str] = Counter()
-                history_display: dict[str, str] = {}
-                for source_row in source_rows:
-                    try:
-                        raw_terms = json.loads(source_row['raw_tags'] or '[]') if source_row['raw_tags'] else []
-                    except Exception:
-                        raw_terms = []
-                    try:
-                        extra = json.loads(source_row['extra_json'] or '{}') if source_row['extra_json'] else {}
-                    except Exception:
-                        extra = {}
-                    translated_terms = extra.get('translated_tags') if isinstance(extra, dict) else []
-                    if not isinstance(translated_terms, list):
-                        translated_terms = []
-                    for value in [*raw_terms, *translated_terms]:
-                        text = str(value or '').strip()
-                        normalized = normalize_tag_name(text)
-                        if not text or not normalized or not self._looks_like_platform_term(text):
-                            continue
-                        history_counter[normalized] += 1
-                        history_display.setdefault(normalized, text)
-                history_terms = [
-                    {
-                        'term': history_display.get(normalized, normalized),
-                        'normalized_term': normalized,
-                        'count': int(count),
-                    }
-                    for normalized, count in sorted(
-                        history_counter.items(),
-                        key=lambda item: (-item[1], history_display.get(item[0], item[0])),
-                    )[:40]
-                ]
                 result.append(
                     {
                         'id': tag_id,
                         'name': str(tag_row['name']),
                         'normalized_name': str(tag_row['normalized_name'] or ''),
                         'is_character': bool(tag_row['is_character']),
+                        'tag_type': str(tag_row['tag_type'] or 'character'),
+                        'status': str(tag_row['status'] or 'active'),
                         'image_count': int(tag_row['image_count'] or 0),
                         'aliases': [str(row['alias']) for row in alias_rows],
                         'platform_terms': [
@@ -2755,7 +3058,8 @@ class ImageIndexDB:
                             }
                             for row in platform_rows
                         ],
-                        'history_terms': history_terms,
+                        # 来源图片的原始 Pixiv tag 仅作为图片元数据，不能作为角色身份依据。
+                        'history_terms': [],
                     }
                 )
         return result
@@ -3138,6 +3442,155 @@ class ImageIndexDB:
             'crawl_jobs': int(job_count),
             'crawl_subscriptions': int(subscription_count),
             'pending_reviews': int(review_count),
+        }
+
+    def get_tag_governance_snapshot(self) -> dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            tag_rows = conn.execute(
+                """
+                SELECT t.id, t.name, t.normalized_name, t.is_character, t.tag_type, t.status, t.created_at,
+                       (SELECT COUNT(DISTINCT it.image_id)
+                        FROM image_tags it WHERE it.tag_id = t.id) AS image_link_count,
+                       (SELECT COUNT(DISTINCT it.image_id)
+                        FROM image_tags it
+                        WHERE it.tag_id = t.id
+                          AND it.review_status IN ('approved', 'manual_approved')) AS approved_count,
+                       (SELECT COUNT(DISTINCT it.image_id)
+                        FROM image_tags it
+                        WHERE it.tag_id = t.id
+                          AND it.review_status NOT IN ('rejected', 'manual_rejected')) AS non_rejected_link_count,
+                       (SELECT COUNT(*) FROM review_tasks rt
+                        WHERE rt.tag_id = t.id AND rt.status IN ('pending', 'uncertain')) AS open_review_count,
+                       (SELECT COUNT(*) FROM review_tasks rt
+                        WHERE rt.tag_id = t.id
+                          AND rt.status NOT IN ('rejected', 'manual_rejected')) AS review_dependency_count,
+                       (SELECT COUNT(*) FROM tag_aliases a WHERE a.tag_id = t.id) AS alias_count,
+                       (SELECT COUNT(*) FROM platform_tag_terms p WHERE p.tag_id = t.id) AS platform_term_count,
+                       (SELECT COUNT(*) FROM platform_tag_terms p
+                        WHERE p.tag_id = t.id AND p.platform = 'pixiv'
+                          AND p.term_type IN ('query', 'both')) AS pixiv_query_term_count,
+                       (SELECT COUNT(*) FROM crawl_subscriptions cs
+                        WHERE cs.tag_id = t.id AND cs.enabled = 1) AS enabled_subscription_count,
+                       (SELECT COUNT(*) FROM tag_merge_identity_candidates mic
+                        WHERE mic.source_tag_id = t.id OR mic.target_tag_id = t.id) AS identity_candidate_count,
+                       (SELECT COUNT(*) FROM tag_proposals tp
+                        WHERE tp.resolved_tag_id = t.id
+                           OR (tp.status = 'pending' AND tp.normalized_name = t.normalized_name)
+                       ) AS proposal_dependency_count
+                FROM tags t
+                ORDER BY t.name COLLATE NOCASE ASC
+                """
+            ).fetchall()
+            alias_rows = conn.execute(
+                """
+                SELECT a.id, a.alias, a.normalized_alias, a.tag_id, t.name AS tag_name
+                FROM tag_aliases a
+                JOIN tags t ON t.id = a.tag_id
+                ORDER BY t.name ASC, a.alias ASC
+                """
+            ).fetchall()
+            pending_proposals = int(
+                conn.execute("SELECT COUNT(*) AS c FROM tag_proposals WHERE status = 'pending'").fetchone()['c']
+            )
+
+        aliases_by_tag: dict[int, list[str]] = {}
+        aliases: list[dict[str, Any]] = []
+        for row in alias_rows:
+            tag_id = int(row['tag_id'])
+            alias = str(row['alias'] or '')
+            aliases_by_tag.setdefault(tag_id, []).append(alias)
+            aliases.append(
+                {
+                    'id': int(row['id']),
+                    'alias': alias,
+                    'normalized_alias': str(row['normalized_alias'] or ''),
+                    'tag_id': tag_id,
+                    'tag_name': str(row['tag_name'] or ''),
+                }
+            )
+
+        tags: list[dict[str, Any]] = []
+        type_counts = {item: 0 for item in sorted(TAG_TYPES)}
+        status_counts = {item: 0 for item in sorted(TAG_STATUSES)}
+        for row in tag_rows:
+            tag_type = normalize_tag_type(str(row['tag_type'] or ''), default='other') or 'other'
+            status = normalize_tag_status(str(row['status'] or ''), default='active') or 'active'
+            type_counts[tag_type] += 1
+            status_counts[status] += 1
+            image_link_count = int(row['image_link_count'] or 0)
+            approved_count = int(row['approved_count'] or 0)
+            non_rejected_link_count = int(row['non_rejected_link_count'] or 0)
+            open_review_count = int(row['open_review_count'] or 0)
+            review_dependency_count = int(row['review_dependency_count'] or 0)
+            alias_count = int(row['alias_count'] or 0)
+            platform_term_count = int(row['platform_term_count'] or 0)
+            enabled_subscription_count = int(row['enabled_subscription_count'] or 0)
+            identity_candidate_count = int(row['identity_candidate_count'] or 0)
+            proposal_dependency_count = int(row['proposal_dependency_count'] or 0)
+            safe_cleanup = (
+                tag_type == 'other'
+                and status == 'active'
+                and approved_count == 0
+                and non_rejected_link_count == 0
+                and open_review_count == 0
+                and review_dependency_count == 0
+                and alias_count == 0
+                and platform_term_count == 0
+                and enabled_subscription_count == 0
+                and identity_candidate_count == 0
+                and proposal_dependency_count == 0
+            )
+            protected_other = tag_type == 'other' and (
+                status != 'active'
+                or any(
+                    (
+                        approved_count,
+                        non_rejected_link_count,
+                        open_review_count,
+                        review_dependency_count,
+                        alias_count,
+                        platform_term_count,
+                        enabled_subscription_count,
+                        identity_candidate_count,
+                        proposal_dependency_count,
+                    )
+                )
+            )
+            tags.append(
+                {
+                    'id': int(row['id']),
+                    'name': str(row['name'] or ''),
+                    'normalized_name': str(row['normalized_name'] or ''),
+                    'is_character': bool(int(row['is_character'] or 0)),
+                    'tag_type': tag_type,
+                    'status': status,
+                    'created_at': str(row['created_at'] or ''),
+                    'image_link_count': image_link_count,
+                    'approved_count': approved_count,
+                    'non_rejected_link_count': non_rejected_link_count,
+                    'open_review_count': open_review_count,
+                    'review_dependency_count': review_dependency_count,
+                    'alias_count': alias_count,
+                    'platform_term_count': platform_term_count,
+                    'pixiv_query_term_count': int(row['pixiv_query_term_count'] or 0),
+                    'enabled_subscription_count': enabled_subscription_count,
+                    'identity_candidate_count': identity_candidate_count,
+                    'proposal_dependency_count': proposal_dependency_count,
+                    'aliases': aliases_by_tag.get(int(row['id']), []),
+                    'safe_cleanup': safe_cleanup,
+                    'protected_other': protected_other,
+                }
+            )
+        return {
+            'totals': {
+                'tags': len(tags),
+                'aliases': len(aliases),
+                'pending_proposals': pending_proposals,
+                'type_counts': type_counts,
+                'status_counts': status_counts,
+            },
+            'tags': tags,
+            'aliases': aliases,
         }
 
     def count_images_for_tag(self, tag_name: str, include_unapproved: bool = False) -> int:
@@ -4888,7 +5341,7 @@ class ImageIndexDB:
 
     def list_tags(self, *, keyword: str = '', limit: int = 100, character_only: bool | None = None) -> list[sqlite3.Row]:
         sql = """
-            SELECT t.id, t.name, t.is_character,
+            SELECT t.id, t.name, t.is_character, t.tag_type, t.status,
                    COUNT(DISTINCT CASE WHEN it.review_status IN ('approved', 'manual_approved') AND i.is_active = 1 THEN i.id END) AS image_count,
                    COUNT(DISTINCT a.id) AS alias_count
             FROM tags t
@@ -4899,76 +5352,82 @@ class ImageIndexDB:
         params: list[Any] = []
         clauses: list[str] = []
         if character_only is not None:
-            clauses.append('t.is_character = ?')
-            params.append(1 if character_only else 0)
+            clauses.append("t.tag_type = 'character'" if character_only else "t.tag_type <> 'character'")
         if keyword:
             clauses.append('t.normalized_name LIKE ?')
             params.append(f"%{normalize_tag_name(keyword)}%")
         if clauses:
             sql += ' WHERE ' + ' AND '.join(clauses)
-        sql += ' GROUP BY t.id, t.name, t.is_character ORDER BY image_count DESC, t.name ASC LIMIT ?'
+        sql += ' GROUP BY t.id, t.name, t.is_character, t.tag_type, t.status ORDER BY image_count DESC, t.name ASC LIMIT ?'
         params.append(limit)
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
 
-    def preview_non_character_tag_cleanup(self, *, limit: int = 200) -> list[sqlite3.Row]:
-        return self.list_tags(limit=limit, character_only=False)
+    def preview_non_character_tag_cleanup(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        rows = [row for row in self.get_tag_governance_snapshot()['tags'] if bool(row.get('safe_cleanup'))]
+        rows.sort(key=lambda row: (-int(row.get('image_link_count') or 0), str(row.get('name') or '')))
+        return rows[: max(1, int(limit or 1))]
 
-    def cleanup_non_character_tags(self) -> dict[str, int]:
-        with self._lock, self._connect() as conn:
-            rows = conn.execute('SELECT id, normalized_name FROM tags WHERE is_character = 0').fetchall()
-            if not rows:
+    def cleanup_non_character_tags(self) -> dict[str, Any]:
+        with self._lock:
+            snapshot = self.get_tag_governance_snapshot()
+            safe_rows = [row for row in snapshot['tags'] if bool(row.get('safe_cleanup'))]
+            protected_rows = [row for row in snapshot['tags'] if bool(row.get('protected_other'))]
+            tag_ids = [int(row['id']) for row in safe_rows]
+            normalized_names = [str(row.get('normalized_name') or '') for row in safe_rows if str(row.get('normalized_name') or '').strip()]
+            with self._connect() as conn:
+                if not tag_ids:
+                    return {
+                        'tags_removed': 0,
+                        'image_links_removed': 0,
+                        'review_tasks_removed': 0,
+                        'aliases_removed': 0,
+                        'platform_terms_removed': 0,
+                        'subscriptions_removed': 0,
+                        'protected_tags': len(protected_rows),
+                    }
+                id_placeholders = ','.join('?' for _ in tag_ids)
+
+                image_cursor = conn.execute(f'DELETE FROM image_tags WHERE tag_id IN ({id_placeholders})', tag_ids)
+                review_cursor = conn.execute(f'DELETE FROM review_tasks WHERE tag_id IN ({id_placeholders})', tag_ids)
+                alias_cursor = conn.execute(f'DELETE FROM tag_aliases WHERE tag_id IN ({id_placeholders})', tag_ids)
+                platform_term_cursor = conn.execute(f'DELETE FROM platform_tag_terms WHERE tag_id IN ({id_placeholders})', tag_ids)
+
+                subscription_sql = f'DELETE FROM crawl_subscriptions WHERE tag_id IN ({id_placeholders})'
+                subscription_select_sql = f'SELECT id FROM crawl_subscriptions WHERE tag_id IN ({id_placeholders})'
+                subscription_params: list[Any] = list(tag_ids)
+                if normalized_names:
+                    normalized_placeholders = ','.join('?' for _ in normalized_names)
+                    subscription_sql += f' OR normalized_tag IN ({normalized_placeholders})'
+                    subscription_select_sql += f' OR normalized_tag IN ({normalized_placeholders})'
+                    subscription_params.extend(normalized_names)
+                subscription_ids = [
+                    int(row['id'])
+                    for row in conn.execute(subscription_select_sql, subscription_params).fetchall()
+                ]
+                if subscription_ids:
+                    subscription_placeholders = ','.join('?' for _ in subscription_ids)
+                    conn.execute(
+                        f'DELETE FROM crawl_subscription_terms WHERE subscription_id IN ({subscription_placeholders})',
+                        subscription_ids,
+                    )
+                subscription_cursor = conn.execute(subscription_sql, subscription_params)
+                tag_cursor = conn.execute(f'DELETE FROM tags WHERE id IN ({id_placeholders})', tag_ids)
+
                 return {
-                    'tags_removed': 0,
-                    'image_links_removed': 0,
-                    'review_tasks_removed': 0,
-                    'aliases_removed': 0,
-                    'platform_terms_removed': 0,
-                    'subscriptions_removed': 0,
+                    'tags_removed': max(0, int(tag_cursor.rowcount or 0)),
+                    'image_links_removed': max(0, int(image_cursor.rowcount or 0)),
+                    'review_tasks_removed': max(0, int(review_cursor.rowcount or 0)),
+                    'aliases_removed': max(0, int(alias_cursor.rowcount or 0)),
+                    'platform_terms_removed': max(0, int(platform_term_cursor.rowcount or 0)),
+                    'subscriptions_removed': max(0, int(subscription_cursor.rowcount or 0)),
+                    'protected_tags': len(protected_rows),
                 }
-            tag_ids = [int(row['id']) for row in rows]
-            normalized_names = [str(row['normalized_name'] or '') for row in rows if str(row['normalized_name'] or '').strip()]
-            id_placeholders = ','.join('?' for _ in tag_ids)
-
-            image_cursor = conn.execute(f'DELETE FROM image_tags WHERE tag_id IN ({id_placeholders})', tag_ids)
-            review_cursor = conn.execute(f'DELETE FROM review_tasks WHERE tag_id IN ({id_placeholders})', tag_ids)
-            alias_cursor = conn.execute(f'DELETE FROM tag_aliases WHERE tag_id IN ({id_placeholders})', tag_ids)
-            platform_term_cursor = conn.execute(f'DELETE FROM platform_tag_terms WHERE tag_id IN ({id_placeholders})', tag_ids)
-
-            subscription_sql = f'DELETE FROM crawl_subscriptions WHERE tag_id IN ({id_placeholders})'
-            subscription_select_sql = f'SELECT id FROM crawl_subscriptions WHERE tag_id IN ({id_placeholders})'
-            subscription_params: list[Any] = list(tag_ids)
-            if normalized_names:
-                normalized_placeholders = ','.join('?' for _ in normalized_names)
-                subscription_sql += f' OR normalized_tag IN ({normalized_placeholders})'
-                subscription_select_sql += f' OR normalized_tag IN ({normalized_placeholders})'
-                subscription_params.extend(normalized_names)
-            subscription_ids = [
-                int(row['id'])
-                for row in conn.execute(subscription_select_sql, subscription_params).fetchall()
-            ]
-            if subscription_ids:
-                subscription_placeholders = ','.join('?' for _ in subscription_ids)
-                conn.execute(
-                    f'DELETE FROM crawl_subscription_terms WHERE subscription_id IN ({subscription_placeholders})',
-                    subscription_ids,
-                )
-            subscription_cursor = conn.execute(subscription_sql, subscription_params)
-            tag_cursor = conn.execute(f'DELETE FROM tags WHERE id IN ({id_placeholders})', tag_ids)
-
-            return {
-                'tags_removed': max(0, int(tag_cursor.rowcount or 0)),
-                'image_links_removed': max(0, int(image_cursor.rowcount or 0)),
-                'review_tasks_removed': max(0, int(review_cursor.rowcount or 0)),
-                'aliases_removed': max(0, int(alias_cursor.rowcount or 0)),
-                'platform_terms_removed': max(0, int(platform_term_cursor.rowcount or 0)),
-                'subscriptions_removed': max(0, int(subscription_cursor.rowcount or 0)),
-            }
 
     def list_tags_for_auto_crawl(self, *, character_only: bool = True) -> list[sqlite3.Row]:
-        sql = 'SELECT id, name, is_character FROM tags'
+        sql = 'SELECT id, name, is_character, tag_type, status FROM tags WHERE status = \'active\''
         if character_only:
-            sql += ' WHERE is_character = 1'
+            sql += " AND tag_type = 'character'"
         sql += ' ORDER BY name ASC'
         with self._lock, self._connect() as conn:
             return conn.execute(sql).fetchall()

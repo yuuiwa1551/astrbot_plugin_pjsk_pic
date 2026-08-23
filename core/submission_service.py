@@ -57,6 +57,7 @@ class SubmissionResult:
     platform_name: str = ""
     session_id: str = ""
     message_id: str = ""
+    proposal_id: int | None = None
 
     @property
     def image_count(self) -> int:
@@ -186,7 +187,7 @@ class SubmissionService:
         normalized_aliases = self._normalize_submission_aliases(
             aliases or [],
             input_tag_name=input_tag_name,
-            canonical_tag_name=canonical_tag_name,
+            canonical_tag_name=canonical_tag_name or input_tag_name,
         )
 
         image_paths = await self._extract_image_paths(event)
@@ -195,7 +196,7 @@ class SubmissionService:
                 ok=False,
                 reply_message="投稿时请至少附带 1 张图片，或回复一条带图消息后发送 tg <tag>。",
                 input_tag_name=input_tag_name,
-                tag_name=canonical_tag_name,
+                tag_name=canonical_tag_name or input_tag_name,
                 resolved_from_alias=resolved_from_alias,
             )
 
@@ -206,10 +207,54 @@ class SubmissionService:
         message_obj = getattr(event, "message_obj", None)
         message_id = str(getattr(message_obj, "message_id", "") or "")
 
-        tag_exists = self.db.get_tag_row(canonical_tag_name) is not None
-        tag_id: int | None = None
-        tag_ready = False
-        created_tag = False
+        if not canonical_tag_name:
+            proposal = self.db.create_or_increment_tag_proposal(
+                input_tag_name,
+                aliases=normalized_aliases,
+                submitter_id=str(sender_id or ""),
+                submitter_name=str(sender_name or ""),
+                platform_name=str(platform_name or ""),
+                session_id=unified_origin,
+                message_id=message_id,
+            )
+            proposal_id = int(proposal["id"])
+            return SubmissionResult(
+                ok=False,
+                reply_message=(
+                    f"没有找到主 tag 或 alias：{input_tag_name}\n"
+                    f"已登记为 tag 提案 #{proposal_id}（累计出现 {int(proposal.get('occurrence_count') or 1)} 次），"
+                    "图片尚未入库。管理员审核词条后，请重新投稿。"
+                ),
+                input_tag_name=input_tag_name,
+                tag_name=input_tag_name,
+                aliases=list(normalized_aliases),
+                sender_id=str(sender_id or ""),
+                sender_name=str(sender_name or ""),
+                platform_name=str(platform_name or ""),
+                session_id=unified_origin,
+                message_id=message_id,
+                proposal_id=proposal_id,
+            )
+
+        tag_row = self.db.get_tag_row(canonical_tag_name)
+        if not tag_row:
+            return SubmissionResult(
+                ok=False,
+                reply_message=f"主 tag 状态异常，请联系管理员：{canonical_tag_name}",
+                input_tag_name=input_tag_name,
+                tag_name=canonical_tag_name,
+                resolved_from_alias=resolved_from_alias,
+            )
+        if str(tag_row["status"] or "active") != "active":
+            return SubmissionResult(
+                ok=False,
+                reply_message=f"主 tag “{canonical_tag_name}”当前未启用，暂不接收投稿。",
+                input_tag_name=input_tag_name,
+                tag_name=canonical_tag_name,
+                resolved_from_alias=resolved_from_alias,
+            )
+
+        tag_id = int(tag_row["id"])
         aliases_applied = False
         added_aliases: list[str] = []
         skipped_aliases: list[str] = []
@@ -218,11 +263,6 @@ class SubmissionService:
         for image_index, image_path in enumerate(image_paths, start=1):
             try:
                 imported = await self.importer.import_local_file(image_path, platform="submission")
-
-                if not tag_ready:
-                    tag_id = self.db.get_or_create_tag(canonical_tag_name, is_character=True)
-                    tag_ready = True
-                    created_tag = not tag_exists
 
                 if not aliases_applied:
                     added_aliases, skipped_aliases = self._apply_aliases(canonical_tag_name, normalized_aliases)
@@ -328,7 +368,7 @@ class SubmissionService:
             input_tag_name=input_tag_name,
             tag_name=canonical_tag_name,
             resolved_from_alias=resolved_from_alias,
-            created_tag=created_tag,
+            created_tag=False,
             aliases=list(added_aliases),
             skipped_aliases=list(skipped_aliases),
             items=items,
@@ -345,7 +385,7 @@ class SubmissionService:
         match = self.db.resolve_tag(input_tag_name, allow_fuzzy=False, candidate_limit=1)
         if match.matched and match.tag_name:
             return str(match.tag_name), bool(match.match_type == "exact_alias")
-        return input_tag_name, False
+        return "", False
 
     def _normalize_submission_aliases(
         self,

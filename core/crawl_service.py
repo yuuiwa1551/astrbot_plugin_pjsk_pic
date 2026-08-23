@@ -442,7 +442,11 @@ class CrawlService:
         if not match.matched or not match.tag_name:
             return None
         row = self.db.get_tag_row(str(match.tag_name))
-        if not row or int(row["is_character"] or 0) != 1:
+        if (
+            not row
+            or str(row["tag_type"] or "other") != "character"
+            or str(row["status"] or "active") != "active"
+        ):
             return None
         return str(match.tag_name)
 
