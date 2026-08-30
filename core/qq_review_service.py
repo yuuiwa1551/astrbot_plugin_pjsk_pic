@@ -14,6 +14,7 @@ class QQReviewSession:
     session_key: str
     origin: str
     reviewer_id: str
+    platform: str
     image_id: int
     filter_tag_id: int
     filter_tag_name: str
@@ -84,17 +85,28 @@ class QQReviewSessionService:
         *,
         origin: str,
         reviewer_id: str,
+        platform: str = "pixiv",
         filter_tag_id: int = 0,
         filter_tag_name: str = "",
         replace_current: bool = True,
     ) -> tuple[QQReviewSession | None, int]:
         session_key = self.make_session_key(origin, reviewer_id)
+        platform_text = str(platform or "pixiv").strip().lower() or "pixiv"
         async with self._lock:
             self._cleanup_expired_locked()
             current = self._sessions.get(session_key)
             if current is not None and not replace_current:
-                if self.db.is_open_pixiv_review_image(current.image_id, statuses=self.OPEN_STATUSES):
-                    remaining = self.db.count_open_pixiv_review_images(
+                same_request = (
+                    current.platform == platform_text
+                    and current.filter_tag_id == max(0, int(filter_tag_id or 0))
+                )
+                if same_request and self.db.is_open_review_image(
+                    current.image_id,
+                    platform=current.platform,
+                    statuses=self.OPEN_STATUSES,
+                ):
+                    remaining = self.db.count_open_review_images(
+                        platform=current.platform,
                         statuses=self.OPEN_STATUSES,
                         candidate_tag_id=current.filter_tag_id or None,
                     )
@@ -106,18 +118,21 @@ class QQReviewSessionService:
             claimed_ids = set(self._claims)
             recent_ids = set(self._recent_queue(session_key))
             excluded = claimed_ids | recent_ids
-            row = self.db.get_random_pixiv_review_image(
+            row = self.db.get_random_review_image(
+                platform=platform_text,
                 statuses=self.OPEN_STATUSES,
                 candidate_tag_id=filter_tag_id or None,
                 exclude_image_ids=excluded,
             )
             if row is None and recent_ids:
-                row = self.db.get_random_pixiv_review_image(
+                row = self.db.get_random_review_image(
+                    platform=platform_text,
                     statuses=self.OPEN_STATUSES,
                     candidate_tag_id=filter_tag_id or None,
                     exclude_image_ids=claimed_ids,
                 )
-            remaining = self.db.count_open_pixiv_review_images(
+            remaining = self.db.count_open_review_images(
+                platform=platform_text,
                 statuses=self.OPEN_STATUSES,
                 candidate_tag_id=filter_tag_id or None,
             )
@@ -129,6 +144,7 @@ class QQReviewSessionService:
                 session_key=session_key,
                 origin=str(origin or "default"),
                 reviewer_id=str(reviewer_id or "unknown"),
+                platform=platform_text,
                 image_id=int(row["image_id"]),
                 filter_tag_id=max(0, int(filter_tag_id or 0)),
                 filter_tag_name=str(filter_tag_name or "").strip(),
@@ -146,7 +162,11 @@ class QQReviewSessionService:
             session = self._sessions.get(session_key)
             if session is None:
                 return None
-            if not self.db.is_open_pixiv_review_image(session.image_id, statuses=self.OPEN_STATUSES):
+            if not self.db.is_open_review_image(
+                session.image_id,
+                platform=session.platform,
+                statuses=self.OPEN_STATUSES,
+            ):
                 self._release_locked(session_key, remember=True)
                 return None
             return session
@@ -176,18 +196,23 @@ class QQReviewSessionService:
             session = self._sessions.get(session_key)
             if session is None:
                 return False, {"message": "当前没有领取中的审核图片。", "code": "no_session"}
-            if not self.db.is_open_pixiv_review_image(session.image_id, statuses=self.OPEN_STATUSES):
+            if not self.db.is_open_review_image(
+                session.image_id,
+                platform=session.platform,
+                statuses=self.OPEN_STATUSES,
+            ):
                 self._release_locked(session_key, remember=True)
                 return False, {
                     "message": f"图片 #{session.image_id} 已被其他人处理，请重新抽取。",
                     "code": "stale_session",
                     "image_id": session.image_id,
+                    "platform": session.platform,
                 }
             ok, result = self.db.apply_image_review(
                 session.image_id,
                 selected_tag_names=[tag_name],
                 source_terms=[],
-                platform="pixiv",
+                platform=session.platform,
                 reason=f"QQ 群友 {reviewer_id} 人工审核通过",
                 reject_unselected=True,
                 require_open_review=True,
@@ -201,6 +226,7 @@ class QQReviewSessionService:
             payload.setdefault("image_id", session.image_id)
             payload["filter_tag_id"] = session.filter_tag_id
             payload["filter_tag_name"] = session.filter_tag_name
+            payload["platform"] = session.platform
             return ok, payload
 
     async def reject_current(
@@ -216,12 +242,17 @@ class QQReviewSessionService:
             session = self._sessions.get(session_key)
             if session is None:
                 return False, {"message": "当前没有领取中的审核图片。", "code": "no_session"}
-            if not self.db.is_open_pixiv_review_image(session.image_id, statuses=self.OPEN_STATUSES):
+            if not self.db.is_open_review_image(
+                session.image_id,
+                platform=session.platform,
+                statuses=self.OPEN_STATUSES,
+            ):
                 self._release_locked(session_key, remember=True)
                 return False, {
                     "message": f"图片 #{session.image_id} 已被其他人处理，请重新抽取。",
                     "code": "stale_session",
                     "image_id": session.image_id,
+                    "platform": session.platform,
                 }
             reason_text = str(reason or "").strip()[:200]
             audit_reason = f"QQ 群友 {reviewer_id} 人工拒绝"
@@ -229,7 +260,7 @@ class QQReviewSessionService:
                 audit_reason += f"：{reason_text}"
             ok, result = self.db.reject_image_source(
                 session.image_id,
-                platform="pixiv",
+                platform=session.platform,
                 reason=audit_reason,
                 require_open_review=True,
             )
@@ -242,6 +273,7 @@ class QQReviewSessionService:
             payload.setdefault("image_id", session.image_id)
             payload["filter_tag_id"] = session.filter_tag_id
             payload["filter_tag_name"] = session.filter_tag_name
+            payload["platform"] = session.platform
             return ok, payload
 
     async def clear(self) -> None:

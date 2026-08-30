@@ -53,6 +53,7 @@ class ImportedImageService:
         timeout_seconds: int = 20,
         enable_phash_dedupe: bool = True,
         phash_max_distance: int = 8,
+        max_download_bytes: int = 25 * 1024 * 1024,
     ) -> None:
         self.db = db
         self.data_dir = data_dir
@@ -61,6 +62,10 @@ class ImportedImageService:
         self.timeout_seconds = timeout_seconds
         self.enable_phash_dedupe = enable_phash_dedupe
         self.phash_max_distance = phash_max_distance
+        self.max_download_bytes = min(
+            max(int(max_download_bytes or 25 * 1024 * 1024), 1024 * 1024),
+            100 * 1024 * 1024,
+        )
         self.download_retry_times = 3
 
     async def import_candidate(self, candidate: CrawlCandidate) -> ImportedImage:
@@ -74,6 +79,12 @@ class ImportedImageService:
         extra_headers = candidate.extra.get("request_headers", {}) if isinstance(candidate.extra, dict) else {}
         headers.update({str(k): str(v) for k, v in dict(extra_headers).items()})
         body, content_type, final_url = self._download_remote_bytes(candidate.image_url, headers=headers)
+        if (
+            isinstance(candidate.extra, dict)
+            and bool(candidate.extra.get("require_image_mime"))
+            and not str(content_type or "").split(";", 1)[0].strip().lower().startswith("image/")
+        ):
+            raise ValueError(f"图片响应 MIME 非法：{content_type or 'missing'}")
 
         return self._store_imported_bytes(
             body,
@@ -89,11 +100,28 @@ class ImportedImageService:
             request = urllib.request.Request(image_url, headers=headers)
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    content_length = str(response.headers.get("Content-Length", "") or "").strip()
+                    if content_length:
+                        try:
+                            declared_size = int(content_length)
+                        except ValueError:
+                            declared_size = 0
+                        if declared_size > self.max_download_bytes:
+                            raise ValueError(
+                                f"图片响应超过下载上限：{declared_size} > {self.max_download_bytes} bytes"
+                            )
+                    body = response.read(self.max_download_bytes + 1)
+                    if len(body) > self.max_download_bytes:
+                        raise ValueError(
+                            f"图片实际内容超过下载上限：>{self.max_download_bytes} bytes"
+                        )
                     return (
-                        response.read(),
+                        body,
                         response.headers.get("Content-Type", ""),
                         response.geturl(),
                     )
+            except ValueError:
+                raise
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
                 if attempt >= max_attempts:

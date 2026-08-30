@@ -40,7 +40,15 @@ class BaseCrawlAdapter:
         self.platform = platform
         self.config = config or {}
 
-    async def fetch_candidates(self, source_url: str, *, max_candidates: int = 8, timeout_seconds: int = 20) -> list[CrawlCandidate]:
+    async def fetch_candidates(
+        self,
+        source_url: str,
+        *,
+        max_candidates: int = 8,
+        timeout_seconds: int = 20,
+        source_context: dict | None = None,
+    ) -> list[CrawlCandidate]:
+        del source_context
         result = await asyncio.to_thread(self._fetch_url, source_url, timeout_seconds)
         content_type = (result.content_type or "").lower()
         if self._looks_like_direct_image(result.final_url) or content_type.startswith("image/"):

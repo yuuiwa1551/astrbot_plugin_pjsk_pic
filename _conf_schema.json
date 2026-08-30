@@ -119,6 +119,11 @@
     "description": "抓取流程的整体超时时间（秒）。",
     "default": 20
   },
+  "crawler_max_image_bytes": {
+    "type": "int",
+    "description": "单张远程图片允许下载的最大字节数；运行时限制在 1 MiB 至 100 MiB，默认 25 MiB。",
+    "default": 26214400
+  },
   "platform_request_timeout": {
     "type": "int",
     "description": "单个平台请求超时时间（秒）；通常建议不超过 crawler_timeout_seconds。",
@@ -229,6 +234,91 @@
     "description": "每轮自动抓取全局最多创建的 Pixiv 新任务数。",
     "default": 30
   },
+  "xhs_auto_crawl_enabled": {
+    "type": "bool",
+    "description": "是否启用小红书最新图文自动采集。默认关闭；只会处理显式配置 xiaohongshu query + match/both 平台词的主 tag。",
+    "default": false
+  },
+  "xhs_auto_crawl_character_only": {
+    "type": "bool",
+    "description": "小红书自动采集是否仅处理启用状态的角色主 tag。",
+    "default": true
+  },
+  "xhs_auto_crawl_interval_minutes": {
+    "type": "int",
+    "description": "小红书自动采集轮询间隔（分钟），运行时最低按 15 分钟处理。",
+    "default": 180
+  },
+  "xhs_provider_base_url": {
+    "type": "string",
+    "description": "隔离运行的 xiaohongshu-mcp REST 地址；推荐使用与 AstrBot 同 Docker 网络的服务名。",
+    "default": "http://pjsk-xhs-provider:18060"
+  },
+  "xhs_provider_access_token": {
+    "type": "string",
+    "description": "xiaohongshu-mcp REST 鉴权 Token；视为秘密，插件不会输出该值。",
+    "default": ""
+  },
+  "xhs_provider_timeout_seconds": {
+    "type": "int",
+    "description": "小红书提供者健康、搜索和详情请求超时秒数。",
+    "default": 45
+  },
+  "xhs_provider_min_interval_seconds": {
+    "type": "float",
+    "description": "插件对小红书提供者发起相邻请求的最小间隔秒数；所有请求会串行执行。",
+    "default": 2.0
+  },
+  "xhs_auto_crawl_max_results_per_term": {
+    "type": "int",
+    "description": "每个小红书 query 词单轮最多读取的首批搜索结果数。二期不做翻页。",
+    "default": 20
+  },
+  "xhs_auto_crawl_max_subscriptions_per_cycle": {
+    "type": "int",
+    "description": "每轮最多检查的小红书 tag 订阅数，按最久未检查优先。",
+    "default": 3
+  },
+  "xhs_auto_crawl_max_queries_per_cycle": {
+    "type": "int",
+    "description": "每轮最多执行的小红书搜索请求数。",
+    "default": 5
+  },
+  "xhs_auto_crawl_max_details_per_cycle": {
+    "type": "int",
+    "description": "每轮最多读取的小红书笔记详情数。",
+    "default": 10
+  },
+  "xhs_auto_crawl_max_new_jobs_per_cycle": {
+    "type": "int",
+    "description": "每轮最多创建的小红书采集任务数。",
+    "default": 10
+  },
+  "xhs_auto_crawl_seed_max_notes": {
+    "type": "int",
+    "description": "小红书订阅首次启用时每个 query 词最多接纳的新笔记数，防止首屏灌入审核队列。",
+    "default": 3
+  },
+  "xhs_max_images_per_note": {
+    "type": "int",
+    "description": "单篇小红书笔记的异常响应安全上限；结构化详情不会套用通用 6 图上限。",
+    "default": 60
+  },
+  "xhs_auto_crawl_notify_enabled": {
+    "type": "bool",
+    "description": "登录失效、验证码、风控或上游契约异常导致暂停时是否发送一次管理员通知。",
+    "default": true
+  },
+  "xhs_auto_crawl_notify_use_astr_admins": {
+    "type": "bool",
+    "description": "小红书采集状态变化通知是否发送给 AstrBot 管理员私聊。",
+    "default": true
+  },
+  "xhs_auto_crawl_notify_targets": {
+    "type": "string",
+    "description": "额外状态通知目标，支持逗号/换行分隔 QQ 号或 unified_msg_origin。",
+    "default": ""
+  },
   "pixiv_backfill_default_pages": {
     "type": "int",
     "description": "WebUI 创建 Pixiv 历史回填任务时的默认页数上限。",
@@ -256,7 +346,7 @@
   },
   "xiaohongshu_cookie_string": {
     "type": "string",
-    "description": "小红书抓取所需的 Cookie 字符串。",
+    "description": "旧版小红书网页抓取 Cookie 配置（已停用）；新版通过隔离提供者持有登录态。",
     "default": ""
   }
 }

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 from difflib import SequenceMatcher
-from typing import Iterable
+from typing import Awaitable, Callable, Iterable
 
 from astrbot.api import logger
 
@@ -15,6 +17,7 @@ from .pixiv_app_api import PixivAppClient
 from .pixiv_tag_terms import known_pixiv_query_terms
 from .review_service import ReviewService
 from .tag_cleaner import TagCleaner
+from .xhs_provider import XhsProviderClient, XhsProviderError
 
 
 class CrawlService:
@@ -26,12 +29,15 @@ class CrawlService:
         reviewer: ReviewService,
         config,
         pixiv_client: PixivAppClient | None = None,
+        xhs_provider_client: XhsProviderClient | None = None,
     ) -> None:
         self.db = db
         self.importer = importer
         self.reviewer = reviewer
         self.config = config
         self.pixiv_client = pixiv_client
+        self.xhs_provider_client = xhs_provider_client
+        self._xhs_pause_handler: Callable[[XhsProviderError], Awaitable[None] | None] | None = None
         self.tag_cleaner = TagCleaner(config)
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._queued_ids: set[int] = set()
@@ -40,6 +46,12 @@ class CrawlService:
 
     def _keep_primary_tags_only(self) -> bool:
         return bool(self.config.get("crawl_keep_primary_tags_only", True))
+
+    def set_xhs_pause_handler(
+        self,
+        handler: Callable[[XhsProviderError], Awaitable[None] | None] | None,
+    ) -> None:
+        self._xhs_pause_handler = handler
 
     def queue_size(self) -> int:
         return int(self._queue.qsize())
@@ -71,6 +83,7 @@ class CrawlService:
         source_url: str,
         tags: list[str],
         *,
+        source_context: dict | None = None,
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = "exact",
@@ -84,6 +97,7 @@ class CrawlService:
             normalized_platform,
             source_url,
             tags,
+            source_context=source_context,
             include_tags=include_tags,
             exclude_tags=exclude_tags,
             match_mode=match_mode,
@@ -97,6 +111,7 @@ class CrawlService:
         source_url: str,
         tags: list[str],
         *,
+        source_context: dict | None = None,
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = "exact",
@@ -110,6 +125,7 @@ class CrawlService:
             normalized_platform,
             source_url,
             tags,
+            source_context=source_context,
             include_tags=include_tags,
             exclude_tags=exclude_tags,
             match_mode=match_mode,
@@ -158,6 +174,12 @@ class CrawlService:
         attempt_count = self.db.increment_crawl_job_attempt(job_id)
         platform = str(row["platform"])
         source_url = str(row["source_url"])
+        try:
+            source_context = json.loads(str(row["source_context_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            source_context = {}
+        if not isinstance(source_context, dict):
+            source_context = {}
         job_rules = CrawlTagRules.from_db_row(row)
         default_rules = CrawlTagRules.from_config(self.config)
         manual_tags = job_rules.manual_tags
@@ -174,6 +196,7 @@ class CrawlService:
             platform,
             config=self.config,
             pixiv_client=self.pixiv_client,
+            xhs_provider_client=self.xhs_provider_client,
         )
         max_candidates = max(1, int(self.config.get("crawler_max_candidates", 6) or 6))
         timeout_seconds = max(5, int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20))
@@ -188,11 +211,16 @@ class CrawlService:
                     source_url,
                     max_candidates=max_candidates,
                     timeout_seconds=timeout_seconds,
+                    source_context=source_context,
                 )
                 if candidates:
                     break
             except Exception as exc:
                 last_error = str(exc)
+                if platform == "xiaohongshu" and isinstance(exc, XhsProviderError) and exc.pause_required:
+                    await self._handle_xhs_provider_pause(exc)
+                if getattr(exc, "retryable", True) is False:
+                    break
         if not candidates:
             self.db.update_crawl_job(job_id, status="failed", progress=0, error_log=last_error or "未解析到可下载图片")
             return
@@ -254,7 +282,7 @@ class CrawlService:
                     },
                 )
 
-                if self._keep_primary_tags_only():
+                if platform == "xiaohongshu" or self._keep_primary_tags_only():
                     tags = self._canonicalize_primary_tags(
                         manual_tags=manual_tags,
                         include_tags=include_tags,
@@ -343,6 +371,23 @@ class CrawlService:
             result_summary=summary,
             error_log="；".join(candidate_errors) if candidate_errors else "",
         )
+
+    async def _handle_xhs_provider_pause(self, error: XhsProviderError) -> None:
+        handler = self._xhs_pause_handler
+        if handler is None:
+            self.db.set_crawl_provider_state(
+                "xiaohongshu",
+                status="paused",
+                category=error.category,
+                reason=str(error),
+            )
+            return
+        try:
+            result = handler(error)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(f"[PJSKPic] 小红书暂停通知失败: {exc}", exc_info=True)
 
     @staticmethod
     def _merge_tags(manual_tags: Iterable[str], raw_tags: Iterable[str]) -> list[str]:

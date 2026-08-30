@@ -30,6 +30,8 @@ from .core import (
     SubmissionNotifyService,
     SubmissionService,
     TagGovernanceService,
+    XhsAutoCrawlService,
+    XhsProviderClient,
     extract_query_from_text,
     normalize_tag_status,
     normalize_tag_type,
@@ -55,6 +57,7 @@ class PJSKPicPlugin(Star):
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_pjsk_pic")
         self.db = ImageIndexDB(self.data_dir / "image_index.db")
         self.pixiv_client = PixivAppClient(config)
+        self.xhs_provider_client = XhsProviderClient(config)
         self.indexer = LibraryIndexer(self.db)
         self.importer = ImportedImageService(
             self.db,
@@ -62,6 +65,10 @@ class PJSKPicPlugin(Star):
             timeout_seconds=self._crawler_timeout(),
             enable_phash_dedupe=bool(self.config.get("enable_phash_dedupe", True)),
             phash_max_distance=int(self.config.get("phash_max_distance", 8) or 8),
+            max_download_bytes=int(
+                self.config.get("crawler_max_image_bytes", 25 * 1024 * 1024)
+                or 25 * 1024 * 1024
+            ),
         )
         self.reviewer = ReviewService(context, self.db, config)
         self.crawl_service = CrawlService(
@@ -70,6 +77,7 @@ class PJSKPicPlugin(Star):
             reviewer=self.reviewer,
             config=config,
             pixiv_client=self.pixiv_client,
+            xhs_provider_client=self.xhs_provider_client,
         )
         self.auto_crawl_service = AutoCrawlService(
             db=self.db,
@@ -77,6 +85,14 @@ class PJSKPicPlugin(Star):
             config=config,
             pixiv_client=self.pixiv_client,
         )
+        self.xhs_auto_crawl_service = XhsAutoCrawlService(
+            db=self.db,
+            crawl_service=self.crawl_service,
+            config=config,
+            provider_client=self.xhs_provider_client,
+            context=context,
+        )
+        self.crawl_service.set_xhs_pause_handler(self.xhs_auto_crawl_service.pause_for_error)
         self.pixiv_backfill_service = PixivBackfillService(
             db=self.db,
             crawl_service=self.crawl_service,
@@ -110,6 +126,7 @@ class PJSKPicPlugin(Star):
         await self.crawl_service.start()
         await self.pixiv_backfill_service.start()
         await self.auto_crawl_service.start()
+        await self.xhs_auto_crawl_service.start()
         if self._webui_enabled():
             try:
                 await self.webui.start(
@@ -123,10 +140,12 @@ class PJSKPicPlugin(Star):
     async def terminate(self) -> None:
         await self.qq_review_service.clear()
         await self.webui.stop()
+        await self.xhs_auto_crawl_service.stop()
         await self.auto_crawl_service.stop()
         await self.pixiv_backfill_service.stop()
         await self.crawl_service.stop()
         self.pixiv_client.close()
+        self.xhs_provider_client.close()
 
     def _library_root(self) -> Path:
         configured = str(self.config.get("library_root", "") or "").strip()
@@ -396,16 +415,22 @@ class PJSKPicPlugin(Star):
             reviewer_id = "unknown"
         return origin, reviewer_id
 
-    def _resolve_qq_review_tag(self, raw_query: str) -> tuple[str | None, str, list[str]]:
+    def _resolve_qq_review_tag(
+        self,
+        raw_query: str,
+        *,
+        platform: str = "pixiv",
+    ) -> tuple[str | None, str, list[str]]:
         query = str(raw_query or "").strip()
         if not query:
             return None, "", []
         direct = self.db.resolve_tag(query, allow_fuzzy=False)
         if direct.matched and direct.tag_name:
             return str(direct.tag_name), str(direct.match_type or ""), []
-        platform = self.db.resolve_platform_term("pixiv", query)
-        if platform.matched and platform.tag_name:
-            return str(platform.tag_name), str(platform.match_type or "platform:pixiv"), []
+        platform_text = str(platform or "pixiv").strip().lower() or "pixiv"
+        platform_match = self.db.resolve_platform_term(platform_text, query)
+        if platform_match.matched and platform_match.tag_name:
+            return str(platform_match.tag_name), str(platform_match.match_type or f"platform:{platform_text}"), []
         fuzzy = self.db.resolve_tag(
             query,
             allow_fuzzy=True,
@@ -440,19 +465,20 @@ class PJSKPicPlugin(Star):
                 seen_candidates.add(key)
                 candidate_tags.append(tag_name)
 
-        pixiv_source = next(
+        source_platform = str(session.platform or "pixiv").strip().lower() or "pixiv"
+        source = next(
             (
                 item
                 for item in list(detail.get("sources") or [])
-                if str(item.get("platform") or "").strip().lower() == "pixiv"
+                if str(item.get("platform") or "").strip().lower() == source_platform
             ),
             {},
         )
-        extra = pixiv_source.get("extra") if isinstance(pixiv_source.get("extra"), dict) else {}
+        extra = source.get("extra") if isinstance(source.get("extra"), dict) else {}
         source_terms: list[str] = []
         seen_terms: set[str] = set()
         for value in [
-            *list(pixiv_source.get("raw_tags") or []),
+            *list(source.get("raw_tags") or []),
             *list(extra.get("translated_tags") or []),
         ]:
             text = str(value or "").strip()
@@ -466,20 +492,20 @@ class PJSKPicPlugin(Star):
             visible_terms.append(f"…另 {len(source_terms) - source_limit} 个")
 
         lines = [
-            f"Pixiv 群友审核 · 图片 #{session.image_id}",
+            f"{self._review_platform_label(source_platform)} 群友审核 · 图片 #{session.image_id}",
             "候选 tag：" + ("、".join(candidate_tags) if candidate_tags else "无"),
         ]
         if session.filter_tag_name:
             lines.append(f"当前筛选：{session.filter_tag_name}")
         title = str(extra.get("title") or "").strip()
-        author = str(pixiv_source.get("author") or "").strip()
+        author = str(source.get("author") or "").strip()
         if title:
             lines.append(f"标题：{title}")
         if author:
             lines.append(f"作者：{author}")
         if visible_terms:
-            lines.append("Pixiv 来源词：" + "、".join(visible_terms))
-        post_url = str(pixiv_source.get("post_url") or "").strip()
+            lines.append(f"{self._review_platform_label(source_platform)} 来源词：" + "、".join(visible_terms))
+        post_url = str(source.get("post_url") or "").strip()
         if post_url:
             lines.append(f"来源：{post_url}")
         if remaining is not None:
@@ -489,7 +515,7 @@ class PJSKPicPlugin(Star):
                 "通过并归类：.pp 审图通过 <最终tag>",
                 "整图不要：.pp 审图拒绝 [原因]",
                 "换一张：.pp 审图跳过",
-                "提示：整图拒绝会阻止这个 Pixiv 作品以后再次被抓取。",
+                f"提示：整图拒绝会阻止这个{self._review_platform_label(source_platform)}来源以后再次被抓取。",
             ]
         )
         await event.send(MessageChain().file_image(str(image_path)))
@@ -500,6 +526,7 @@ class PJSKPicPlugin(Star):
         self,
         event: AstrMessageEvent,
         *,
+        platform: str = "pixiv",
         filter_tag_id: int = 0,
         filter_tag_name: str = "",
         replace_current: bool = True,
@@ -509,13 +536,18 @@ class PJSKPicPlugin(Star):
             session, remaining = await self.qq_review_service.claim_next(
                 origin=origin,
                 reviewer_id=reviewer_id,
+                platform=platform,
                 filter_tag_id=filter_tag_id,
                 filter_tag_name=filter_tag_name,
                 replace_current=replace_current,
             )
             if session is None:
                 scope = f"候选 tag“{filter_tag_name}”下" if filter_tag_name else ""
-                await event.send(MessageChain().message(f"当前{scope}没有可领取的 Pixiv 待审图片。"))
+                await event.send(
+                    MessageChain().message(
+                        f"当前{scope}没有可领取的 {self._review_platform_label(platform)} 待审图片。"
+                    )
+                )
                 return False
             if await self._send_qq_review_session(event, session, remaining=remaining):
                 return True
@@ -527,6 +559,11 @@ class PJSKPicPlugin(Star):
             replace_current = True
         await event.send(MessageChain().message("连续抽到文件不可用的待审记录，请稍后重试或联系管理员检查图库文件。"))
         return False
+
+    @staticmethod
+    def _review_platform_label(platform: str) -> str:
+        normalized = str(platform or "pixiv").strip().lower()
+        return {"pixiv": "Pixiv", "xiaohongshu": "小红书"}.get(normalized, normalized or "来源平台")
 
     def _resolve_existing_tag_name(self, raw_query: str, *, allow_fuzzy: bool = False) -> tuple[str | None, str]:
         query = str(raw_query or "").strip()
@@ -605,6 +642,7 @@ class PJSKPicPlugin(Star):
     def _sync_auto_crawl_subscriptions_safe(self) -> None:
         try:
             self.auto_crawl_service._sync_subscriptions()
+            self.xhs_auto_crawl_service._sync_subscriptions()
         except Exception as exc:
             logger.warning(f"[PJSKPic] 自动采集订阅同步失败: {exc}", exc_info=True)
 
@@ -1342,6 +1380,82 @@ class PJSKPicPlugin(Star):
             message = f"已将 {canonical_tag_name} 状态设置为：{tag_status_label(resolved_status)}。"
         yield event.plain_result(message if ok else f"设置失败：{message}")
 
+    @pjsk_gallery.command("平台词添加")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def add_platform_term_command(
+        self,
+        event: AstrMessageEvent,
+        platform: str,
+        tag_name: str,
+        term_type: str,
+        term: str,
+    ):
+        platform_text = {
+            "p站": "pixiv",
+            "pixiv": "pixiv",
+            "小红书": "xiaohongshu",
+            "xhs": "xiaohongshu",
+            "xiaohongshu": "xiaohongshu",
+            "x": "x",
+            "twitter": "x",
+        }.get(str(platform or "").strip().casefold(), str(platform or "").strip().lower())
+        if platform_text not in {"pixiv", "xiaohongshu", "x"}:
+            yield event.plain_result("平台无效，可用：pixiv、小红书、x。")
+            return
+        canonical, _ = self._resolve_existing_tag_name(tag_name, allow_fuzzy=False)
+        if not canonical:
+            yield event.plain_result(f"添加失败：没有找到 tag 或 alias：{tag_name}")
+            return
+        ok, message = self.db.add_platform_term(
+            canonical,
+            term,
+            platform=platform_text,
+            term_type=term_type,
+            source="qq_admin",
+            confidence=1.0,
+        )
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
+        yield event.plain_result(message if ok else f"添加失败：{message}")
+
+    @pjsk_gallery.command("平台词列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_platform_terms_command(
+        self,
+        event: AstrMessageEvent,
+        platform: str,
+        tag_name: str = "",
+    ):
+        platform_text = {
+            "p站": "pixiv",
+            "小红书": "xiaohongshu",
+            "xhs": "xiaohongshu",
+            "twitter": "x",
+        }.get(str(platform or "").strip().casefold(), str(platform or "").strip().lower())
+        rows = self.db.list_platform_terms(
+            tag_name=str(tag_name or "").strip(),
+            platform=platform_text,
+            limit=100,
+        )
+        if not rows:
+            yield event.plain_result("没有找到对应平台词。")
+            return
+        lines = [f"{self._review_platform_label(platform_text)} 平台词："]
+        for row in rows:
+            lines.append(
+                f"#{row['id']} {row['tag_name']} <- {row['term']} "
+                f"[{row['term_type']}]（{row['source']}）"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    @pjsk_gallery.command("平台词删除")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def remove_platform_term_command(self, event: AstrMessageEvent, term_id: int):
+        ok, message = self.db.remove_platform_term(int(term_id))
+        if ok:
+            self._sync_auto_crawl_subscriptions_safe()
+        yield event.plain_result(message if ok else f"删除失败：{message}")
+
     @pjsk_gallery.command("tag清理预览")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def preview_tag_cleanup(self, event: AstrMessageEvent):
@@ -1447,12 +1561,15 @@ class PJSKPicPlugin(Star):
         job_counts = self.db.count_crawl_jobs_by_status()
         backfill_counts = self.db.count_pixiv_backfill_tasks_by_status()
         pixiv_subs = self.db.list_crawl_subscriptions(platform="pixiv", limit=1000)
+        xhs_subs = self.db.list_crawl_subscriptions(platform="xiaohongshu", limit=1000)
         enabled_pixiv_subs = [row for row in pixiv_subs if int(row["enabled"] or 0) == 1]
+        enabled_xhs_subs = [row for row in xhs_subs if int(row["enabled"] or 0) == 1]
         last_checked = max([str(row["last_checked_at"] or "") for row in pixiv_subs] or [""]) or "-"
         last_success = max([str(row["last_success_at"] or "") for row in pixiv_subs] or [""]) or "-"
         latest_job = self.db.get_latest_crawl_job()
         latest_failed = self.db.get_latest_crawl_job(statuses=("failed",))
         latest_subscription_error = self.db.get_latest_crawl_subscription_error(platform="pixiv")
+        xhs_state = self.xhs_auto_crawl_service.state()
 
         lines = [
             "采集诊断：",
@@ -1460,6 +1577,9 @@ class PJSKPicPlugin(Star):
             f"Pixiv 自动采集：{'启用' if self.auto_crawl_service.enabled() else '未启用'} / {'运行中' if self.auto_crawl_service.running() else '未运行'}",
             f"Pixiv refresh token：{'已配置' if self.auto_crawl_service.has_refresh_token() else '未配置'}",
             f"Pixiv 自动订阅：启用 {len(enabled_pixiv_subs)} / 总计 {len(pixiv_subs)}",
+            f"小红书自动采集：{'启用' if self.xhs_auto_crawl_service.enabled() else '未启用'} / "
+            f"{'已暂停' if self.xhs_auto_crawl_service.paused() else ('运行中' if self.xhs_auto_crawl_service.running() else '未运行')}",
+            f"小红书自动订阅：启用 {len(enabled_xhs_subs)} / 总计 {len(xhs_subs)}",
             f"最近检查：{last_checked}",
             f"最近成功：{last_success}",
             f"采集任务状态：{self._format_status_counts(job_counts, ('pending', 'retry', 'running', 'failed', 'completed'))}",
@@ -1482,6 +1602,18 @@ class PJSKPicPlugin(Star):
                 + f"   错误：{self._short_text(str(latest_subscription_error['last_error'] or ''), 180) or '-'}\n"
                 + f"   更新：{latest_subscription_error['updated_at']}"
             )
+        if xhs_state:
+            lines.append(
+                "小红书提供者状态："
+                + f"{xhs_state['status']}；最近检查 {xhs_state['last_checked_at'] or '-'}；"
+                + f"最近成功 {xhs_state['last_success_at'] or '-'}"
+            )
+            if str(xhs_state["paused_reason"] or "").strip():
+                lines.append(
+                    "小红书暂停原因："
+                    + f"{xhs_state['paused_category'] or 'unknown'} / "
+                    + self._short_text(str(xhs_state["paused_reason"] or ""), 180)
+                )
         lines.append("失败任务可用 .pp 失败列表 查看，或 .pp 失败重试 <job_id> 重新入队。")
         yield event.plain_result("\n".join(lines))
 
@@ -1588,6 +1720,96 @@ class PJSKPicPlugin(Star):
             f"过滤跳过 {summary['skipped_filtered']} 个，错误 {summary['errors']} 个。"
         )
 
+    @pjsk_gallery.command("小红书采集状态")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def xhs_auto_crawl_status(self, event: AstrMessageEvent):
+        rows = self.db.list_crawl_subscriptions(
+            platform="xiaohongshu",
+            enabled_only=True,
+            limit=200,
+        )
+        discovery_stats = self.db.count_crawl_discoveries_by_status(platform="xiaohongshu")
+        state = self.xhs_auto_crawl_service.state()
+        state_text = str(state["status"] or "active") if state else "active"
+        lines = [
+            "小红书自动采集状态：",
+            f"已启用：{'是' if self.xhs_auto_crawl_service.enabled() else '否'}",
+            f"调度器：{'运行中' if self.xhs_auto_crawl_service.running() else '未运行'}",
+            f"提供者状态：{state_text}",
+            f"提供者地址：{self.xhs_provider_client.base_url()}",
+            f"轮询间隔：{self.xhs_auto_crawl_service.interval_minutes()} 分钟",
+            f"自动订阅：{len(rows)} 个",
+            f"待提交发现：{discovery_stats.get('pending', 0)}",
+            f"单轮预算：查询 {self.xhs_auto_crawl_service.max_queries_per_cycle()} / "
+            f"详情 {self.xhs_auto_crawl_service.max_details_per_cycle()} / "
+            f"新任务 {self.xhs_auto_crawl_service.max_new_jobs_per_cycle()}",
+        ]
+        if state:
+            lines.append(f"最近检查：{state['last_checked_at'] or '-'}")
+            lines.append(f"最近成功：{state['last_success_at'] or '-'}")
+            if str(state["paused_reason"] or "").strip():
+                lines.append(
+                    f"暂停原因：{state['paused_category'] or 'unknown'} / "
+                    f"{self._short_text(str(state['paused_reason'] or ''), 300)}"
+                )
+        lines.append("未配置显式 xiaohongshu query + match/both 平台词的 tag 不会被搜索。")
+        yield event.plain_result("\n".join(lines))
+
+    @pjsk_gallery.command("小红书采集列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def xhs_auto_crawl_list(self, event: AstrMessageEvent):
+        rows = self.db.list_crawl_subscriptions(
+            platform="xiaohongshu",
+            enabled_only=True,
+            limit=30,
+        )
+        if not rows:
+            yield event.plain_result("当前没有启用中的小红书自动采集订阅。")
+            return
+        lines = ["当前小红书自动采集订阅："]
+        for row in rows:
+            terms = self.db.list_crawl_subscription_terms(int(row["id"]))
+            lines.append(
+                "\n".join(
+                    [
+                        f"#{row['id']} {row['tag_name']}",
+                        "query：" + ("、".join(str(term["query_term"]) for term in terms) or "-"),
+                        f"last_seen：{row['last_seen_source_uid'] or '-'}",
+                        f"last_checked：{row['last_checked_at'] or '-'}",
+                        f"last_error：{row['last_error'] or '-'}",
+                    ]
+                )
+            )
+        yield event.plain_result("\n\n".join(lines))
+
+    @pjsk_gallery.command("小红书采集执行")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def run_xhs_auto_crawl_once(self, event: AstrMessageEvent, tag_name: str = ""):
+        summary = await self.xhs_auto_crawl_service.run_once(force=True, tag_name=tag_name)
+        if summary["paused"]:
+            yield event.plain_result("小红书自动采集当前已暂停，请先查看状态并处理原因。")
+            return
+        yield event.plain_result(
+            "小红书自动采集执行完成：\n"
+            f"订阅 {summary['subscriptions']}，检查 {summary['checked']}，搜索 {summary['searched']}，"
+            f"详情 {summary['detailed']}，匹配 {summary['matched']}，新发现 {summary['discovered']}，"
+            f"入队 {summary['queued']}，已存在 {summary['skipped_existing']}，"
+            f"已拒绝 {summary['skipped_rejected']}，过滤 {summary['skipped_filtered']}，"
+            f"错误 {summary['errors']}。"
+        )
+
+    @pjsk_gallery.command("小红书采集暂停")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def pause_xhs_auto_crawl(self, event: AstrMessageEvent, reason: str = ""):
+        changed = await self.xhs_auto_crawl_service.pause_manually(reason or "管理员手动暂停")
+        yield event.plain_result("小红书自动采集已暂停。" if changed else "小红书自动采集已经处于暂停状态。")
+
+    @pjsk_gallery.command("小红书采集恢复")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def resume_xhs_auto_crawl(self, event: AstrMessageEvent):
+        changed = await self.xhs_auto_crawl_service.resume()
+        yield event.plain_result("小红书自动采集已恢复。" if changed else "小红书自动采集当前未暂停。")
+
     @pjsk_gallery.command("历史回填添加")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def add_pixiv_backfill_task(
@@ -1650,7 +1872,7 @@ class PJSKPicPlugin(Star):
             "\n".join(
                 [
                     "PJSK 群友审图命令：",
-                    ".pp 随机审核 [候选tag]：随机领取一张 Pixiv 待审图",
+                    ".pp 随机审核 [Pixiv|小红书] [候选tag]：随机领取一张指定来源待审图",
                     ".pp 审图通过 <最终tag>：归入指定现有主 tag",
                     ".pp 审图拒绝 [原因]：整图拒绝并阻止以后重复抓取",
                     ".pp 审图跳过：不修改审核结果并换一张",
@@ -1662,17 +1884,37 @@ class PJSKPicPlugin(Star):
         )
 
     @pjsk_gallery.command("随机审核", alias={"抽审"})
-    async def claim_random_qq_review(self, event: AstrMessageEvent, candidate_tag: str = ""):
+    async def claim_random_qq_review(
+        self,
+        event: AstrMessageEvent,
+        platform_or_tag: str = "",
+        candidate_tag: str = "",
+    ):
         if not self._qq_review_enabled():
             yield event.plain_result("群友审图当前未启用。")
             return
         filter_tag_id = 0
         filter_tag_name = ""
-        query = str(candidate_tag or "").strip()
+        first = str(platform_or_tag or "").strip()
+        normalized_first = first.casefold()
+        platform_aliases = {
+            "pixiv": "pixiv",
+            "p站": "pixiv",
+            "小红书": "xiaohongshu",
+            "xhs": "xiaohongshu",
+            "rednote": "xiaohongshu",
+            "xiaohongshu": "xiaohongshu",
+        }
+        platform = platform_aliases.get(normalized_first, "pixiv")
+        query = str(candidate_tag or "").strip() if normalized_first in platform_aliases else first
         if query:
-            resolved, _, candidates = self._resolve_qq_review_tag(query)
+            resolved, _, candidates = self._resolve_qq_review_tag(query, platform=platform)
             if not resolved:
-                hint = f"你想找的是不是：{'、'.join(candidates)}" if candidates else "请使用已经存在的主 tag、alias 或 Pixiv 平台词。"
+                hint = (
+                    f"你想找的是不是：{'、'.join(candidates)}"
+                    if candidates
+                    else f"请使用已经存在的主 tag、alias 或 {self._review_platform_label(platform)} 平台词。"
+                )
                 yield event.plain_result(f"没有精确找到候选 tag“{query}”。{hint}")
                 return
             row = self.db.get_tag_row(resolved)
@@ -1683,6 +1925,7 @@ class PJSKPicPlugin(Star):
             filter_tag_name = str(row["name"])
         await self._claim_and_send_qq_review(
             event,
+            platform=platform,
             filter_tag_id=filter_tag_id,
             filter_tag_name=filter_tag_name,
             replace_current=True,
@@ -1697,12 +1940,19 @@ class PJSKPicPlugin(Star):
         if not query:
             yield event.plain_result("请指定最终 tag，例如：.pp 审图通过 晓山瑞希")
             return
-        resolved, match_type, candidates = self._resolve_qq_review_tag(query)
+        origin, reviewer_id = self._qq_review_identity(event)
+        current = await self.qq_review_service.get_current(origin=origin, reviewer_id=reviewer_id)
+        if current is None:
+            yield event.plain_result("当前没有领取中的审核图片，请先发送 .pp 随机审核。")
+            return
+        resolved, match_type, candidates = self._resolve_qq_review_tag(
+            query,
+            platform=current.platform,
+        )
         if not resolved:
             hint = f"你想选的是不是：{'、'.join(candidates)}" if candidates else "请先在图库中建立这个主 tag。"
             yield event.plain_result(f"没有精确找到 tag“{query}”，未提交审核。{hint}")
             return
-        origin, reviewer_id = self._qq_review_identity(event)
         ok, result = await self.qq_review_service.approve_current(
             origin=origin,
             reviewer_id=reviewer_id,
@@ -1711,7 +1961,10 @@ class PJSKPicPlugin(Star):
         if not ok:
             await event.send(MessageChain().message(f"处理失败：{result.get('message') or '未知错误'}"))
             if result.get("code") == "stale_session" and self._qq_review_auto_next():
-                await self._claim_and_send_qq_review(event)
+                await self._claim_and_send_qq_review(
+                    event,
+                    platform=str(result.get("platform", "pixiv") or "pixiv"),
+                )
             return
         await event.send(
             MessageChain().message(
@@ -1722,6 +1975,7 @@ class PJSKPicPlugin(Star):
         if self._qq_review_auto_next():
             await self._claim_and_send_qq_review(
                 event,
+                platform=str(result.get("platform", "pixiv") or "pixiv"),
                 filter_tag_id=int(result.get("filter_tag_id", 0) or 0),
                 filter_tag_name=str(result.get("filter_tag_name", "") or ""),
             )
@@ -1740,16 +1994,21 @@ class PJSKPicPlugin(Star):
         if not ok:
             await event.send(MessageChain().message(f"处理失败：{result.get('message') or '未知错误'}"))
             if result.get("code") == "stale_session" and self._qq_review_auto_next():
-                await self._claim_and_send_qq_review(event)
+                await self._claim_and_send_qq_review(
+                    event,
+                    platform=str(result.get("platform", "pixiv") or "pixiv"),
+                )
             return
         await event.send(
             MessageChain().message(
-                f"已整图拒绝图片 #{int(result.get('image_id', 0) or 0)}；该 Pixiv 作品以后不会再次进入采集队列。"
+                f"已整图拒绝图片 #{int(result.get('image_id', 0) or 0)}；"
+                f"该 {self._review_platform_label(str(result.get('platform', 'pixiv')))} 来源以后不会再次进入采集队列。"
             )
         )
         if self._qq_review_auto_next():
             await self._claim_and_send_qq_review(
                 event,
+                platform=str(result.get("platform", "pixiv") or "pixiv"),
                 filter_tag_id=int(result.get("filter_tag_id", 0) or 0),
                 filter_tag_name=str(result.get("filter_tag_name", "") or ""),
             )
@@ -1771,6 +2030,7 @@ class PJSKPicPlugin(Star):
         await event.send(MessageChain().message(f"已跳过图片 #{session.image_id}，审核状态未改变。"))
         await self._claim_and_send_qq_review(
             event,
+            platform=session.platform,
             filter_tag_id=session.filter_tag_id,
             filter_tag_name=session.filter_tag_name,
         )
@@ -1785,7 +2045,8 @@ class PJSKPicPlugin(Star):
         if session is None:
             yield event.plain_result("当前没有领取中的审核图片，请先发送 .pp 随机审核。")
             return
-        remaining = self.db.count_open_pixiv_review_images(
+        remaining = self.db.count_open_review_images(
+            platform=session.platform,
             statuses=QQReviewSessionService.OPEN_STATUSES,
             candidate_tag_id=session.filter_tag_id or None,
         )
@@ -2076,6 +2337,8 @@ class PJSKPicPlugin(Star):
             "抓图": "crawl",
             "crawl": "crawl",
             "pixiv": "crawl",
+            "小红书": "crawl",
+            "xhs": "crawl",
         }
         topic = aliases.get(key, "")
         if topic == "submission":
@@ -2111,7 +2374,7 @@ class PJSKPicPlugin(Star):
             return "\n".join(
                 [
                     "PJSK 审核命令：",
-                    ".pp 随机审核 [候选tag]：群友随机领取 Pixiv 待审图",
+                    ".pp 随机审核 [Pixiv|小红书] [候选tag]：群友随机领取指定来源待审图",
                     ".pp 审图通过 <最终tag>；.pp 审图拒绝 [原因]；.pp 审图跳过",
                     ".pp 审图当前；.pp 审图结束；.pp 审图帮助",
                     ".pp 审核列表 [status]：查看最近审核任务",
@@ -2133,6 +2396,11 @@ class PJSKPicPlugin(Star):
                     ".pp 失败重试 <job_id|全部>",
                     ".pp 自动采集状态",
                     ".pp 历史回填添加 <tag> [页数上限] [扫描上限] [入队上限]",
+                    ".pp 平台词添加 <Pixiv|小红书> <tag> <query|match|both> <term>",
+                    ".pp 平台词列表 <Pixiv|小红书> [tag]；.pp 平台词删除 <term_id>",
+                    ".pp 小红书采集状态；.pp 小红书采集列表",
+                    ".pp 小红书采集执行 [tag]；.pp 小红书采集暂停 [原因]；.pp 小红书采集恢复",
+                    "小红书只采集配置了显式 query 与 match/both 平台词的 tag。",
                 ]
             )
         return "\n".join(
@@ -2141,7 +2409,7 @@ class PJSKPicPlugin(Star):
                 "管理子命令可省略 pp，例如 .统计；原 .pp 统计 仍可使用。",
                 "发图：看看初音未来、来张 miku、看看id123",
                 "投稿：.tg <tag>，可用 .pp 帮助 投稿 查看 alias 写法",
-                "群友审图：.pp 随机审核，可用 .pp 审图帮助 查看完整流程",
+                "群友审图：.pp 随机审核 [Pixiv|小红书]，可用 .pp 审图帮助 查看完整流程",
                 "管理：.pp 统计、.pp 查看 <tag>、.pp 看图 <image_id>",
                 "面板：.pp 面板地址",
                 "分组帮助：.pp 帮助 投稿、tag、审核、采集",

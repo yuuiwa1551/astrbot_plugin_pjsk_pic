@@ -39,7 +39,7 @@ class QQReviewTestCase(unittest.IsolatedAsyncioTestCase):
     def _clock(self) -> float:
         return self.clock_value
 
-    def _add_pending_image(self, name: str, tags: list[str]) -> int:
+    def _add_pending_image(self, name: str, tags: list[str], *, platform: str = "pixiv") -> int:
         file_path = self.root / f"{name}.jpg"
         file_path.write_bytes(f"image-{name}".encode("utf-8"))
         image_id = self.db.upsert_image(
@@ -50,11 +50,21 @@ class QQReviewTestCase(unittest.IsolatedAsyncioTestCase):
             height=100,
             format_="jpeg",
         )
+        post_url = (
+            f"https://www.xiaohongshu.com/explore/{image_id}"
+            if platform == "xiaohongshu"
+            else f"https://www.pixiv.net/artworks/{image_id}"
+        )
+        image_url = (
+            f"https://sns-webpic-qc.xhscdn.com/{image_id}.webp"
+            if platform == "xiaohongshu"
+            else f"https://i.pximg.net/{image_id}.jpg"
+        )
         self.db.upsert_source(
             image_id,
-            "pixiv",
-            f"https://www.pixiv.net/artworks/{image_id}",
-            f"https://i.pximg.net/{image_id}.jpg",
+            platform,
+            post_url,
+            image_url,
             author="tester",
             raw_tags=tags,
             extra_json={"translated_tags": tags},
@@ -64,7 +74,7 @@ class QQReviewTestCase(unittest.IsolatedAsyncioTestCase):
             self.db.link_image_tag(
                 image_id,
                 tag_id,
-                source_type="crawl:pixiv",
+                source_type=f"crawl:{platform}",
                 review_status="pending",
             )
             self.db.create_review_task(image_id, tag_id, "pending", reason="test")
@@ -174,6 +184,37 @@ class QQReviewTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(ok)
         self.assertEqual("stale_session", result["code"])
+
+    async def test_xiaohongshu_review_is_claimed_and_approved_in_qq_flow(self) -> None:
+        image_id = self._add_pending_image(
+            "xhs",
+            ["初音未来"],
+            platform="xiaohongshu",
+        )
+        service = self._service()
+        session, remaining = await service.claim_next(
+            origin="group:1",
+            reviewer_id="10001",
+            platform="xiaohongshu",
+        )
+        self.assertIsNotNone(session)
+        self.assertEqual(image_id, session.image_id)
+        self.assertEqual("xiaohongshu", session.platform)
+        self.assertEqual(1, remaining)
+
+        ok, result = await service.approve_current(
+            origin="group:1",
+            reviewer_id="10001",
+            tag_name="初音未来",
+        )
+        self.assertTrue(ok, result)
+        self.assertEqual("xiaohongshu", result["platform"])
+        self.assertFalse(
+            self.db.is_open_review_image(
+                image_id,
+                platform="xiaohongshu",
+            )
+        )
 
 
 if __name__ == "__main__":

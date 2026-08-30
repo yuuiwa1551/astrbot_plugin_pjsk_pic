@@ -2464,7 +2464,13 @@ class GalleryWebUI:
             return denied
         if request.method == "GET":
             rows = self.db.list_crawl_jobs(limit=50)
-            return self._json_response({"items": [dict(row) for row in rows]})
+            items = []
+            for row in rows:
+                item = dict(row)
+                source_context = str(item.pop("source_context_json", "") or "").strip()
+                item["has_source_context"] = bool(source_context and source_context != "{}")
+                items.append(item)
+            return self._json_response({"items": items})
 
         data = await self._json_body(request)
         platform = str(data.get("platform", "") or "").strip().lower()

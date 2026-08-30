@@ -17,7 +17,15 @@ class PixivAdapter(BaseCrawlAdapter):
         super().__init__("pixiv", config=config)
         self.pixiv_client = pixiv_client or PixivAppClient(self.config)
 
-    async def fetch_candidates(self, source_url: str, *, max_candidates: int = 8, timeout_seconds: int = 20) -> list[CrawlCandidate]:
+    async def fetch_candidates(
+        self,
+        source_url: str,
+        *,
+        max_candidates: int = 8,
+        timeout_seconds: int = 20,
+        source_context: dict | None = None,
+    ) -> list[CrawlCandidate]:
+        del source_context
         source_uid = self.extract_source_uid(source_url, "")
         refresh_token = self.refresh_token()
         if source_uid and refresh_token:

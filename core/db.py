@@ -162,6 +162,7 @@ class ImageIndexDB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     platform TEXT NOT NULL,
                     source_url TEXT NOT NULL,
+                    source_context_json TEXT DEFAULT '{}',
                     tags_text TEXT DEFAULT '',
                     include_tags_text TEXT DEFAULT '',
                     exclude_tags_text TEXT DEFAULT '',
@@ -234,6 +235,7 @@ class ImageIndexDB:
                     platform TEXT NOT NULL,
                     source_uid TEXT NOT NULL,
                     post_url TEXT NOT NULL,
+                    source_context_json TEXT DEFAULT '{}',
                     tags_text TEXT DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'pending',
                     crawl_job_id INTEGER DEFAULT 0,
@@ -241,6 +243,18 @@ class ImageIndexDB:
                     discovered_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(platform, source_uid)
+                );
+
+                CREATE TABLE IF NOT EXISTS crawl_provider_states (
+                    platform TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    paused_category TEXT DEFAULT '',
+                    paused_reason TEXT DEFAULT '',
+                    paused_at TEXT DEFAULT '',
+                    last_checked_at TEXT DEFAULT '',
+                    last_success_at TEXT DEFAULT '',
+                    last_error TEXT DEFAULT '',
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS pixiv_backfill_tasks (
@@ -393,6 +407,7 @@ class ImageIndexDB:
             self._ensure_column(conn, 'image_tags', 'review_reason', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'image_tags', 'updated_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_jobs', 'attempt_count', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'crawl_jobs', 'source_context_json', "TEXT DEFAULT '{}'")
             self._ensure_column(conn, 'crawl_jobs', 'include_tags_text', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_jobs', 'exclude_tags_text', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_jobs', 'tag_match_mode', "TEXT DEFAULT 'exact'")
@@ -403,6 +418,7 @@ class ImageIndexDB:
             self._ensure_column(conn, 'crawl_subscriptions', 'last_checked_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscriptions', 'last_success_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscriptions', 'last_error', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_discoveries', 'source_context_json', "TEXT DEFAULT '{}'")
             if not had_tag_type:
                 conn.execute(
                     "UPDATE tags SET tag_type = CASE WHEN is_character = 1 THEN 'character' ELSE 'other' END"
@@ -1944,13 +1960,14 @@ class ImageIndexDB:
         ).fetchone()
         if not target:
             return False, f'tag 不存在：{tag_id}'
-        if normalized_term == str(target['normalized_name'] or ''):
+        explicit_platform_opt_in = platform_text == 'xiaohongshu'
+        if normalized_term == str(target['normalized_name'] or '') and not explicit_platform_opt_in:
             return False, f'{platform_text} term 与主 tag 相同，无需单独保存'
         alias_exists = conn.execute(
             'SELECT 1 FROM tag_aliases WHERE tag_id = ? AND normalized_alias = ? LIMIT 1',
             (tag_id, normalized_term),
         ).fetchone()
-        if alias_exists:
+        if alias_exists and not explicit_platform_opt_in:
             return False, f'{platform_text} term 已被 alias 覆盖：{term_text}'
 
         existing = conn.execute(
@@ -3847,6 +3864,10 @@ class ImageIndexDB:
             match = re.search(r'(?:artworks/|illust_id=)(\d+)', raw_post_url)
             if match:
                 return f'https://www.pixiv.net/artworks/{match.group(1)}'
+        if platform_text == 'xiaohongshu':
+            match = re.search(r'/(?:explore|discovery/item|note)/([0-9A-Za-z]+)', raw_post_url)
+            if match:
+                return f'https://www.xiaohongshu.com/explore/{match.group(1)}'
         return raw_post_url.rstrip('/')
 
     @staticmethod
@@ -3854,6 +3875,10 @@ class ImageIndexDB:
         platform_text = str(platform or '').strip().lower()
         if platform_text == 'pixiv':
             match = re.search(r'(?:artworks/|illust_id=)(\d+)', str(post_url or ''))
+            if match:
+                return match.group(1)
+        if platform_text == 'xiaohongshu':
+            match = re.search(r'/(?:explore|discovery/item|note)/([0-9A-Za-z]+)', str(post_url or ''))
             if match:
                 return match.group(1)
         return ''
@@ -4008,7 +4033,7 @@ class ImageIndexDB:
             )
 
         return True, {
-            'message': f'已拒绝图片 #{image_id}，后续 Pixiv 来源搜图会跳过该作品',
+            'message': f'已拒绝图片 #{image_id}，后续 {platform_text} 来源搜图会跳过该作品',
             'image_id': int(image_id),
             'post_url': str(rejected_source['normalized_post_url'] or source['post_url']),
             'rejected_tasks': [str(row['tag_name']) for row in tasks],
@@ -4021,6 +4046,7 @@ class ImageIndexDB:
         source_url: str,
         tags: list[str],
         *,
+        source_context: dict[str, Any] | None = None,
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = 'exact',
@@ -4030,14 +4056,15 @@ class ImageIndexDB:
             cursor = conn.execute(
                 """
                 INSERT INTO crawl_jobs(
-                    platform, source_url, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
+                    platform, source_url, source_context_json, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
                     status, progress, error_log, result_summary, attempt_count, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
                 """,
                 (
                     platform,
                     source_url,
+                    self._serialize_source_context(source_context),
                     ','.join(tags),
                     ','.join(include_tags or []),
                     ','.join(exclude_tags or []),
@@ -4142,6 +4169,119 @@ class ImageIndexDB:
         sql += " ORDER BY updated_at DESC, id DESC LIMIT 1"
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchone()
+
+    def get_crawl_provider_state(self, platform: str) -> sqlite3.Row | None:
+        platform_text = str(platform or '').strip().lower()
+        if not platform_text:
+            return None
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                'SELECT * FROM crawl_provider_states WHERE platform = ? LIMIT 1',
+                (platform_text,),
+            ).fetchone()
+
+    def set_crawl_provider_state(
+        self,
+        platform: str,
+        *,
+        status: str,
+        category: str = '',
+        reason: str = '',
+    ) -> bool:
+        platform_text = str(platform or '').strip().lower()
+        status_text = str(status or '').strip().lower()
+        if not platform_text or status_text not in {'active', 'paused'}:
+            raise ValueError('提供者状态必须是 active 或 paused')
+        category_text = str(category or '').strip()[:100] if status_text == 'paused' else ''
+        reason_text = str(reason or '').strip()[:1000] if status_text == 'paused' else ''
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                'SELECT * FROM crawl_provider_states WHERE platform = ? LIMIT 1',
+                (platform_text,),
+            ).fetchone()
+            changed = (
+                (existing is None and status_text == 'paused')
+                or (
+                    existing is not None
+                    and (
+                        str(existing['status'] or '') != status_text
+                        or str(existing['paused_category'] or '') != category_text
+                        or str(existing['paused_reason'] or '') != reason_text
+                    )
+                )
+            )
+            paused_at = now if status_text == 'paused' else ''
+            if existing and status_text == 'paused' and str(existing['status'] or '') == 'paused':
+                paused_at = str(existing['paused_at'] or '') or now
+            conn.execute(
+                """
+                INSERT INTO crawl_provider_states(
+                    platform, status, paused_category, paused_reason, paused_at,
+                    last_checked_at, last_success_at, last_error, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, '', '', ?, ?)
+                ON CONFLICT(platform) DO UPDATE SET
+                    status = excluded.status,
+                    paused_category = excluded.paused_category,
+                    paused_reason = excluded.paused_reason,
+                    paused_at = excluded.paused_at,
+                    last_error = CASE
+                        WHEN excluded.status = 'active' THEN ''
+                        ELSE excluded.last_error
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    platform_text,
+                    status_text,
+                    category_text,
+                    reason_text,
+                    paused_at,
+                    reason_text,
+                    now,
+                ),
+            )
+        return changed
+
+    def record_crawl_provider_check(
+        self,
+        platform: str,
+        *,
+        success: bool,
+        error: str = '',
+    ) -> None:
+        platform_text = str(platform or '').strip().lower()
+        if not platform_text:
+            return
+        now = utcnow_str()
+        error_text = str(error or '').strip()[:1000]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO crawl_provider_states(
+                    platform, status, paused_category, paused_reason, paused_at,
+                    last_checked_at, last_success_at, last_error, updated_at
+                )
+                VALUES(?, 'active', '', '', '', ?, ?, ?, ?)
+                ON CONFLICT(platform) DO UPDATE SET
+                    last_checked_at = excluded.last_checked_at,
+                    last_success_at = CASE
+                        WHEN ? = 1 THEN excluded.last_success_at
+                        ELSE crawl_provider_states.last_success_at
+                    END,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    platform_text,
+                    now,
+                    now if success else '',
+                    '' if success else error_text,
+                    now,
+                    1 if success else 0,
+                ),
+            )
 
     def get_pending_job_ids(self) -> list[int]:
         with self._lock, self._connect() as conn:
@@ -4631,6 +4771,130 @@ class ImageIndexDB:
     @staticmethod
     def _normalize_review_statuses(statuses: Iterable[str] | None = None) -> list[str]:
         return split_status_filter(statuses or ["pending", "uncertain"])
+
+    def get_random_review_image(
+        self,
+        *,
+        platform: str,
+        statuses: Iterable[str] | None = None,
+        candidate_tag_id: int | None = None,
+        exclude_image_ids: Iterable[int] | None = None,
+    ) -> sqlite3.Row | None:
+        normalized_statuses = self._normalize_review_statuses(statuses)
+        platform_text = str(platform or '').strip().lower()
+        if not normalized_statuses or not platform_text:
+            return None
+        status_placeholders = ",".join("?" for _ in normalized_statuses)
+        sql = f"""
+            SELECT i.id AS image_id,
+                   i.file_path,
+                   MAX(rt.id) AS latest_review_id,
+                   COUNT(DISTINCT rt.id) AS review_task_count
+            FROM images i
+            JOIN review_tasks rt ON rt.image_id = i.id
+            WHERE i.is_active = 1
+              AND rt.status IN ({status_placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM sources s
+                  WHERE s.image_id = i.id AND s.platform = ?
+              )
+        """
+        params: list[Any] = [*normalized_statuses, platform_text]
+        wanted_tag_id = int(candidate_tag_id or 0)
+        if wanted_tag_id > 0:
+            sql += f"""
+              AND EXISTS (
+                  SELECT 1
+                  FROM review_tasks rt_filter
+                  WHERE rt_filter.image_id = i.id
+                    AND rt_filter.tag_id = ?
+                    AND rt_filter.status IN ({status_placeholders})
+              )
+            """
+            params.append(wanted_tag_id)
+            params.extend(normalized_statuses)
+        excluded = sorted(
+            {int(item) for item in (exclude_image_ids or []) if int(item or 0) > 0}
+        )[:500]
+        if excluded:
+            placeholders = ",".join("?" for _ in excluded)
+            sql += f" AND i.id NOT IN ({placeholders})"
+            params.extend(excluded)
+        sql += " GROUP BY i.id ORDER BY RANDOM() LIMIT 1"
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchone()
+
+    def count_open_review_images(
+        self,
+        *,
+        platform: str,
+        statuses: Iterable[str] | None = None,
+        candidate_tag_id: int | None = None,
+    ) -> int:
+        normalized_statuses = self._normalize_review_statuses(statuses)
+        platform_text = str(platform or '').strip().lower()
+        if not normalized_statuses or not platform_text:
+            return 0
+        status_placeholders = ",".join("?" for _ in normalized_statuses)
+        sql = f"""
+            SELECT COUNT(DISTINCT i.id) AS total
+            FROM images i
+            JOIN review_tasks rt ON rt.image_id = i.id
+            WHERE i.is_active = 1
+              AND rt.status IN ({status_placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM sources s
+                  WHERE s.image_id = i.id AND s.platform = ?
+              )
+        """
+        params: list[Any] = [*normalized_statuses, platform_text]
+        wanted_tag_id = int(candidate_tag_id or 0)
+        if wanted_tag_id > 0:
+            sql += f"""
+              AND EXISTS (
+                  SELECT 1
+                  FROM review_tasks rt_filter
+                  WHERE rt_filter.image_id = i.id
+                    AND rt_filter.tag_id = ?
+                    AND rt_filter.status IN ({status_placeholders})
+              )
+            """
+            params.append(wanted_tag_id)
+            params.extend(normalized_statuses)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def is_open_review_image(
+        self,
+        image_id: int,
+        *,
+        platform: str,
+        statuses: Iterable[str] | None = None,
+    ) -> bool:
+        normalized_statuses = self._normalize_review_statuses(statuses)
+        platform_text = str(platform or '').strip().lower()
+        if not normalized_statuses or not platform_text:
+            return False
+        placeholders = ",".join("?" for _ in normalized_statuses)
+        sql = f"""
+            SELECT 1
+            FROM images i
+            JOIN review_tasks rt ON rt.image_id = i.id
+            WHERE i.id = ?
+              AND i.is_active = 1
+              AND rt.status IN ({placeholders})
+              AND EXISTS (
+                  SELECT 1 FROM sources s
+                  WHERE s.image_id = i.id AND s.platform = ?
+              )
+            LIMIT 1
+        """
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                sql,
+                (int(image_id), *normalized_statuses, platform_text),
+            ).fetchone() is not None
 
     def get_random_pixiv_review_image(
         self,
@@ -5564,6 +5828,41 @@ class ImageIndexDB:
                 result.append(text)
         return result
 
+    @staticmethod
+    def _normalize_source_context(value: dict[str, Any] | str | None) -> dict[str, Any]:
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value or '{}')
+            except (TypeError, json.JSONDecodeError):
+                parsed = {}
+        else:
+            parsed = value
+        if not isinstance(parsed, dict):
+            return {}
+        try:
+            serialized = json.dumps(parsed, ensure_ascii=False)
+            normalized = json.loads(serialized)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return normalized if isinstance(normalized, dict) else {}
+
+    @classmethod
+    def _serialize_source_context(cls, value: dict[str, Any] | str | None) -> str:
+        return json.dumps(cls._normalize_source_context(value), ensure_ascii=False, separators=(',', ':'))
+
+    @classmethod
+    def _merge_source_context_values(
+        cls,
+        existing: dict[str, Any] | str | None,
+        incoming: dict[str, Any] | str | None,
+    ) -> dict[str, Any]:
+        merged = cls._normalize_source_context(existing)
+        for key, value in cls._normalize_source_context(incoming).items():
+            if value is None or value == '':
+                continue
+            merged[str(key)] = value
+        return merged
+
     @classmethod
     def _merge_crawl_job_values_conn(
         cls,
@@ -5573,6 +5872,7 @@ class ImageIndexDB:
         tags: Iterable[str] = (),
         include_tags: Iterable[str] = (),
         exclude_tags: Iterable[str] = (),
+        source_context: dict[str, Any] | None = None,
         now: str,
     ) -> None:
         row = conn.execute('SELECT * FROM crawl_jobs WHERE id = ? LIMIT 1', (int(job_id),)).fetchone()
@@ -5581,13 +5881,24 @@ class ImageIndexDB:
         merged_tags = cls._merge_csv_values(str(row['tags_text'] or ''), tags)
         merged_include = cls._merge_csv_values(str(row['include_tags_text'] or ''), include_tags)
         merged_exclude = cls._merge_csv_values(str(row['exclude_tags_text'] or ''), exclude_tags)
+        merged_context = cls._merge_source_context_values(
+            str(row['source_context_json'] or '{}'),
+            source_context,
+        )
         conn.execute(
             """
             UPDATE crawl_jobs
-            SET tags_text = ?, include_tags_text = ?, exclude_tags_text = ?, updated_at = ?
+            SET tags_text = ?, include_tags_text = ?, exclude_tags_text = ?, source_context_json = ?, updated_at = ?
             WHERE id = ?
             """,
-            (','.join(merged_tags), ','.join(merged_include), ','.join(merged_exclude), now, int(job_id)),
+            (
+                ','.join(merged_tags),
+                ','.join(merged_include),
+                ','.join(merged_exclude),
+                cls._serialize_source_context(merged_context),
+                now,
+                int(job_id),
+            ),
         )
 
     def get_or_create_crawl_job(
@@ -5596,6 +5907,7 @@ class ImageIndexDB:
         source_url: str,
         tags: list[str],
         *,
+        source_context: dict[str, Any] | None = None,
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = 'exact',
@@ -5632,6 +5944,7 @@ class ImageIndexDB:
                     tags=tags,
                     include_tags=include_tags or [],
                     exclude_tags=exclude_tags or [],
+                    source_context=source_context,
                     now=now,
                 )
                 return int(row['id']), False
@@ -5639,14 +5952,15 @@ class ImageIndexDB:
             cursor = conn.execute(
                 """
                 INSERT INTO crawl_jobs(
-                    platform, source_url, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
+                    platform, source_url, source_context_json, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
                     status, progress, error_log, result_summary, attempt_count, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
                 """,
                 (
                     platform_text,
                     normalized_url,
+                    self._serialize_source_context(source_context),
                     ','.join(self._merge_csv_values(tags)),
                     ','.join(self._merge_csv_values(include_tags or [])),
                     ','.join(self._merge_csv_values(exclude_tags or [])),
@@ -5817,6 +6131,7 @@ class ImageIndexDB:
         source_uid: str,
         post_url: str,
         tags: Iterable[str],
+        source_context: dict[str, Any] | None = None,
     ) -> tuple[sqlite3.Row, bool]:
         platform_text = str(platform or '').strip().lower()
         post_url_text = self.normalize_source_post_url(platform_text, post_url) or str(post_url or '').strip()
@@ -5831,13 +6146,23 @@ class ImageIndexDB:
             ).fetchone()
             if existing:
                 merged_tags = self._merge_csv_values(str(existing['tags_text'] or ''), tags)
+                merged_context = self._merge_source_context_values(
+                    str(existing['source_context_json'] or '{}'),
+                    source_context,
+                )
                 conn.execute(
                     """
                     UPDATE crawl_discoveries
-                    SET post_url = ?, tags_text = ?, updated_at = ?
+                    SET post_url = ?, source_context_json = ?, tags_text = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (post_url_text, ','.join(merged_tags), now, int(existing['id'])),
+                    (
+                        post_url_text,
+                        self._serialize_source_context(merged_context),
+                        ','.join(merged_tags),
+                        now,
+                        int(existing['id']),
+                    ),
                 )
                 crawl_job_id = int(existing['crawl_job_id'] or 0)
                 if crawl_job_id > 0:
@@ -5845,6 +6170,7 @@ class ImageIndexDB:
                         conn,
                         crawl_job_id,
                         tags=merged_tags,
+                        source_context=merged_context,
                         now=now,
                     )
                 row = conn.execute('SELECT * FROM crawl_discoveries WHERE id = ?', (int(existing['id']),)).fetchone()
@@ -5855,12 +6181,20 @@ class ImageIndexDB:
             cursor = conn.execute(
                 """
                 INSERT INTO crawl_discoveries(
-                    platform, source_uid, post_url, tags_text, status, crawl_job_id,
+                    platform, source_uid, post_url, source_context_json, tags_text, status, crawl_job_id,
                     last_error, discovered_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, 'pending', 0, '', ?, ?)
+                VALUES(?, ?, ?, ?, ?, 'pending', 0, '', ?, ?)
                 """,
-                (platform_text, source_uid_text, post_url_text, ','.join(self._merge_csv_values(tags)), now, now),
+                (
+                    platform_text,
+                    source_uid_text,
+                    post_url_text,
+                    self._serialize_source_context(source_context),
+                    ','.join(self._merge_csv_values(tags)),
+                    now,
+                    now,
+                ),
             )
             row = conn.execute('SELECT * FROM crawl_discoveries WHERE id = ?', (int(cursor.lastrowid),)).fetchone()
             if not row:

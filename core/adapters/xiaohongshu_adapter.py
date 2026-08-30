@@ -1,58 +1,120 @@
 from __future__ import annotations
 
+import asyncio
 import re
+import urllib.parse
 
 from .common import BaseCrawlAdapter
+from ..models import CrawlCandidate
+from ..xhs_provider import XhsProviderClient, XhsProviderError, canonical_xhs_post_url
+
 
 NOTE_ID_PATTERN = re.compile(r"/(?:explore|discovery/item|note)/([0-9a-zA-Z]+)")
-XHS_IMAGE_PATTERN = re.compile(r"https://(?:sns-webpic-qc|sns-img-qc|ci)\.[^\s\"'<>\\]+")
 
 
 class XiaohongshuAdapter(BaseCrawlAdapter):
-    def __init__(self, config: dict | None = None) -> None:
+    def __init__(
+        self,
+        config: dict | None = None,
+        *,
+        provider_client: XhsProviderClient | None = None,
+    ) -> None:
         super().__init__("xiaohongshu", config=config)
+        self.provider_client = provider_client or XhsProviderClient(self.config)
+
+    async def fetch_candidates(
+        self,
+        source_url: str,
+        *,
+        max_candidates: int = 8,
+        timeout_seconds: int = 20,
+        source_context: dict | None = None,
+    ) -> list[CrawlCandidate]:
+        # The structured provider is deliberately authoritative. Falling back to
+        # generic page regexes can turn login/risk-control HTML into fake images.
+        del max_candidates
+        context = source_context if isinstance(source_context, dict) else {}
+        note_id = str(context.get("note_id", "") or self.extract_source_uid(source_url, "")).strip()
+        xsec_token = str(context.get("xsec_token", "") or self._token_from_url(source_url)).strip()
+        if not note_id or not xsec_token:
+            raise XhsProviderError(
+                "小红书结构化详情缺少 note_id 或 xsec_token，不能回退到网页正则",
+                category="configuration",
+            )
+        detail = await asyncio.to_thread(
+            self.provider_client.fetch_note_detail,
+            note_id,
+            xsec_token,
+            timeout_seconds=timeout_seconds,
+        )
+        safety_limit = self._image_safety_limit()
+        if len(detail.images) > safety_limit:
+            raise XhsProviderError(
+                f"小红书笔记返回 {len(detail.images)} 张图片，超过安全上限 {safety_limit}，已停止任务等待检查",
+                category="response_too_large",
+                pause_required=True,
+            )
+        if not detail.images:
+            raise XhsProviderError(
+                "小红书图文详情没有可下载图片",
+                category="empty_note",
+            )
+
+        candidates: list[CrawlCandidate] = []
+        page_count = len(detail.images)
+        for image in detail.images:
+            candidates.append(
+                CrawlCandidate(
+                    platform=self.platform,
+                    post_url=canonical_xhs_post_url(detail.note_id),
+                    normalized_post_url=canonical_xhs_post_url(detail.note_id),
+                    source_uid=detail.note_id,
+                    image_url=image.url,
+                    raw_tags=list(detail.topics),
+                    author=detail.author,
+                    title=detail.title,
+                    extra={
+                        "adapter": "xiaohongshu",
+                        "via": "xiaohongshu_mcp_rest",
+                        "source_id": detail.note_id,
+                        "description": detail.description,
+                        "published_at_ms": detail.published_at_ms,
+                        "page_index": image.index,
+                        "page_count": page_count,
+                        "reported_width": image.width,
+                        "reported_height": image.height,
+                        "require_image_mime": True,
+                        "request_headers": self.image_request_headers(detail.post_url, image.url),
+                    },
+                )
+            )
+        return candidates
+
+    def _image_safety_limit(self) -> int:
+        raw = self.config.get("xhs_max_images_per_note", 60)
+        try:
+            return min(max(int(raw or 60), 1), 100)
+        except (TypeError, ValueError):
+            return 60
+
+    @staticmethod
+    def _token_from_url(source_url: str) -> str:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(str(source_url or "")).query)
+        values = query.get("xsec_token") or query.get("xsecToken") or []
+        return str(values[0] if values else "").strip()
 
     def cookie_string(self) -> str:
-        return str(self.config.get("xiaohongshu_cookie_string", "") or "").strip()
+        # Kept only for backward-compatible config introspection. Structured
+        # collection never copies cookies into the plugin process.
+        return ""
 
-    def extract_image_urls(self, html: str, base_url: str) -> list[str]:
-        ordered = super().extract_image_urls(html, base_url)
-        seen = set(ordered)
-        for raw in XHS_IMAGE_PATTERN.findall(html):
-            cleaned = raw.replace("\\u002F", "/").replace("\\/", "/").replace("&amp;", "&")
-            if cleaned not in seen:
-                seen.add(cleaned)
-                ordered.append(cleaned)
-        return ordered
-
-    def extract_raw_tags(self, html: str) -> list[str]:
-        ordered = super().extract_raw_tags(html)
-        seen = {item.lower() for item in ordered}
-        for tag in re.findall(r'"tagName"\s*:\s*"([^"]+)"', html):
-            self.push_tag(ordered, seen, tag)
-        return ordered[:40]
-
-    def extract_author(self, html: str) -> str:
-        for pattern in (r'"nickname"\s*:\s*"([^"]+)"', r'"userName"\s*:\s*"([^"]+)"'):
-            match = re.search(pattern, html)
-            if match:
-                return match.group(1)
-        return super().extract_author(html)
-
-    def extract_title(self, html: str) -> str:
-        for pattern in (r'"title"\s*:\s*"([^"]+)"', r'"desc"\s*:\s*"([^"]+)"'):
-            match = re.search(pattern, html)
-            if match:
-                return match.group(1)
-        return super().extract_title(html)
+    def image_request_headers(self, source_url: str, image_url: str) -> dict[str, str]:
+        del image_url
+        return {"Referer": source_url or "https://www.xiaohongshu.com/"}
 
     def extract_source_uid(self, final_url: str, html: str) -> str:
-        match = NOTE_ID_PATTERN.search(final_url) or re.search(r'"noteId"\s*:\s*"([^"]+)"', html)
-        return match.group(1) if match else ""
-
-    def build_extra(self, source_url: str, final_url: str, image_url: str, html: str, title: str) -> dict[str, object]:
-        extra = super().build_extra(source_url, final_url, image_url, html, title)
-        extra["source_id"] = self.extract_source_uid(final_url, html)
-        extra["adapter"] = "xiaohongshu"
-        extra["is_cover"] = bool(re.search(r'"cover"\s*:\s*"[^"]+"', html))
-        return extra
+        match = NOTE_ID_PATTERN.search(str(final_url or ""))
+        if match:
+            return match.group(1)
+        legacy = re.search(r'"noteId"\s*:\s*"([^"]+)"', str(html or ""))
+        return legacy.group(1) if legacy else ""
