@@ -1,6 +1,6 @@
 # astrbot_plugin_pjsk_pic
 
-PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采集、Pixiv / 小红书按 tag 增量抓图、审核与独立 WebUI 管理。
+PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采集、Pixiv / 小红书按 tag 增量抓图、LLM 图片质量与候选 tag 审核、人工审核及独立 WebUI 管理。
 
 ## 安装方式
 
@@ -110,7 +110,11 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 
 ### 审核能力
 
-- 自动审核接入
+- 新版 LLM 审图一张图片只调用一次，同时给出技术质量、美观程度、图库适用性和候选角色判断
+- 候选角色只来自已存在的启用角色主 tag，模型只能返回候选 `tag_id`，不会自动创建或合并 tag / alias
+- 支持 `shadow`、`assist`、`auto_approve` 三种模式；模型异常、非法 JSON、候选越界和低置信结果保留人工审核
+- `auto_approve` 只有在质量、图库适用性和全部选中角色置信度同时达标时自动通过，并支持多角色 tag 与随机人工抽检
+- 审核模型使用独立持久队列、单并发、单轮与每日预算，不阻塞 Pixiv / 小红书下载任务，插件重启后可恢复
 - 人工审核命令
 - 审核列表 / 查看 / 通过 / 拒绝
 - 按图片聚合的来源人工审核
@@ -291,7 +295,7 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 - `submission_review_enabled`
   - 是否开启投稿审核
 - `enable_auto_review`
-  - 是否启用自动审核
+  - 旧版逐 tag 自动审核兼容开关；新版 LLM 审图启用时不会执行旧版逐 tag 模型调用
 - `review_provider_id`
   - 自动审核使用的 provider id
 - `review_confidence_threshold`
@@ -300,6 +304,36 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
   - 非角色 tag 是否自动放行
 - `guess_character_tags`
   - 是否自动猜测角色 tag
+- `llm_image_review_enabled`
+  - 是否启用新版 LLM 图片审核工作线程；默认关闭
+- `llm_image_review_mode`
+  - `shadow` 只记录、`assist` 在 QQ 审图卡展示建议、`auto_approve` 允许高置信度自动通过
+- `llm_image_review_provider_id`
+  - 使用的多模态 provider id；留空时回退到旧版 `review_provider_id`
+- `llm_image_review_auto_queue_new`
+  - 是否自动排队新产生的待审图；不会默认扫完历史积压
+- `llm_image_review_max_per_cycle` / `llm_image_review_daily_limit`
+  - 每轮与每日模型调用硬预算，审核固定单并发
+- `llm_image_review_max_candidates`
+  - 单张图片最多提供给模型的现有角色候选数，默认 `8`
+- `llm_image_review_preview_max_side` / `llm_image_review_min_side`
+  - 模型预览最长边与本地硬检查最短边；原图不修改，预览去除元数据
+- `llm_image_review_quality_threshold` / `llm_image_review_technical_threshold`
+  - 自动通过要求的整体与技术质量分数
+- `llm_image_review_aesthetic_threshold`
+  - 自动通过要求的美观程度最低分
+- `llm_image_review_gallery_fit_threshold` / `llm_image_review_identity_threshold`
+  - 自动通过要求的图库适用性与每个选中角色置信度
+- `llm_image_review_spot_check_rate`
+  - 达标图片仍保留人工抽检的比例
+- `.pp LLM审图状态`
+  - 查看模式、provider、工作线程、队列和阈值
+- `.pp LLM审图执行 [数量] [Pixiv|小红书|投稿]`
+  - 管理员受限排队并执行一批待审图片
+- `.pp LLM审图重试 [数量]`
+  - 重新排队失败的模型审核任务
+
+完整的输出契约、安全边界和放量方法见 [LLM 图片审核说明](docs/llm-image-review.md)。
 
 ### 采集
 
@@ -521,9 +555,19 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 
 ## 9. 当前版本
 
-- 当前插件版本：`0.18.0`
+- 当前插件版本：`0.19.0`
 
 ## 10. 更新记录
+
+### v0.19.0
+
+- 新增独立持久化 LLM 图片审核队列，一张图片只调用一次模型，同时评价技术质量、美观程度、图库适用性和候选角色
+- 候选只接受已存在的启用角色主 tag，严格校验结构化 JSON、候选 ID、分数、flags 与最多 3 个角色，不使用宽松文本兜底
+- 新增 `shadow`、`assist`、`auto_approve` 模式；影子和辅助模式不修改审核状态，高置信自动模式原子更新多个候选 tag
+- 人工审核状态优先，模型结果过期时不会覆盖；低分辨率、模型异常、非法结果、低置信或随机抽检均保留人工待审
+- 新图片可自动排队，历史积压只能由管理员受限执行；增加单轮、每日、超时、重试、预览尺寸和多维阈值配置
+- QQ 审图卡在辅助/自动模式展示模型建议，新增 LLM 审图状态、执行和重试管理员命令
+- 审图预览限制最长边并去除元数据，不向模型发送来源 URL、Cookie、token、`xsec_token` 或投稿人信息
 
 ### v0.18.0
 

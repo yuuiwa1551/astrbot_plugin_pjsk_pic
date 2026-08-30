@@ -30,6 +30,7 @@ class CrawlService:
         config,
         pixiv_client: PixivAppClient | None = None,
         xhs_provider_client: XhsProviderClient | None = None,
+        llm_review_service=None,
     ) -> None:
         self.db = db
         self.importer = importer
@@ -37,6 +38,7 @@ class CrawlService:
         self.config = config
         self.pixiv_client = pixiv_client
         self.xhs_provider_client = xhs_provider_client
+        self.llm_review_service = llm_review_service
         self._xhs_pause_handler: Callable[[XhsProviderError], Awaitable[None] | None] | None = None
         self.tag_cleaner = TagCleaner(config)
         self._queue: asyncio.Queue[int] = asyncio.Queue()
@@ -332,6 +334,17 @@ class CrawlService:
                         approved_links += 1
                     if decision.status in {"rejected", "manual_rejected"}:
                         rejected_links += 1
+                if self.llm_review_service is not None:
+                    try:
+                        self.llm_review_service.queue_image(
+                            imported.image_id,
+                            platform=platform,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[PJSKPic] 图片 #{imported.image_id} 加入 LLM 审核队列失败：{exc}",
+                            exc_info=True,
+                        )
             except Exception as exc:
                 failed_candidates += 1
                 message = f"候选图 #{index} 处理失败: {exc}"

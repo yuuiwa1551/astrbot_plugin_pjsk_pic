@@ -194,6 +194,101 @@
     "description": "自动审核时是否尝试猜测缺失的角色标签。",
     "default": true
   },
+  "llm_image_review_enabled": {
+    "type": "bool",
+    "description": "是否启用新版 LLM 图片质量与候选 tag 审核工作线程。建议先使用 shadow。",
+    "default": false
+  },
+  "llm_image_review_mode": {
+    "type": "string",
+    "description": "LLM 审图模式：shadow 只记录，assist 同时在 QQ 审图卡展示建议，auto_approve 允许高置信度自动通过。",
+    "default": "shadow"
+  },
+  "llm_image_review_provider_id": {
+    "type": "string",
+    "description": "新版 LLM 图片审核使用的多模态 provider id；留空时兼容回退到 review_provider_id。",
+    "default": ""
+  },
+  "llm_image_review_prompt_version": {
+    "type": "string",
+    "description": "审图提示词版本；修改后会生成新的幂等输入指纹并允许重新评估。",
+    "default": "v1"
+  },
+  "llm_image_review_auto_queue_new": {
+    "type": "bool",
+    "description": "是否把新产生的待审图片自动加入独立 LLM 审核队列；不会默认扫描全部历史积压。",
+    "default": true
+  },
+  "llm_image_review_interval_seconds": {
+    "type": "int",
+    "description": "LLM 图片审核工作线程轮询间隔，运行时最低 15 秒。",
+    "default": 60
+  },
+  "llm_image_review_max_per_cycle": {
+    "type": "int",
+    "description": "LLM 图片审核每轮最多处理的图片数，固定单并发。",
+    "default": 3
+  },
+  "llm_image_review_daily_limit": {
+    "type": "int",
+    "description": "LLM 图片审核每天最多处理的运行记录数。",
+    "default": 30
+  },
+  "llm_image_review_max_candidates": {
+    "type": "int",
+    "description": "单张图片最多提供给模型的已存在角色候选 tag 数。",
+    "default": 8
+  },
+  "llm_image_review_preview_max_side": {
+    "type": "int",
+    "description": "发送给视觉模型的脱敏预览最长边像素，原图不修改。",
+    "default": 1536
+  },
+  "llm_image_review_min_side": {
+    "type": "int",
+    "description": "本地硬检查允许的图片最短边下限；低于该值保留人工审核且不调用模型。",
+    "default": 512
+  },
+  "llm_image_review_timeout_seconds": {
+    "type": "int",
+    "description": "单次视觉模型审核超时秒数。",
+    "default": 90
+  },
+  "llm_image_review_max_attempts": {
+    "type": "int",
+    "description": "视觉 provider 故障时每条审核记录最多尝试次数。",
+    "default": 2
+  },
+  "llm_image_review_quality_threshold": {
+    "type": "float",
+    "description": "auto_approve 要求的整体质量最低分（0-100）。",
+    "default": 85
+  },
+  "llm_image_review_technical_threshold": {
+    "type": "float",
+    "description": "auto_approve 要求的技术质量最低分（0-100）。",
+    "default": 75
+  },
+  "llm_image_review_aesthetic_threshold": {
+    "type": "float",
+    "description": "auto_approve 要求的美观程度最低分（0-100）。",
+    "default": 82
+  },
+  "llm_image_review_gallery_fit_threshold": {
+    "type": "float",
+    "description": "auto_approve 要求的图库适用性最低分（0-100）。",
+    "default": 80
+  },
+  "llm_image_review_identity_threshold": {
+    "type": "float",
+    "description": "auto_approve 要求的每个选中角色最低置信度（0-1）。",
+    "default": 0.93
+  },
+  "llm_image_review_spot_check_rate": {
+    "type": "float",
+    "description": "达到自动通过阈值后仍随机保留人工抽检的比例（0-1）。",
+    "default": 0.1
+  },
   "pixiv_refresh_token": {
     "type": "string",
     "description": "Pixiv App API 的 refresh token，用于 Pixiv 搜图与自动抓取。",

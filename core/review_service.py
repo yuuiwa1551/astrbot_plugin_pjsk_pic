@@ -47,6 +47,13 @@ class ReviewService:
                 return ReviewDecision(status="approved", confidence=1.0, reason="非角色 tag 默认通过")
             return ReviewDecision(status="pending", confidence=0.0, reason="非角色 tag，等待人工审核")
 
+        if self.config.get("llm_image_review_enabled", False):
+            return ReviewDecision(
+                status="pending",
+                confidence=0.0,
+                reason="等待候选 tag LLM 图片审核",
+            )
+
         if not self.config.get("enable_auto_review", False):
             return ReviewDecision(status="pending", confidence=0.0, reason="未启用自动审核")
 

@@ -324,6 +324,31 @@ class ImageIndexDB:
                     FOREIGN KEY(tag_id) REFERENCES tags(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS llm_image_review_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL DEFAULT 'shadow',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    prompt_version TEXT NOT NULL DEFAULT 'v1',
+                    input_fingerprint TEXT NOT NULL UNIQUE,
+                    image_sha256 TEXT NOT NULL DEFAULT '',
+                    candidates_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    decision TEXT NOT NULL DEFAULT '',
+                    quality_json TEXT NOT NULL DEFAULT '{}',
+                    selected_tags_json TEXT NOT NULL DEFAULT '[]',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    raw_result TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    error_log TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(image_id) REFERENCES images(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS rejected_sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     platform TEXT NOT NULL,
@@ -380,6 +405,9 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status_image ON review_tasks(status, image_id, id);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_image_status ON review_tasks(image_id, status);
+                CREATE INDEX IF NOT EXISTS idx_llm_image_review_runs_status ON llm_image_review_runs(status, id);
+                CREATE INDEX IF NOT EXISTS idx_llm_image_review_runs_image ON llm_image_review_runs(image_id, id);
+                CREATE INDEX IF NOT EXISTS idx_llm_image_review_runs_created ON llm_image_review_runs(created_at, status);
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 CREATE INDEX IF NOT EXISTS idx_platform_tag_terms_tag_id ON platform_tag_terms(tag_id, platform);
                 CREATE INDEX IF NOT EXISTS idx_rejected_sources_platform ON rejected_sources(platform, normalized_post_url);
@@ -4591,6 +4619,469 @@ class ImageIndexDB:
         sql += ' ORDER BY rt.id DESC'
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
+
+    def get_llm_review_image(self, image_id: int) -> sqlite3.Row | None:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT i.id, i.file_path, i.file_name, i.sha256, i.width, i.height, i.format,
+                       COALESCE((
+                           SELECT s.platform
+                           FROM sources s
+                           WHERE s.image_id = i.id
+                           ORDER BY CASE s.platform
+                               WHEN 'xiaohongshu' THEN 0
+                               WHEN 'pixiv' THEN 1
+                               WHEN 'submission' THEN 2
+                               ELSE 3
+                           END, s.id DESC
+                           LIMIT 1
+                       ), '') AS platform
+                FROM images i
+                WHERE i.id = ? AND i.is_active = 1
+                LIMIT 1
+                """,
+                (int(image_id),),
+            ).fetchone()
+
+    def get_llm_review_candidates(
+        self,
+        image_id: int,
+        *,
+        statuses: Iterable[str] | None = None,
+        max_candidates: int = 8,
+        alias_limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        normalized_statuses = split_status_filter(statuses or ('pending', 'uncertain'))
+        if not normalized_statuses:
+            return []
+        placeholders = ','.join('?' for _ in normalized_statuses)
+        candidate_limit = min(max(1, int(max_candidates or 8)), 20)
+        aliases_per_tag = min(max(0, int(alias_limit or 0)), 20)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT t.id AS tag_id, t.name AS tag_name, MAX(rt.id) AS latest_review_id
+                FROM review_tasks rt
+                JOIN tags t ON t.id = rt.tag_id
+                WHERE rt.image_id = ?
+                  AND rt.status IN ({placeholders})
+                  AND t.status = 'active'
+                  AND (t.tag_type = 'character' OR t.is_character = 1)
+                GROUP BY t.id, t.name
+                ORDER BY latest_review_id DESC, t.id ASC
+                LIMIT ?
+                """,
+                (int(image_id), *normalized_statuses, candidate_limit),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                aliases: list[str] = []
+                if aliases_per_tag > 0:
+                    alias_rows = conn.execute(
+                        """
+                        SELECT alias
+                        FROM tag_aliases
+                        WHERE tag_id = ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (int(row['tag_id']), aliases_per_tag),
+                    ).fetchall()
+                    aliases = [str(alias_row['alias']) for alias_row in alias_rows]
+                result.append(
+                    {
+                        'tag_id': int(row['tag_id']),
+                        'tag_name': str(row['tag_name']),
+                        'aliases': aliases,
+                    }
+                )
+        return result
+
+    def list_llm_review_image_ids(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        platform: str = '',
+        limit: int = 20,
+        newest_first: bool = True,
+    ) -> list[int]:
+        normalized_statuses = split_status_filter(statuses or ('pending', 'uncertain'))
+        if not normalized_statuses:
+            return []
+        placeholders = ','.join('?' for _ in normalized_statuses)
+        sql = f"""
+            SELECT rt.image_id, MAX(rt.id) AS latest_review_id
+            FROM review_tasks rt
+            JOIN images i ON i.id = rt.image_id
+            JOIN tags t ON t.id = rt.tag_id
+            WHERE i.is_active = 1
+              AND rt.status IN ({placeholders})
+              AND t.status = 'active'
+              AND (t.tag_type = 'character' OR t.is_character = 1)
+        """
+        params: list[Any] = list(normalized_statuses)
+        platform_text = str(platform or '').strip().lower()
+        if platform_text:
+            sql += " AND EXISTS (SELECT 1 FROM sources s WHERE s.image_id = rt.image_id AND s.platform = ?)"
+            params.append(platform_text)
+        sql += ' GROUP BY rt.image_id ORDER BY latest_review_id ' + ('DESC' if newest_first else 'ASC') + ' LIMIT ?'
+        params.append(min(max(1, int(limit or 20)), 500))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [int(row['image_id']) for row in rows]
+
+    def create_llm_image_review_run(
+        self,
+        *,
+        image_id: int,
+        platform: str,
+        mode: str,
+        provider_id: str,
+        prompt_version: str,
+        input_fingerprint: str,
+        image_sha256: str,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[int, bool]:
+        now = utcnow_str()
+        fingerprint = str(input_fingerprint or '').strip()
+        if not fingerprint:
+            raise ValueError('LLM 审图输入指纹不能为空')
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                'SELECT id FROM llm_image_review_runs WHERE input_fingerprint = ? LIMIT 1',
+                (fingerprint,),
+            ).fetchone()
+            if existing:
+                return int(existing['id']), False
+            cursor = conn.execute(
+                """
+                INSERT INTO llm_image_review_runs(
+                    image_id, platform, mode, provider_id, prompt_version,
+                    input_fingerprint, image_sha256, candidates_json, status,
+                    attempt_count, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (
+                    int(image_id),
+                    str(platform or '').strip().lower(),
+                    str(mode or 'shadow').strip().lower(),
+                    str(provider_id or '').strip(),
+                    str(prompt_version or 'v1').strip(),
+                    fingerprint,
+                    str(image_sha256 or '').strip(),
+                    json.dumps(candidates, ensure_ascii=False, separators=(',', ':')),
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid), True
+
+    def reset_running_llm_image_review_runs(self) -> int:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE llm_image_review_runs
+                SET status = 'pending', error_log = 'worker interrupted before completion', updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
+    def claim_next_llm_image_review_run(self) -> sqlite3.Row | None:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute(
+                """
+                SELECT *
+                FROM llm_image_review_runs
+                WHERE status = 'pending'
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                """
+                UPDATE llm_image_review_runs
+                SET status = 'running', attempt_count = attempt_count + 1,
+                    error_log = '', updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, int(row['id'])),
+            )
+            return conn.execute(
+                'SELECT * FROM llm_image_review_runs WHERE id = ? LIMIT 1',
+                (int(row['id']),),
+            ).fetchone()
+
+    def complete_llm_image_review_run(
+        self,
+        run_id: int,
+        *,
+        decision: str,
+        quality: dict[str, Any],
+        selected_tags: list[dict[str, Any]],
+        result: dict[str, Any],
+        raw_result: str,
+        reason: str,
+    ) -> None:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE llm_image_review_runs
+                SET status = 'completed', decision = ?, quality_json = ?,
+                    selected_tags_json = ?, result_json = ?, raw_result = ?,
+                    reason = ?, error_log = '', completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(decision or '').strip(),
+                    json.dumps(quality, ensure_ascii=False, separators=(',', ':')),
+                    json.dumps(selected_tags, ensure_ascii=False, separators=(',', ':')),
+                    json.dumps(result, ensure_ascii=False, separators=(',', ':')),
+                    str(raw_result or '')[:8000],
+                    str(reason or '')[:1000],
+                    now,
+                    now,
+                    int(run_id),
+                ),
+            )
+
+    def fail_llm_image_review_run(
+        self,
+        run_id: int,
+        *,
+        error: str,
+        retry: bool,
+    ) -> None:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE llm_image_review_runs
+                SET status = ?, error_log = ?, updated_at = ?,
+                    completed_at = CASE WHEN ? = 'failed' THEN ? ELSE '' END
+                WHERE id = ?
+                """,
+                (
+                    'pending' if retry else 'failed',
+                    str(error or '')[:1000],
+                    now,
+                    'pending' if retry else 'failed',
+                    now,
+                    int(run_id),
+                ),
+            )
+
+    def retry_failed_llm_image_review_runs(self, *, limit: int = 20) -> int:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM llm_image_review_runs
+                WHERE status = 'failed'
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (min(max(1, int(limit or 20)), 200),),
+            ).fetchall()
+            ids = [int(row['id']) for row in rows]
+            if not ids:
+                return 0
+            placeholders = ','.join('?' for _ in ids)
+            conn.execute(
+                f"""
+                UPDATE llm_image_review_runs
+                SET status = 'pending', error_log = '', completed_at = '', updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (now, *ids),
+            )
+            return len(ids)
+
+    def get_latest_llm_image_review_run(
+        self,
+        image_id: int,
+        *,
+        completed_only: bool = True,
+    ) -> sqlite3.Row | None:
+        sql = 'SELECT * FROM llm_image_review_runs WHERE image_id = ?'
+        params: list[Any] = [int(image_id)]
+        if completed_only:
+            sql += " AND status = 'completed'"
+        sql += ' ORDER BY id DESC LIMIT 1'
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchone()
+
+    def count_llm_image_review_runs_since(self, since: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM llm_image_review_runs
+                WHERE attempt_count > 0 AND updated_at >= ?
+                """,
+                (str(since or ''),),
+            ).fetchone()
+        return int(row['c'] or 0) if row else 0
+
+    def get_llm_image_review_stats(self) -> dict[str, int]:
+        stats = {
+            'pending': 0,
+            'running': 0,
+            'completed': 0,
+            'failed': 0,
+        }
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                'SELECT status, COUNT(*) AS c FROM llm_image_review_runs GROUP BY status'
+            ).fetchall()
+        for row in rows:
+            stats[str(row['status'])] = int(row['c'] or 0)
+        return stats
+
+    def apply_llm_image_review_approval(
+        self,
+        run_id: int,
+        *,
+        selected_tags: list[dict[str, Any]],
+        model_result: str,
+        reason: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        selected_by_id: dict[int, float] = {}
+        for item in selected_tags:
+            try:
+                tag_id = int(item.get('tag_id', 0) or 0)
+                confidence = max(0.0, min(1.0, float(item.get('confidence', 0) or 0)))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if tag_id > 0:
+                selected_by_id[tag_id] = max(selected_by_id.get(tag_id, 0.0), confidence)
+        if not selected_by_id:
+            return False, {'code': 'no_selected_tags', 'message': '模型没有选择任何候选 tag'}
+
+        now = utcnow_str()
+        review_reason = str(reason or '').strip()[:1000] or 'LLM 高置信度自动通过'
+        serialized_result = str(model_result or '')[:8000]
+        with self._lock, self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            run = conn.execute(
+                'SELECT * FROM llm_image_review_runs WHERE id = ? LIMIT 1',
+                (int(run_id),),
+            ).fetchone()
+            if not run or str(run['status']) != 'running':
+                return False, {'code': 'stale_run', 'message': 'LLM 审图运行状态已变化'}
+            try:
+                candidates = json.loads(str(run['candidates_json'] or '[]'))
+            except (TypeError, json.JSONDecodeError):
+                candidates = []
+            candidate_ids: set[int] = set()
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    candidate_id = int(item.get('tag_id', 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if candidate_id > 0:
+                    candidate_ids.add(candidate_id)
+            if not candidate_ids or not set(selected_by_id).issubset(candidate_ids):
+                return False, {'code': 'candidate_mismatch', 'message': '模型选择超出候选范围'}
+
+            placeholders = ','.join('?' for _ in candidate_ids)
+            task_rows = conn.execute(
+                f"""
+                SELECT rt.id, rt.tag_id, rt.status, rt.manual_result,
+                       t.name AS tag_name, t.status AS tag_status,
+                       t.tag_type, t.is_character
+                FROM review_tasks rt
+                JOIN tags t ON t.id = rt.tag_id
+                WHERE rt.image_id = ? AND rt.tag_id IN ({placeholders})
+                ORDER BY rt.id DESC
+                """,
+                (int(run['image_id']), *sorted(candidate_ids)),
+            ).fetchall()
+            latest_by_tag: dict[int, sqlite3.Row] = {}
+            for task in task_rows:
+                latest_by_tag.setdefault(int(task['tag_id']), task)
+            if set(latest_by_tag) != candidate_ids:
+                return False, {'code': 'stale_candidates', 'message': '候选审核任务已变化'}
+            if any(
+                str(task['tag_status'] or '') != 'active'
+                or (
+                    str(task['tag_type'] or '') != 'character'
+                    and int(task['is_character'] or 0) != 1
+                )
+                for task in latest_by_tag.values()
+            ):
+                return False, {'code': 'inactive_candidate', 'message': '候选 tag 已停用或不再是角色'}
+            if any(
+                str(task['status'] or '') not in {'pending', 'uncertain'}
+                or str(task['manual_result'] or '').strip()
+                for task in latest_by_tag.values()
+            ):
+                return False, {'code': 'manual_review_won', 'message': '人工审核已先完成，模型不覆盖'}
+
+            approved_names: list[str] = []
+            rejected_names: list[str] = []
+            for tag_id, task in latest_by_tag.items():
+                selected = tag_id in selected_by_id
+                status = 'approved' if selected else 'rejected'
+                confidence = selected_by_id.get(tag_id, 0.0)
+                conn.execute(
+                    """
+                    UPDATE review_tasks
+                    SET status = ?, model_result = ?, reason = ?, updated_at = ?
+                    WHERE id = ? AND status IN ('pending', 'uncertain')
+                      AND TRIM(COALESCE(manual_result, '')) = ''
+                    """,
+                    (status, serialized_result, review_reason, now, int(task['id'])),
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE image_tags
+                    SET review_status = ?, score = ?, review_reason = ?, updated_at = ?
+                    WHERE image_id = ? AND tag_id = ?
+                      AND review_status IN ('pending', 'uncertain', 'rejected')
+                    """,
+                    (
+                        status,
+                        confidence,
+                        review_reason,
+                        now,
+                        int(run['image_id']),
+                        tag_id,
+                    ),
+                )
+                if int(cursor.rowcount or 0) == 0 and selected:
+                    conn.execute(
+                        """
+                        INSERT INTO image_tags(
+                            image_id, tag_id, source_type, score, review_status,
+                            review_reason, created_at, updated_at
+                        )
+                        VALUES(?, ?, 'llm:auto_review', ?, 'approved', ?, ?, ?)
+                        """,
+                        (int(run['image_id']), tag_id, confidence, review_reason, now, now),
+                    )
+                if selected:
+                    approved_names.append(str(task['tag_name']))
+                else:
+                    rejected_names.append(str(task['tag_name']))
+
+        return True, {
+            'code': 'approved',
+            'image_id': int(run['image_id']),
+            'approved_tags': approved_names,
+            'rejected_tags': rejected_names,
+        }
 
     def _build_pixiv_review_images_query(
         self,

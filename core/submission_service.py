@@ -112,10 +112,17 @@ class SubmissionResult:
 
 
 class SubmissionService:
-    def __init__(self, db: ImageIndexDB, importer: ImportedImageService, reviewer: ReviewService) -> None:
+    def __init__(
+        self,
+        db: ImageIndexDB,
+        importer: ImportedImageService,
+        reviewer: ReviewService,
+        llm_review_service=None,
+    ) -> None:
         self.db = db
         self.importer = importer
         self.reviewer = reviewer
+        self.llm_review_service = llm_review_service
 
     @staticmethod
     def extract_tag_from_text(text: str) -> str:
@@ -338,6 +345,18 @@ class SubmissionService:
                         "similar_image_ids": imported.similar_image_ids,
                     },
                 )
+
+                if self.llm_review_service is not None:
+                    try:
+                        self.llm_review_service.queue_image(
+                            imported.image_id,
+                            platform="submission",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[PJSKPic] 投稿图片 #{imported.image_id} 加入 LLM 审核队列失败：{exc}",
+                            exc_info=True,
+                        )
 
                 items.append(
                     SubmissionImageResult(

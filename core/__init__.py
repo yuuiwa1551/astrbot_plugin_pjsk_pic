@@ -5,6 +5,7 @@ from .crawl_tag_rules import CrawlTagRules, parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
 from .importer import ImportedImageService
 from .indexer import LibraryIndexer
+from .llm_image_review_service import LlmImageReviewContractError, LlmImageReviewService
 from .matcher import extract_query_from_text, normalize_tag_name
 from .pixiv_backfill_service import PixivBackfillService
 from .pixiv_search_service import PixivSearchHit, PixivSearchService
@@ -44,6 +45,8 @@ __all__ = [
     "ImportedImage",
     "ImportedImageService",
     "LibraryIndexer",
+    "LlmImageReviewContractError",
+    "LlmImageReviewService",
     "MatchResult",
     "ReviewDecision",
     "ReviewService",

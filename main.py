@@ -22,6 +22,7 @@ from .core import (
     ImageIndexDB,
     ImportedImageService,
     LibraryIndexer,
+    LlmImageReviewService,
     PixivAppClient,
     PixivBackfillService,
     QQReviewSession,
@@ -71,6 +72,12 @@ class PJSKPicPlugin(Star):
             ),
         )
         self.reviewer = ReviewService(context, self.db, config)
+        self.llm_image_review_service = LlmImageReviewService(
+            db=self.db,
+            context=context,
+            config=config,
+            data_dir=self.data_dir,
+        )
         self.crawl_service = CrawlService(
             db=self.db,
             importer=self.importer,
@@ -78,6 +85,7 @@ class PJSKPicPlugin(Star):
             config=config,
             pixiv_client=self.pixiv_client,
             xhs_provider_client=self.xhs_provider_client,
+            llm_review_service=self.llm_image_review_service,
         )
         self.auto_crawl_service = AutoCrawlService(
             db=self.db,
@@ -99,7 +107,12 @@ class PJSKPicPlugin(Star):
             config=config,
             pixiv_client=self.pixiv_client,
         )
-        self.submission_service = SubmissionService(self.db, self.importer, self.reviewer)
+        self.submission_service = SubmissionService(
+            self.db,
+            self.importer,
+            self.reviewer,
+            llm_review_service=self.llm_image_review_service,
+        )
         self.tag_governance_service = TagGovernanceService(self.db)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
         self.qq_review_service = QQReviewSessionService(self.db, config)
@@ -127,6 +140,7 @@ class PJSKPicPlugin(Star):
         await self.pixiv_backfill_service.start()
         await self.auto_crawl_service.start()
         await self.xhs_auto_crawl_service.start()
+        await self.llm_image_review_service.start()
         if self._webui_enabled():
             try:
                 await self.webui.start(
@@ -140,6 +154,7 @@ class PJSKPicPlugin(Star):
     async def terminate(self) -> None:
         await self.qq_review_service.clear()
         await self.webui.stop()
+        await self.llm_image_review_service.stop()
         await self.xhs_auto_crawl_service.stop()
         await self.auto_crawl_service.stop()
         await self.pixiv_backfill_service.stop()
@@ -495,6 +510,35 @@ class PJSKPicPlugin(Star):
             f"{self._review_platform_label(source_platform)} 群友审核 · 图片 #{session.image_id}",
             "候选 tag：" + ("、".join(candidate_tags) if candidate_tags else "无"),
         ]
+        llm_suggestion = self.llm_image_review_service.latest_suggestion(session.image_id)
+        if llm_suggestion and str(llm_suggestion.get("run_mode") or "shadow") in {"assist", "auto_approve"}:
+            quality = llm_suggestion.get("quality") if isinstance(llm_suggestion.get("quality"), dict) else {}
+            candidate_snapshot = llm_suggestion.get("candidate_snapshot")
+            candidate_name_by_id = {
+                int(item.get("tag_id", 0) or 0): str(item.get("tag_name", "") or "")
+                for item in (candidate_snapshot if isinstance(candidate_snapshot, list) else [])
+                if isinstance(item, dict) and int(item.get("tag_id", 0) or 0) > 0
+            }
+            selected_text: list[str] = []
+            for item in llm_suggestion.get("characters") or []:
+                if not isinstance(item, dict):
+                    continue
+                tag_id = int(item.get("tag_id", 0) or 0)
+                name = candidate_name_by_id.get(tag_id, f"tag#{tag_id}")
+                confidence = float(item.get("confidence", 0) or 0)
+                selected_text.append(f"{name} {confidence:.0%}")
+            lines.append(
+                "LLM 建议："
+                + ("、".join(selected_text) if selected_text else "没有高置信角色")
+                + f"；质量 {float(quality.get('overall', 0) or 0):.0f}/100"
+                + f"（{llm_suggestion.get('run_mode') or 'shadow'}）"
+            )
+            flags = [str(item) for item in (quality.get("flags") or []) if str(item).strip()]
+            if flags:
+                lines.append("LLM 风险：" + "、".join(flags))
+            llm_reason = str(llm_suggestion.get("reason", "") or "").strip()
+            if llm_reason:
+                lines.append("LLM 理由：" + self._short_text(llm_reason, 200))
         if session.filter_tag_name:
             lines.append(f"当前筛选：{session.filter_tag_name}")
         title = str(extra.get("title") or "").strip()
@@ -1866,6 +1910,77 @@ class PJSKPicPlugin(Star):
         ok, message = await self.crawl_service.retry_job(int(job_id))
         yield event.plain_result(message if ok else f"重试失败：{message}")
 
+    @pjsk_gallery.command("LLM审图状态")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def llm_image_review_status(self, event: AstrMessageEvent):
+        stats = self.db.get_llm_image_review_stats()
+        yield event.plain_result(
+            "LLM 图片审核状态：\n"
+            f"已启用：{'是' if self.llm_image_review_service.enabled() else '否'}\n"
+            f"模式：{self.llm_image_review_service.mode()}\n"
+            f"工作线程：{'运行中' if self.llm_image_review_service.running() else '未运行'}\n"
+            f"provider：{self.llm_image_review_service.provider_id() or '-'}\n"
+            f"队列：pending {stats.get('pending', 0)} / running {stats.get('running', 0)} / "
+            f"completed {stats.get('completed', 0)} / failed {stats.get('failed', 0)}\n"
+            f"预算：每轮 {self.llm_image_review_service.max_per_cycle()}，"
+            f"每天 {self.llm_image_review_service.daily_limit()}\n"
+            f"阈值：质量 {self.llm_image_review_service.quality_threshold():.0f}，"
+            f"技术 {self.llm_image_review_service.technical_threshold():.0f}，"
+            f"美观 {self.llm_image_review_service.aesthetic_threshold():.0f}，"
+            f"图库适用 {self.llm_image_review_service.gallery_fit_threshold():.0f}，"
+            f"角色 {self.llm_image_review_service.identity_threshold():.0%}"
+        )
+
+    @pjsk_gallery.command("LLM审图执行")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def run_llm_image_review(
+        self,
+        event: AstrMessageEvent,
+        limit: int = 3,
+        platform: str = "",
+    ):
+        requested = min(max(1, int(limit or 3)), 20)
+        aliases = {
+            "": "",
+            "全部": "",
+            "pixiv": "pixiv",
+            "p站": "pixiv",
+            "小红书": "xiaohongshu",
+            "xhs": "xiaohongshu",
+            "投稿": "submission",
+            "submission": "submission",
+        }
+        platform_text = aliases.get(str(platform or "").strip().casefold())
+        if platform_text is None:
+            yield event.plain_result("平台只支持 Pixiv、小红书、投稿或留空。")
+            return
+        queued = self.llm_image_review_service.queue_open_reviews(
+            limit=requested,
+            platform=platform_text,
+            force=True,
+        )
+        summary = await self.llm_image_review_service.run_once(
+            force=True,
+            max_runs=min(requested, self.llm_image_review_service.max_per_cycle()),
+        )
+        yield event.plain_result(
+            "LLM 图片审核执行完成：\n"
+            f"扫描 {queued['scanned']}，新入队 {queued['queued']}，已存在 {queued['existing']}，"
+            f"跳过 {queued['skipped']}；\n"
+            f"处理 {summary['processed']}，完成 {summary['completed']}，"
+            f"自动通过 {summary['auto_approved']}，留待人工 {summary['manual_review']}，"
+            f"重试 {summary['retried']}，失败 {summary['failed']}，"
+            f"日限额 {'已达到' if summary['daily_limited'] else '未达到'}。"
+        )
+
+    @pjsk_gallery.command("LLM审图重试")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def retry_llm_image_review(self, event: AstrMessageEvent, limit: int = 10):
+        count = self.db.retry_failed_llm_image_review_runs(limit=min(max(1, int(limit or 10)), 100))
+        if count:
+            self.llm_image_review_service.trigger()
+        yield event.plain_result(f"已重新排队 {count} 个失败的 LLM 图片审核任务。")
+
     @pjsk_gallery.command("审图帮助")
     async def show_qq_review_help(self, event: AstrMessageEvent):
         yield event.plain_result(
@@ -1878,6 +1993,9 @@ class PJSKPicPlugin(Star):
                     ".pp 审图跳过：不修改审核结果并换一张",
                     ".pp 审图当前：重发当前领取的图片",
                     ".pp 审图结束：释放当前图片并退出",
+                    ".pp LLM审图状态：查看影子/辅助/自动审核队列与阈值（管理员）",
+                    ".pp LLM审图执行 [数量] [Pixiv|小红书|投稿]：受限执行一批（管理员）",
+                    ".pp LLM审图重试 [数量]：重新排队失败任务（管理员）",
                     "如果图片有价值但候选 tag 错了，请用“审图通过 正确tag”，不要整图拒绝。",
                 ]
             )
@@ -2381,6 +2499,8 @@ class PJSKPicPlugin(Star):
                     ".pp 审核查看 [review_id]：查看单条或下一条待审",
                     ".pp 审核通过 <review_id>",
                     ".pp 审核拒绝 <review_id>",
+                    ".pp LLM审图状态；.pp LLM审图执行 [数量] [Pixiv|小红书|投稿]",
+                    ".pp LLM审图重试 [数量]：重新排队失败的模型审核",
                     ".pp 投稿审核状态",
                     ".pp 投稿审核开启 或 .pp 投稿审核关闭",
                 ]
@@ -2410,6 +2530,7 @@ class PJSKPicPlugin(Star):
                 "发图：看看初音未来、来张 miku、看看id123",
                 "投稿：.tg <tag>，可用 .pp 帮助 投稿 查看 alias 写法",
                 "群友审图：.pp 随机审核 [Pixiv|小红书]，可用 .pp 审图帮助 查看完整流程",
+                "LLM 辅助：.pp LLM审图状态（管理员）",
                 "管理：.pp 统计、.pp 查看 <tag>、.pp 看图 <image_id>",
                 "面板：.pp 面板地址",
                 "分组帮助：.pp 帮助 投稿、tag、审核、采集",
