@@ -314,6 +314,8 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
   - 是否自动排队新产生的待审图；不会默认扫完历史积压
 - `llm_image_review_max_per_cycle` / `llm_image_review_daily_limit`
   - 每轮与每日模型调用硬预算，审核固定单并发
+- `llm_image_review_startup_delay_seconds`
+  - AstrBot 启动后等待 provider 管理器加载完成再处理队列，默认 `30` 秒
 - `llm_image_review_max_candidates`
   - 单张图片最多提供给模型的现有角色候选数，默认 `8`
 - `llm_image_review_preview_max_side` / `llm_image_review_min_side`
@@ -555,9 +557,14 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 
 ## 9. 当前版本
 
-- 当前插件版本：`0.19.1`
+- 当前插件版本：`0.19.2`
 
 ## 10. 更新记录
+
+### v0.19.2
+
+- LLM 审核工作线程增加默认 30 秒启动延迟，避免插件初始化早于 AstrBot provider 管理器导致首次调用误报 provider 不存在
+- 可重试 provider 故障会立即结束本轮，下一轮到期后再试，不会在同一轮重新领取并耗尽尝试次数
 
 ### v0.19.1
 

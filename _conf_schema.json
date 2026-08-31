@@ -224,6 +224,11 @@
     "description": "LLM 图片审核工作线程轮询间隔，运行时最低 15 秒。",
     "default": 60
   },
+  "llm_image_review_startup_delay_seconds": {
+    "type": "int",
+    "description": "AstrBot 启动后等待 provider 管理器就绪再处理 LLM 审核的秒数。",
+    "default": 30
+  },
   "llm_image_review_max_per_cycle": {
     "type": "int",
     "description": "LLM 图片审核每轮最多处理的图片数，固定单并发。",

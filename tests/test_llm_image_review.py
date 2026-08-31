@@ -306,6 +306,26 @@ class LlmImageReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(history))
         self.assertEqual([1, 2], [int(item["attempt"]) for item in history])
 
+    async def test_retryable_failure_stops_current_cycle_before_other_runs(self) -> None:
+        second_image_id = self._add_image("second", [self.miku_id], size=(900, 900))
+        self.assertNotEqual(self.image_id, second_image_id)
+        context = _Context([RuntimeError("provider not ready"), self._payload()])
+        service = self._service(context, mode="shadow")
+        service.queue_image(self.image_id, platform="pixiv")
+        service.queue_image(second_image_id, platform="pixiv")
+
+        summary = await service.run_once(force=True, max_runs=3)
+
+        self.assertEqual(1, summary["processed"])
+        self.assertEqual(1, summary["retried"])
+        first = self.db.get_latest_llm_image_review_run(self.image_id, completed_only=False)
+        second = self.db.get_latest_llm_image_review_run(second_image_id, completed_only=False)
+        self.assertEqual("pending", str(first["status"]))
+        self.assertEqual(1, int(first["attempt_count"]))
+        self.assertEqual("pending", str(second["status"]))
+        self.assertEqual(0, int(second["attempt_count"]))
+        self.assertEqual(1, len(context.calls))
+
     async def test_local_low_resolution_skips_model_and_keeps_manual_review(self) -> None:
         small_id = self._add_image("small", [self.miku_id], size=(96, 96))
         context = _Context([])
@@ -370,6 +390,7 @@ class LlmImageReviewTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(flag, prompt)
         self.assertIn("characters 必须返回空数组", prompt)
         self.assertIn(str(self.miku_id), prompt)
+        self.assertEqual(30, self._service(_Context([])).startup_delay_seconds())
 
 
 if __name__ == "__main__":

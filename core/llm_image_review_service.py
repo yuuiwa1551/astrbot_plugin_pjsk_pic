@@ -77,6 +77,9 @@ class LlmImageReviewService:
     def interval_seconds(self) -> int:
         return min(max(15, int(self.config.get("llm_image_review_interval_seconds", 60) or 60)), 3600)
 
+    def startup_delay_seconds(self) -> int:
+        return min(max(0, int(self.config.get("llm_image_review_startup_delay_seconds", 30) or 0)), 300)
+
     def max_per_cycle(self) -> int:
         return min(max(1, int(self.config.get("llm_image_review_max_per_cycle", 3) or 3)), 20)
 
@@ -294,11 +297,19 @@ class LlmImageReviewService:
                     summary["manual_review"] += 1
                 elif outcome == "retry":
                     summary["retried"] += 1
+                    break
                 else:
                     summary["failed"] += 1
         return summary
 
     async def _loop(self) -> None:
+        startup_delay = self.startup_delay_seconds()
+        if startup_delay > 0:
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=startup_delay)
+                return
+            except asyncio.TimeoutError:
+                pass
         while not self._stop_event.is_set():
             self._wake_event.clear()
             try:
