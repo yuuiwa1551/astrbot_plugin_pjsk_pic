@@ -49,6 +49,7 @@ legacy_review_module = importlib.import_module(f"{PACKAGE_NAME}.review_service")
 ImageIndexDB = db_module.ImageIndexDB
 LlmImageReviewContractError = review_module.LlmImageReviewContractError
 LlmImageReviewService = review_module.LlmImageReviewService
+VALID_FLAGS = review_module.VALID_FLAGS
 ReviewService = legacy_review_module.ReviewService
 
 
@@ -300,6 +301,10 @@ class LlmImageReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, second["failed"])
         stats = self.db.get_llm_image_review_stats()
         self.assertEqual(1, stats["failed"])
+        run = self.db.get_latest_llm_image_review_run(self.image_id, completed_only=False)
+        history = json.loads(str(run["error_history_json"] or "[]"))
+        self.assertEqual(2, len(history))
+        self.assertEqual([1, 2], [int(item["attempt"]) for item in history])
 
     async def test_local_low_resolution_skips_model_and_keeps_manual_review(self) -> None:
         small_id = self._add_image("small", [self.miku_id], size=(96, 96))
@@ -352,6 +357,19 @@ class LlmImageReviewTests(unittest.IsolatedAsyncioTestCase):
                 json.dumps(payload, ensure_ascii=False),
                 candidate_ids={self.miku_id},
             )
+        with self.assertRaises(LlmImageReviewContractError):
+            LlmImageReviewService.parse_response(
+                "```json\n" + self._payload() + "\n```",
+                candidate_ids={self.miku_id},
+            )
+
+    def test_prompt_lists_every_parser_flag_and_no_match_contract(self) -> None:
+        candidates = self.db.get_llm_review_candidates(self.image_id)
+        prompt = LlmImageReviewService._build_prompt(candidates)
+        for flag in VALID_FLAGS:
+            self.assertIn(flag, prompt)
+        self.assertIn("characters 必须返回空数组", prompt)
+        self.assertIn(str(self.miku_id), prompt)
 
 
 if __name__ == "__main__":

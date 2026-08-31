@@ -343,6 +343,7 @@ class ImageIndexDB:
                     raw_result TEXT NOT NULL DEFAULT '',
                     reason TEXT NOT NULL DEFAULT '',
                     error_log TEXT NOT NULL DEFAULT '',
+                    error_history_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     completed_at TEXT NOT NULL DEFAULT '',
@@ -447,6 +448,12 @@ class ImageIndexDB:
             self._ensure_column(conn, 'crawl_subscriptions', 'last_success_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscriptions', 'last_error', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_discoveries', 'source_context_json', "TEXT DEFAULT '{}'")
+            self._ensure_column(
+                conn,
+                'llm_image_review_runs',
+                'error_history_json',
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
             if not had_tag_type:
                 conn.execute(
                     "UPDATE tags SET tag_type = CASE WHEN is_character = 1 THEN 'character' ELSE 'other' END"
@@ -4862,17 +4869,37 @@ class ImageIndexDB:
         retry: bool,
     ) -> None:
         now = utcnow_str()
+        error_text = str(error or '')[:1000]
         with self._lock, self._connect() as conn:
+            row = conn.execute(
+                'SELECT attempt_count, error_history_json FROM llm_image_review_runs WHERE id = ? LIMIT 1',
+                (int(run_id),),
+            ).fetchone()
+            try:
+                history = json.loads(str(row['error_history_json'] or '[]')) if row else []
+            except (TypeError, json.JSONDecodeError):
+                history = []
+            if not isinstance(history, list):
+                history = []
+            history.append(
+                {
+                    'attempt': int(row['attempt_count'] or 0) if row else 0,
+                    'at': now,
+                    'error': error_text,
+                }
+            )
+            history = history[-20:]
             conn.execute(
                 """
                 UPDATE llm_image_review_runs
-                SET status = ?, error_log = ?, updated_at = ?,
+                SET status = ?, error_log = ?, error_history_json = ?, updated_at = ?,
                     completed_at = CASE WHEN ? = 'failed' THEN ? ELSE '' END
                 WHERE id = ?
                 """,
                 (
                     'pending' if retry else 'failed',
-                    str(error or '')[:1000],
+                    error_text,
+                    json.dumps(history, ensure_ascii=False, separators=(',', ':')),
                     now,
                     'pending' if retry else 'failed',
                     now,

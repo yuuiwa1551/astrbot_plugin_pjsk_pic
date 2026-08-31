@@ -212,7 +212,7 @@
   "llm_image_review_prompt_version": {
     "type": "string",
     "description": "审图提示词版本；修改后会生成新的幂等输入指纹并允许重新评估。",
-    "default": "v1"
+    "default": "v2"
   },
   "llm_image_review_auto_queue_new": {
     "type": "bool",

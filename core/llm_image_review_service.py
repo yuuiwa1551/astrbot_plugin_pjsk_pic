@@ -71,8 +71,8 @@ class LlmImageReviewService:
         ).strip()
 
     def prompt_version(self) -> str:
-        value = str(self.config.get("llm_image_review_prompt_version", "v1") or "v1").strip()
-        return value[:80] or "v1"
+        value = str(self.config.get("llm_image_review_prompt_version", "v2") or "v2").strip()
+        return value[:80] or "v2"
 
     def interval_seconds(self) -> int:
         return min(max(15, int(self.config.get("llm_image_review_interval_seconds", 60) or 60)), 3600)
@@ -682,6 +682,11 @@ class LlmImageReviewService:
             "aesthetic 看构图、色彩和完成度；gallery_fit 看是否适合作为图库图片。\n"
             "若是聊天截图、表情包、文字过多、严重水印、模糊、严重压缩、异常裁切、"
             "不安全内容或无法确定，请添加对应 flag 并使用 manual_review。\n"
+            "flags 只能使用以下值，不得翻译或创造其他值："
+            "low_resolution, blurry, heavy_artifacts, bad_crop, text_heavy, "
+            "watermark_heavy, screenshot, meme, unsafe, uncertain。\n"
+            "如果没有任何候选角色出现在图中，characters 必须返回空数组，decision 使用 manual_review；"
+            "这不是质量 flag，不要创建 no_match 一类新 flag。\n"
             "同图可以有多个角色，只返回画面中能高置信确认的候选，最多 3 个。\n"
             f"候选角色：{candidate_json}\n"
             "只输出一个 JSON 对象，不要 Markdown、代码块或额外文字，格式："
