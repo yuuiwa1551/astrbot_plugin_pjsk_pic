@@ -343,6 +343,14 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
   - 每个采集任务最多处理的候选图片数
 - `crawler_max_image_bytes`
   - 单张远程图片下载上限，默认 `26214400`（25 MiB），同时校验声明长度和实际读取长度
+- `crawl_worker_count`
+  - 采集任务 worker 数量，默认 `2`；手工任务优先于最新增量，历史回填最后执行
+- `crawl_image_download_concurrency`
+  - 同一作品内图片并发下载数，默认 `3`
+- `crawl_backfill_queue_high_watermark`
+  - 历史回填继续投喂任务时允许的采集队列上限，默认 `20`
+- `crawl_discovery_dispatch_interval_seconds`
+  - 有待分发发现或 Pixiv 分页 checkpoint 时的快速调度间隔，默认 `30` 秒
 - `platform_request_timeout`
   - 平台请求超时秒数
 - `platform_retry_times`
@@ -557,9 +565,21 @@ PJSK 图片图库插件，支持本地图库发图、用户投稿、多平台采
 
 ## 9. 当前版本
 
-- 当前插件版本：`0.19.2`
+- 当前插件版本：`0.20.0`
 
 ## 10. 更新记录
+
+### v0.20.0
+
+- Pixiv 自动发现和历史回填在搜索结果阶段直接应用 include/exclude，已排除作品不再创建空任务或重复请求详情
+- Pixiv 查询词增加分页 checkpoint；旧水位不在当前结果页时分轮续扫，找到旧水位后才推进高水位
+- Pixiv 与小红书优先分发已有 discovery；小红书积压改为 30 秒快速分发，不再等待下一个 180 分钟搜索周期
+- 小红书发现阶段的详情快照直接交给任务，避免同一笔记第二次调用详情；Pixiv 搜索结果完整覆盖全部原图页时同样复用
+- 每个作品只规范化一次 tag；同图的 source、image_tags、review_tasks 合并为一个数据库事务，并取消逐图片进度写库
+- 新增来源 URL 和任务 URL 复合索引；Pixiv 水位 checkpoint、任务 origin/priority 均为无损迁移字段
+- 采集队列改为 PriorityQueue，默认两个 worker；手工、最新增量、历史回填依次为高、中、低优先级，回填按低水位投喂
+- 图片下载复用 HTTP 连接池，同作品默认并发下载 3 张；SHA 命中时跳过解码和 pHash，全量活动 pHash 参与相似图比较
+- 删除通用采集外层重复重试，网络重试由具体 Pixiv API 客户端负责
 
 ### v0.19.2
 

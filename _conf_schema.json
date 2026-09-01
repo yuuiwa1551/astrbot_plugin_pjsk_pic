@@ -124,6 +124,26 @@
     "description": "单张远程图片允许下载的最大字节数；运行时限制在 1 MiB 至 100 MiB，默认 25 MiB。",
     "default": 26214400
   },
+  "crawl_worker_count": {
+    "type": "int",
+    "description": "采集任务并发 worker 数量，运行时限制为 1-4。",
+    "default": 2
+  },
+  "crawl_image_download_concurrency": {
+    "type": "int",
+    "description": "同一作品内图片并发下载数量，运行时限制为 1-8。",
+    "default": 3
+  },
+  "crawl_backfill_queue_high_watermark": {
+    "type": "int",
+    "description": "Pixiv 历史回填只在采集队列低于该数量时继续投喂任务。",
+    "default": 20
+  },
+  "crawl_discovery_dispatch_interval_seconds": {
+    "type": "int",
+    "description": "存在待分发 discovery 或 Pixiv 分页 checkpoint 时的快速调度间隔。",
+    "default": 30
+  },
   "platform_request_timeout": {
     "type": "int",
     "description": "单个平台请求超时时间（秒）；通常建议不超过 crawler_timeout_seconds。",

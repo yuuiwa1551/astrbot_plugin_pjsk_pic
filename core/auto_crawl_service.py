@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import datetime, timedelta
 
@@ -61,6 +62,12 @@ class AutoCrawlService:
     def max_new_jobs_per_cycle(self) -> int:
         return max(1, int(self.config.get("pixiv_auto_crawl_max_new_jobs_per_cycle", 30) or 30))
 
+    def discovery_dispatch_interval_seconds(self) -> int:
+        return min(
+            max(5, int(self.config.get("crawl_discovery_dispatch_interval_seconds", 30) or 30)),
+            300,
+        )
+
     def timeout_seconds(self) -> int:
         return max(
             5,
@@ -113,16 +120,31 @@ class AutoCrawlService:
             if not self.enabled() or not self.has_refresh_token():
                 return summary
 
+            max_new_jobs = self.max_new_jobs_per_cycle()
+            drained = await self._drain_discoveries(max_new_jobs=max_new_jobs)
+            summary["queued"] += drained["queued"]
+            summary["skipped_existing"] += drained["reused"] + drained["resolved_existing"]
+            summary["skipped_rejected"] += drained["resolved_rejected"]
+            summary["errors"] += drained["errors"]
+            remaining_job_budget = max(0, max_new_jobs - drained["queued"])
+            if remaining_job_budget <= 0:
+                return summary
+
             self._sync_subscriptions()
             subscriptions = self.db.list_crawl_subscriptions(platform="pixiv", enabled_only=True)
             summary["subscriptions"] = len(subscriptions)
+            include_tags, exclude_tags = self.crawl_service.resolve_filter_sets(platform="pixiv")
 
             for row in subscriptions:
                 if not force and not self._is_due(row):
                     continue
                 summary["checked"] += 1
                 try:
-                    result = await self._process_subscription(row)
+                    result = await self._process_subscription(
+                        row,
+                        include_tags=include_tags,
+                        exclude_tags=exclude_tags,
+                    )
                 except Exception as exc:
                     summary["errors"] += 1
                     self.db.update_crawl_subscription_state(
@@ -144,11 +166,12 @@ class AutoCrawlService:
                 ):
                     summary[key] += int(result.get(key, 0) or 0)
 
-            drained = await self._drain_discoveries(max_new_jobs=self.max_new_jobs_per_cycle())
-            summary["queued"] += drained["queued"]
-            summary["skipped_existing"] += drained["reused"] + drained["resolved_existing"]
-            summary["skipped_rejected"] += drained["resolved_rejected"]
-            summary["errors"] += drained["errors"]
+            if remaining_job_budget > 0:
+                drained = await self._drain_discoveries(max_new_jobs=remaining_job_budget)
+                summary["queued"] += drained["queued"]
+                summary["skipped_existing"] += drained["reused"] + drained["resolved_existing"]
+                summary["skipped_rejected"] += drained["resolved_rejected"]
+                summary["errors"] += drained["errors"]
             return summary
 
     async def _loop(self) -> None:
@@ -159,8 +182,15 @@ class AutoCrawlService:
                 raise
             except Exception as exc:
                 logger.warning(f"[PJSKPic] Pixiv 自动采集循环失败: {exc}", exc_info=True)
+            discovery_stats = self.db.count_crawl_discoveries_by_status(platform="pixiv")
+            pending_scans = self.db.count_pending_crawl_term_scans(platform="pixiv")
+            timeout = (
+                self.discovery_dispatch_interval_seconds()
+                if int(discovery_stats.get("pending", 0) or 0) > 0 or pending_scans > 0
+                else self.interval_minutes() * 60
+            )
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_minutes() * 60)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 continue
 
@@ -195,6 +225,8 @@ class AutoCrawlService:
         )
 
     def _is_due(self, row) -> bool:
+        if self.db.has_pending_crawl_subscription_scan(int(row["id"])):
+            return True
         last_checked = str(row["last_checked_at"] or "").strip()
         if not last_checked:
             return True
@@ -205,7 +237,13 @@ class AutoCrawlService:
         current = datetime.now(last_dt.tzinfo) if last_dt.tzinfo is not None else datetime.utcnow()
         return current - last_dt >= timedelta(minutes=self.interval_minutes())
 
-    async def _process_subscription(self, row) -> dict[str, int]:
+    async def _process_subscription(
+        self,
+        row,
+        *,
+        include_tags: set[str] | None = None,
+        exclude_tags: set[str] | None = None,
+    ) -> dict[str, int]:
         result = {
             "discovered": 0,
             "matched": 0,
@@ -230,41 +268,102 @@ class AutoCrawlService:
             result["errors"] = 1
             return result
 
+        resolved_include = include_tags or set()
+        resolved_exclude = exclude_tags or set()
         for term_row in term_rows:
             term_id = int(term_row["id"])
             query_term = str(term_row["query_term"] or "").strip()
             last_seen_source_uid = str(term_row["last_seen_source_uid"] or "").strip()
+            scan_offset_text = str(term_row["scan_offset"] or "").strip()
+            scan_high_watermark = str(term_row["scan_high_watermark"] or "").strip()
+            scan_target_source_uid = str(term_row["scan_target_source_uid"] or "").strip()
             checked_at = utcnow_str()
             try:
-                hits = await self.search_service.search_tag(
-                    query_term,
-                    max_results=self.max_results_per_tag(),
-                    max_pages=self.max_pages_per_tag(),
-                    timeout_seconds=self.timeout_seconds(),
-                )
-                for hit in hits:
-                    if last_seen_source_uid and hit.illust_id == last_seen_source_uid:
-                        break
-                    if not self._matches_target_tag(tag_name, hit):
-                        result["skipped_filtered"] += 1
-                        continue
-                    result["matched"] += 1
-                    if self.db.is_rejected_source_post_url(hit.post_url, platform="pixiv"):
-                        result["skipped_rejected"] += 1
-                        continue
-                    if self.db.has_source_post_url(hit.post_url, platform="pixiv"):
-                        result["skipped_existing"] += 1
-                        continue
-                    _, created = self.db.upsert_crawl_discovery(
-                        platform="pixiv",
-                        source_uid=hit.illust_id,
-                        post_url=hit.post_url,
-                        tags=[tag_name],
+                if not last_seen_source_uid and not scan_offset_text:
+                    page = await self.search_service.search_tag_page(
+                        query_term,
+                        offset=None,
+                        timeout_seconds=self.timeout_seconds(),
                     )
-                    if created:
-                        result["discovered"] += 1
-                    else:
-                        result["skipped_existing"] += 1
+                    hits = list(page.hits)[: self.max_results_per_tag()]
+                    for hit in hits:
+                        self._record_search_hit(
+                            tag_name,
+                            hit,
+                            result,
+                            include_tags=resolved_include,
+                            exclude_tags=resolved_exclude,
+                        )
+                    newest_source_uid = hits[0].illust_id if hits else ""
+                    self.db.update_crawl_subscription_term_state(
+                        term_id,
+                        last_seen_source_uid=newest_source_uid,
+                        last_checked_at=checked_at,
+                        last_success_at=checked_at,
+                        last_error="",
+                        scan_offset="",
+                        scan_high_watermark="",
+                        scan_target_source_uid="",
+                    )
+                    continue
+
+                try:
+                    offset = int(scan_offset_text) if scan_offset_text else None
+                except ValueError:
+                    offset = None
+                high_watermark = scan_high_watermark
+                target_source_uid = scan_target_source_uid or last_seen_source_uid
+                scanned = 0
+                finished = False
+                next_offset = offset
+                for _page_index in range(self.max_pages_per_tag()):
+                    page = await self.search_service.search_tag_page(
+                        query_term,
+                        offset=next_offset,
+                        timeout_seconds=self.timeout_seconds(),
+                    )
+                    hits = list(page.hits)
+                    if not high_watermark and hits:
+                        high_watermark = hits[0].illust_id
+                    cursor_found = False
+                    for hit in hits:
+                        if target_source_uid and hit.illust_id == target_source_uid:
+                            cursor_found = True
+                            break
+                        scanned += 1
+                        self._record_search_hit(
+                            tag_name,
+                            hit,
+                            result,
+                            include_tags=resolved_include,
+                            exclude_tags=resolved_exclude,
+                        )
+                    if cursor_found or not hits or page.next_offset is None:
+                        self.db.update_crawl_subscription_term_state(
+                            term_id,
+                            last_seen_source_uid=high_watermark or last_seen_source_uid,
+                            last_checked_at=checked_at,
+                            last_success_at=checked_at,
+                            last_error="",
+                            scan_offset="",
+                            scan_high_watermark="",
+                            scan_target_source_uid="",
+                        )
+                        finished = True
+                        break
+                    next_offset = page.next_offset
+                    if scanned >= self.max_results_per_tag():
+                        break
+                if not finished:
+                    self.db.update_crawl_subscription_term_state(
+                        term_id,
+                        last_checked_at=checked_at,
+                        last_success_at=checked_at,
+                        last_error="",
+                        scan_offset="" if next_offset is None else str(next_offset),
+                        scan_high_watermark=high_watermark,
+                        scan_target_source_uid=target_source_uid,
+                    )
             except Exception as exc:
                 result["errors"] += 1
                 self.db.update_crawl_subscription_term_state(
@@ -278,17 +377,52 @@ class AutoCrawlService:
                 )
                 continue
 
-            newest_source_uid = hits[0].illust_id if hits else last_seen_source_uid
-            self.db.update_crawl_subscription_term_state(
-                term_id,
-                last_seen_source_uid=newest_source_uid,
-                last_checked_at=checked_at,
-                last_success_at=checked_at,
-                last_error="",
-            )
-
         self.db.refresh_crawl_subscription_state(subscription_id)
         return result
+
+    def _record_search_hit(
+        self,
+        tag_name: str,
+        hit: PixivSearchHit,
+        result: dict[str, int],
+        *,
+        include_tags: set[str],
+        exclude_tags: set[str],
+    ) -> None:
+        candidate_tags = [*(hit.raw_tags or []), *(hit.translated_tags or [])]
+        filter_reason = self.crawl_service.filter_reason_for_tags(
+            candidate_tags,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            match_mode="exact",
+        )
+        if filter_reason is not None:
+            result["skipped_filtered"] += 1
+            return
+        if not self._matches_target_tag(tag_name, hit):
+            result["skipped_filtered"] += 1
+            return
+        result["matched"] += 1
+        if self.db.is_rejected_source_post_url(hit.post_url, platform="pixiv"):
+            result["skipped_rejected"] += 1
+            return
+        if self.db.has_source_post_url(hit.post_url, platform="pixiv"):
+            result["skipped_existing"] += 1
+            return
+        _, created = self.db.upsert_crawl_discovery(
+            platform="pixiv",
+            source_uid=hit.illust_id,
+            post_url=hit.post_url,
+            tags=[tag_name],
+            source_context={
+                "filters_applied": True,
+                "detail_snapshot": hit.detail_snapshot or {},
+            },
+        )
+        if created:
+            result["discovered"] += 1
+        else:
+            result["skipped_existing"] += 1
 
     async def _drain_discoveries(self, *, max_new_jobs: int) -> dict[str, int]:
         summary = {
@@ -314,6 +448,12 @@ class AutoCrawlService:
                 if item.strip()
             ]
             try:
+                source_context = json.loads(str(row["source_context_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                source_context = {}
+            if not isinstance(source_context, dict):
+                source_context = {}
+            try:
                 if self.db.is_rejected_source_post_url(post_url, platform="pixiv"):
                     self.db.mark_crawl_discovery_resolved(discovery_id, status="rejected")
                     summary["resolved_rejected"] += 1
@@ -326,9 +466,12 @@ class AutoCrawlService:
                     "pixiv",
                     post_url,
                     tags,
+                    source_context=source_context,
                     include_tags=[],
                     exclude_tags=[],
                     match_mode="exact",
+                    origin="auto_incremental",
+                    priority=20,
                 )
                 self.db.mark_crawl_discovery_submitted(discovery_id, job_id)
                 if created:

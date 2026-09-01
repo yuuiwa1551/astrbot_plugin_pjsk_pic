@@ -5,7 +5,7 @@ import re
 
 from .common import BaseCrawlAdapter
 from ..models import CrawlCandidate
-from ..pixiv_app_api import PixivAppAPIError, PixivAppClient
+from ..pixiv_app_api import PixivAppClient
 from ..pixiv_tag_safety import append_pixiv_safety_tags
 
 PIXIV_ID_PATTERN = re.compile(r"(?:artworks/|illust_id=)(\d+)")
@@ -25,7 +25,7 @@ class PixivAdapter(BaseCrawlAdapter):
         timeout_seconds: int = 20,
         source_context: dict | None = None,
     ) -> list[CrawlCandidate]:
-        del source_context
+        context = source_context if isinstance(source_context, dict) else {}
         source_uid = self.extract_source_uid(source_url, "")
         refresh_token = self.refresh_token()
         if source_uid and refresh_token:
@@ -35,6 +35,7 @@ class PixivAdapter(BaseCrawlAdapter):
                 source_uid,
                 max_candidates,
                 timeout_seconds,
+                context.get("detail_snapshot"),
             )
         return await super().fetch_candidates(
             source_url,
@@ -99,14 +100,17 @@ class PixivAdapter(BaseCrawlAdapter):
         illust_id: str,
         max_candidates: int,
         timeout_seconds: int,
+        detail_snapshot: object = None,
     ) -> list[CrawlCandidate]:
-        try:
-            illust = self.pixiv_client.fetch_illust_detail(
+        illust = (
+            dict(detail_snapshot)
+            if isinstance(detail_snapshot, dict)
+            and self._has_original_image_urls(detail_snapshot)
+            else self.pixiv_client.fetch_illust_detail(
                 illust_id,
                 timeout_seconds=timeout_seconds,
             )
-        except PixivAppAPIError as exc:
-            raise RuntimeError(f"Pixiv refresh token 鉴权采集失败：{exc}") from exc
+        )
 
         title = str(illust.get("title", "") or "").strip()
         user = illust.get("user")
@@ -168,6 +172,23 @@ class PixivAdapter(BaseCrawlAdapter):
                 )
             )
         return candidates
+
+    @staticmethod
+    def _has_original_image_urls(illust: dict) -> bool:
+        meta_pages = illust.get("meta_pages")
+        if isinstance(meta_pages, list) and meta_pages:
+            page_count = int(illust.get("page_count", 0) or len(meta_pages))
+            return len(meta_pages) == page_count and all(
+                isinstance(page, dict)
+                and isinstance(page.get("image_urls"), dict)
+                and bool(str(page["image_urls"].get("original", "") or "").strip())
+                for page in meta_pages
+            )
+        meta_single_page = illust.get("meta_single_page")
+        return bool(
+            isinstance(meta_single_page, dict)
+            and str(meta_single_page.get("original_image_url", "") or "").strip()
+        )
 
     @staticmethod
     def _extract_api_image_urls(illust: dict) -> list[str]:

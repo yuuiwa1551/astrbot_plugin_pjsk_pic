@@ -167,6 +167,8 @@ class ImageIndexDB:
                     include_tags_text TEXT DEFAULT '',
                     exclude_tags_text TEXT DEFAULT '',
                     tag_match_mode TEXT DEFAULT 'exact',
+                    origin TEXT NOT NULL DEFAULT 'manual',
+                    priority INTEGER NOT NULL DEFAULT 20,
                     status TEXT NOT NULL DEFAULT 'pending',
                     progress INTEGER DEFAULT 0,
                     error_log TEXT DEFAULT '',
@@ -224,6 +226,9 @@ class ImageIndexDB:
                     last_checked_at TEXT DEFAULT '',
                     last_success_at TEXT DEFAULT '',
                     last_error TEXT DEFAULT '',
+                    scan_offset TEXT DEFAULT '',
+                    scan_high_watermark TEXT DEFAULT '',
+                    scan_target_source_uid TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(subscription_id, normalized_term),
@@ -398,7 +403,9 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_image_tags_review_status ON image_tags(review_status);
                 CREATE INDEX IF NOT EXISTS idx_sources_platform ON sources(platform);
                 CREATE INDEX IF NOT EXISTS idx_sources_image_platform ON sources(image_id, platform);
+                CREATE INDEX IF NOT EXISTS idx_sources_platform_post_url ON sources(platform, post_url);
                 CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status ON crawl_jobs(status);
+                CREATE INDEX IF NOT EXISTS idx_crawl_jobs_platform_source_url ON crawl_jobs(platform, source_url);
                 CREATE INDEX IF NOT EXISTS idx_crawl_subscriptions_platform ON crawl_subscriptions(platform, enabled);
                 CREATE INDEX IF NOT EXISTS idx_crawl_subscription_terms_subscription ON crawl_subscription_terms(subscription_id, enabled, position);
                 CREATE INDEX IF NOT EXISTS idx_crawl_discoveries_status ON crawl_discoveries(platform, status, id);
@@ -440,6 +447,12 @@ class ImageIndexDB:
             self._ensure_column(conn, 'crawl_jobs', 'include_tags_text', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_jobs', 'exclude_tags_text', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_jobs', 'tag_match_mode', "TEXT DEFAULT 'exact'")
+            self._ensure_column(conn, 'crawl_jobs', 'origin', "TEXT NOT NULL DEFAULT 'manual'")
+            self._ensure_column(conn, 'crawl_jobs', 'priority', 'INTEGER NOT NULL DEFAULT 20')
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status_priority '
+                'ON crawl_jobs(status, priority, id)'
+            )
             self._ensure_column(conn, 'crawl_subscriptions', 'tag_id', 'INTEGER DEFAULT 0')
             self._ensure_column(conn, 'crawl_subscriptions', 'query_text', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscriptions', 'enabled', 'INTEGER DEFAULT 1')
@@ -448,6 +461,9 @@ class ImageIndexDB:
             self._ensure_column(conn, 'crawl_subscriptions', 'last_success_at', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscriptions', 'last_error', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_discoveries', 'source_context_json', "TEXT DEFAULT '{}'")
+            self._ensure_column(conn, 'crawl_subscription_terms', 'scan_offset', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscription_terms', 'scan_high_watermark', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscription_terms', 'scan_target_source_uid', "TEXT DEFAULT ''")
             self._ensure_column(
                 conn,
                 'llm_image_review_runs',
@@ -729,6 +745,22 @@ class ImageIndexDB:
             )
             return image_id
 
+    def get_active_image_by_sha256(self, sha256: str) -> sqlite3.Row | None:
+        digest = str(sha256 or '').strip()
+        if not digest:
+            return None
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT id, file_path, file_name, sha256, phash, width, height, format
+                FROM images
+                WHERE sha256 = ? AND is_active = 1
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (digest,),
+            ).fetchone()
+
     def find_similar_images_by_phash(self, phash: str, *, max_distance: int = 8, limit: int = 10) -> list[sqlite3.Row]:
         if not phash:
             return []
@@ -739,7 +771,6 @@ class ImageIndexDB:
                 FROM images
                 WHERE is_active = 1 AND phash != ''
                 ORDER BY id DESC
-                LIMIT 500
                 """
             ).fetchall()
         matches: list[tuple[int, sqlite3.Row]] = []
@@ -3889,6 +3920,101 @@ class ImageIndexDB:
                 (image_id, platform, post_url, image_url, author, json.dumps(raw_tags or [], ensure_ascii=False), json.dumps(extra_json or {}, ensure_ascii=False), utcnow_str()),
             )
 
+    def commit_crawl_image(
+        self,
+        *,
+        image_id: int,
+        platform: str,
+        post_url: str,
+        image_url: str,
+        author: str,
+        raw_tags: list[str],
+        extra_json: dict[str, Any],
+        tag_reviews: list[dict[str, Any]],
+    ) -> None:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sources(
+                    image_id, platform, post_url, image_url, author, raw_tags, extra_json, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(image_id),
+                    str(platform or '').strip().lower(),
+                    str(post_url or '').strip(),
+                    str(image_url or '').strip(),
+                    str(author or '').strip(),
+                    json.dumps(raw_tags or [], ensure_ascii=False),
+                    json.dumps(extra_json or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            for item in tag_reviews:
+                tag_id = int(item['tag_id'])
+                source_type = str(item.get('source_type', '') or '')
+                status = str(item.get('status', 'pending') or 'pending')
+                score = float(item.get('score', 0.0) or 0.0)
+                reason = str(item.get('reason', '') or '')
+                model_result = str(item.get('model_result', '') or '')
+                conn.execute(
+                    """
+                    INSERT INTO image_tags(
+                        image_id, tag_id, source_type, score, review_status,
+                        review_reason, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(image_id, tag_id, source_type)
+                    DO UPDATE SET
+                        score = excluded.score,
+                        review_status = excluded.review_status,
+                        review_reason = excluded.review_reason,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        int(image_id),
+                        tag_id,
+                        source_type,
+                        score,
+                        status,
+                        reason,
+                        now,
+                        now,
+                    ),
+                )
+                if not bool(item.get('create_review_task', False)):
+                    continue
+                existing = conn.execute(
+                    """
+                    SELECT id FROM review_tasks
+                    WHERE image_id = ? AND tag_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (int(image_id), tag_id),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE review_tasks
+                        SET status = ?, model_result = ?, reason = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (status, model_result, reason, now, int(existing['id'])),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO review_tasks(
+                            image_id, tag_id, status, model_result, manual_result,
+                            reason, created_at, updated_at
+                        )
+                        VALUES(?, ?, ?, ?, '', ?, ?, ?)
+                        """,
+                        (int(image_id), tag_id, status, model_result, reason, now, now),
+                    )
+
     @staticmethod
     def normalize_source_post_url(platform: str, post_url: str) -> str:
         raw_post_url = str(post_url or '').strip()
@@ -4085,6 +4211,8 @@ class ImageIndexDB:
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = 'exact',
+        origin: str = 'manual',
+        priority: int = 0,
     ) -> int:
         now = utcnow_str()
         with self._lock, self._connect() as conn:
@@ -4092,9 +4220,9 @@ class ImageIndexDB:
                 """
                 INSERT INTO crawl_jobs(
                     platform, source_url, source_context_json, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
-                    status, progress, error_log, result_summary, attempt_count, created_at, updated_at
+                    origin, priority, status, progress, error_log, result_summary, attempt_count, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
                 """,
                 (
                     platform,
@@ -4104,6 +4232,8 @@ class ImageIndexDB:
                     ','.join(include_tags or []),
                     ','.join(exclude_tags or []),
                     str(match_mode or 'exact'),
+                    str(origin or 'manual').strip().lower() or 'manual',
+                    int(priority),
                     now,
                     now,
                 ),
@@ -4114,7 +4244,18 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             return conn.execute('SELECT * FROM crawl_jobs WHERE id = ?', (job_id,)).fetchone()
 
-    def update_crawl_job(self, job_id: int, *, status: str | None = None, progress: int | None = None, error_log: str | None = None, result_summary: str | None = None, attempt_count: int | None = None) -> None:
+    def update_crawl_job(
+        self,
+        job_id: int,
+        *,
+        status: str | None = None,
+        progress: int | None = None,
+        error_log: str | None = None,
+        result_summary: str | None = None,
+        attempt_count: int | None = None,
+        source_context: dict[str, Any] | None = None,
+        clear_source_context: bool = False,
+    ) -> None:
         fields: list[str] = ['updated_at = ?']
         params: list[Any] = [utcnow_str()]
         if status is not None:
@@ -4132,6 +4273,11 @@ class ImageIndexDB:
         if attempt_count is not None:
             fields.append('attempt_count = ?')
             params.append(attempt_count)
+        if source_context is not None:
+            fields.append('source_context_json = ?')
+            params.append(self._serialize_source_context(source_context))
+        if clear_source_context:
+            fields.append("source_context_json = '{}'")
         params.append(job_id)
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE crawl_jobs SET {', '.join(fields)} WHERE id = ?", params)
@@ -4318,10 +4464,19 @@ class ImageIndexDB:
                 ),
             )
 
-    def get_pending_job_ids(self) -> list[int]:
+    def get_pending_jobs(self) -> list[sqlite3.Row]:
         with self._lock, self._connect() as conn:
-            rows = conn.execute("SELECT id FROM crawl_jobs WHERE status IN ('pending', 'retry') ORDER BY id ASC").fetchall()
-            return [int(row['id']) for row in rows]
+            return conn.execute(
+                """
+                SELECT id, priority
+                FROM crawl_jobs
+                WHERE status IN ('pending', 'retry')
+                ORDER BY priority ASC, id ASC
+                """
+            ).fetchall()
+
+    def get_pending_job_ids(self) -> list[int]:
+        return [int(row['id']) for row in self.get_pending_jobs()]
 
     def reset_running_jobs(self) -> None:
         with self._lock, self._connect() as conn:
@@ -6391,6 +6546,8 @@ class ImageIndexDB:
         include_tags: Iterable[str] = (),
         exclude_tags: Iterable[str] = (),
         source_context: dict[str, Any] | None = None,
+        origin: str = '',
+        priority: int | None = None,
         now: str,
     ) -> None:
         row = conn.execute('SELECT * FROM crawl_jobs WHERE id = ? LIMIT 1', (int(job_id),)).fetchone()
@@ -6403,10 +6560,21 @@ class ImageIndexDB:
             str(row['source_context_json'] or '{}'),
             source_context,
         )
+        existing_priority = int(row['priority']) if row['priority'] is not None else 20
+        incoming_priority = existing_priority if priority is None else int(priority)
+        merged_priority = min(existing_priority, incoming_priority)
+        existing_origin = str(row['origin'] or 'manual')
+        incoming_origin = str(origin or '').strip().lower()
+        merged_origin = (
+            incoming_origin
+            if incoming_origin and incoming_priority < existing_priority
+            else existing_origin
+        )
         conn.execute(
             """
             UPDATE crawl_jobs
-            SET tags_text = ?, include_tags_text = ?, exclude_tags_text = ?, source_context_json = ?, updated_at = ?
+            SET tags_text = ?, include_tags_text = ?, exclude_tags_text = ?, source_context_json = ?,
+                origin = ?, priority = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -6414,6 +6582,8 @@ class ImageIndexDB:
                 ','.join(merged_include),
                 ','.join(merged_exclude),
                 cls._serialize_source_context(merged_context),
+                merged_origin,
+                merged_priority,
                 now,
                 int(job_id),
             ),
@@ -6429,6 +6599,8 @@ class ImageIndexDB:
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = 'exact',
+        origin: str = 'auto_incremental',
+        priority: int = 20,
     ) -> tuple[int, bool]:
         platform_text = str(platform or '').strip().lower()
         raw_url = str(source_url or '').strip()
@@ -6463,6 +6635,8 @@ class ImageIndexDB:
                     include_tags=include_tags or [],
                     exclude_tags=exclude_tags or [],
                     source_context=source_context,
+                    origin=origin,
+                    priority=priority,
                     now=now,
                 )
                 return int(row['id']), False
@@ -6471,9 +6645,9 @@ class ImageIndexDB:
                 """
                 INSERT INTO crawl_jobs(
                     platform, source_url, source_context_json, tags_text, include_tags_text, exclude_tags_text, tag_match_mode,
-                    status, progress, error_log, result_summary, attempt_count, created_at, updated_at
+                    origin, priority, status, progress, error_log, result_summary, attempt_count, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', 0, ?, ?)
                 """,
                 (
                     platform_text,
@@ -6483,6 +6657,8 @@ class ImageIndexDB:
                     ','.join(self._merge_csv_values(include_tags or [])),
                     ','.join(self._merge_csv_values(exclude_tags or [])),
                     str(match_mode or 'exact').strip().lower() or 'exact',
+                    str(origin or 'auto_incremental').strip().lower() or 'auto_incremental',
+                    int(priority),
                     now,
                     now,
                 ),
@@ -6578,6 +6754,33 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             return conn.execute(sql, params).fetchall()
 
+    def has_pending_crawl_subscription_scan(self, subscription_id: int) -> bool:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT 1
+                FROM crawl_subscription_terms
+                WHERE subscription_id = ? AND enabled = 1
+                  AND TRIM(COALESCE(scan_offset, '')) <> ''
+                LIMIT 1
+                """,
+                (int(subscription_id),),
+            ).fetchone() is not None
+
+    def count_pending_crawl_term_scans(self, *, platform: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM crawl_subscription_terms cst
+                JOIN crawl_subscriptions cs ON cs.id = cst.subscription_id
+                WHERE cs.platform = ? AND cs.enabled = 1 AND cst.enabled = 1
+                  AND TRIM(COALESCE(cst.scan_offset, '')) <> ''
+                """,
+                (str(platform or '').strip().lower(),),
+            ).fetchone()
+        return int(row['c'] or 0) if row else 0
+
     def update_crawl_subscription_term_state(
         self,
         term_id: int,
@@ -6586,6 +6789,9 @@ class ImageIndexDB:
         last_checked_at: str | None = None,
         last_success_at: str | None = None,
         last_error: str | None = None,
+        scan_offset: str | None = None,
+        scan_high_watermark: str | None = None,
+        scan_target_source_uid: str | None = None,
     ) -> None:
         fields = ['updated_at = ?']
         params: list[Any] = [utcnow_str()]
@@ -6601,6 +6807,15 @@ class ImageIndexDB:
         if last_error is not None:
             fields.append('last_error = ?')
             params.append(str(last_error))
+        if scan_offset is not None:
+            fields.append('scan_offset = ?')
+            params.append(str(scan_offset))
+        if scan_high_watermark is not None:
+            fields.append('scan_high_watermark = ?')
+            params.append(str(scan_high_watermark))
+        if scan_target_source_uid is not None:
+            fields.append('scan_target_source_uid = ?')
+            params.append(str(scan_target_source_uid))
         params.append(int(term_id))
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE crawl_subscription_terms SET {', '.join(fields)} WHERE id = ?", params)
@@ -6736,7 +6951,8 @@ class ImageIndexDB:
             conn.execute(
                 """
                 UPDATE crawl_discoveries
-                SET status = 'submitted', crawl_job_id = ?, last_error = '', updated_at = ?
+                SET status = 'submitted', crawl_job_id = ?, source_context_json = '{}',
+                    last_error = '', updated_at = ?
                 WHERE id = ?
                 """,
                 (int(crawl_job_id), utcnow_str(), int(discovery_id)),
@@ -6750,7 +6966,7 @@ class ImageIndexDB:
             conn.execute(
                 """
                 UPDATE crawl_discoveries
-                SET status = ?, last_error = '', updated_at = ?
+                SET status = ?, source_context_json = '{}', last_error = '', updated_at = ?
                 WHERE id = ?
                 """,
                 (resolved_status, utcnow_str(), int(discovery_id)),

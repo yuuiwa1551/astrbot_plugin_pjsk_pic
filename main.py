@@ -159,6 +159,7 @@ class PJSKPicPlugin(Star):
         await self.auto_crawl_service.stop()
         await self.pixiv_backfill_service.stop()
         await self.crawl_service.stop()
+        self.importer.close()
         self.pixiv_client.close()
         self.xhs_provider_client.close()
 
@@ -1617,7 +1618,8 @@ class PJSKPicPlugin(Star):
 
         lines = [
             "采集诊断：",
-            f"采集 worker：{'运行中' if self.crawl_service.worker_running() else '未运行'}，队列 {self.crawl_service.queue_size()}",
+            f"采集 worker：{'运行中' if self.crawl_service.worker_running() else '未运行'} "
+            f"({self.crawl_service.worker_count()} 个)，队列 {self.crawl_service.queue_size()}",
             f"Pixiv 自动采集：{'启用' if self.auto_crawl_service.enabled() else '未启用'} / {'运行中' if self.auto_crawl_service.running() else '未运行'}",
             f"Pixiv refresh token：{'已配置' if self.auto_crawl_service.has_refresh_token() else '未配置'}",
             f"Pixiv 自动订阅：启用 {len(enabled_pixiv_subs)} / 总计 {len(pixiv_subs)}",

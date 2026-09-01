@@ -19,10 +19,12 @@ from tests.test_xhs_auto_crawl import (
 crawl_module = importlib.import_module(f"{PACKAGE_NAME}.crawl_service")
 importer_module = importlib.import_module(f"{PACKAGE_NAME}.importer")
 review_module = importlib.import_module(f"{PACKAGE_NAME}.review_service")
+provider_module = importlib.import_module(f"{PACKAGE_NAME}.xhs_provider")
 
 CrawlService = crawl_module.CrawlService
 ImportedImageService = importer_module.ImportedImageService
 ReviewService = review_module.ReviewService
+xhs_note_detail_to_snapshot = provider_module.xhs_note_detail_to_snapshot
 
 
 @unittest.skipUnless(
@@ -99,6 +101,8 @@ class XhsProviderIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "note_id": hit.note_id,
                         "xsec_token": hit.xsec_token,
                         "provider": "xiaohongshu_mcp_rest",
+                        "filters_applied": True,
+                        "detail_snapshot": xhs_note_detail_to_snapshot(detail),
                     },
                 )
                 self.assertTrue(created)

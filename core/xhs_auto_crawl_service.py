@@ -10,7 +10,12 @@ from astrbot.api import logger
 
 from .db import utcnow_str
 from .matcher import normalize_tag_name
-from .xhs_provider import XhsNoteDetail, XhsProviderClient, XhsProviderError
+from .xhs_provider import (
+    XhsNoteDetail,
+    XhsProviderClient,
+    XhsProviderError,
+    xhs_note_detail_to_snapshot,
+)
 
 
 class XhsAutoCrawlService:
@@ -57,6 +62,12 @@ class XhsAutoCrawlService:
 
     def max_new_jobs_per_cycle(self) -> int:
         return min(max(1, int(self.config.get("xhs_auto_crawl_max_new_jobs_per_cycle", 10) or 10)), 100)
+
+    def discovery_dispatch_interval_seconds(self) -> int:
+        return min(
+            max(5, int(self.config.get("crawl_discovery_dispatch_interval_seconds", 30) or 30)),
+            300,
+        )
 
     def seed_max_notes_per_subscription(self) -> int:
         return min(max(1, int(self.config.get("xhs_auto_crawl_seed_max_notes", 3) or 3)), 20)
@@ -160,6 +171,16 @@ class XhsAutoCrawlService:
                 summary["paused"] = 1
                 return summary
 
+            max_new_jobs = self.max_new_jobs_per_cycle()
+            drained = await self._drain_discoveries(max_new_jobs=max_new_jobs)
+            summary["queued"] += drained["queued"]
+            summary["skipped_existing"] += drained["reused"] + drained["resolved_existing"]
+            summary["skipped_rejected"] += drained["resolved_rejected"]
+            summary["errors"] += drained["errors"]
+            remaining_job_budget = max(0, max_new_jobs - drained["queued"])
+            if remaining_job_budget <= 0:
+                return summary
+
             self._sync_subscriptions()
             subscriptions = self.db.list_crawl_subscriptions(
                 platform=self.PLATFORM,
@@ -181,43 +202,32 @@ class XhsAutoCrawlService:
             if not subscriptions:
                 return summary
 
-            try:
-                await asyncio.to_thread(self.provider_client.health, timeout_seconds=self.timeout_seconds())
-                logged_in = await asyncio.to_thread(
-                    self.provider_client.login_status,
-                    timeout_seconds=self.timeout_seconds(),
-                )
-                if not logged_in:
-                    raise XhsProviderError(
-                        "小红书提供者当前未登录",
-                        category="authentication",
-                        pause_required=True,
-                    )
-                self.db.record_crawl_provider_check(self.PLATFORM, success=True)
-            except XhsProviderError as exc:
-                summary["errors"] += 1
-                self.db.record_crawl_provider_check(self.PLATFORM, success=False, error=str(exc))
-                if exc.pause_required:
-                    await self.pause_for_error(exc)
-                    summary["paused"] = 1
+            due_subscriptions = [
+                row for row in subscriptions if force or self._is_due(row)
+            ]
+            if not due_subscriptions:
                 return summary
+
+            include_tags, exclude_tags = self.crawl_service.resolve_filter_sets(
+                platform=self.PLATFORM,
+            )
 
             budget = {
                 "queries": self.max_queries_per_cycle(),
                 "details": self.max_details_per_cycle(),
             }
             detail_cache: dict[str, XhsNoteDetail] = {}
-            for row in subscriptions:
+            for row in due_subscriptions:
                 if budget["queries"] <= 0 or budget["details"] <= 0 or self.paused():
                     break
-                if not force and not self._is_due(row):
-                    continue
                 summary["checked"] += 1
                 try:
                     result = await self._process_subscription(
                         row,
                         budget=budget,
                         detail_cache=detail_cache,
+                        include_tags=include_tags,
+                        exclude_tags=exclude_tags,
                     )
                 except XhsProviderError as exc:
                     summary["errors"] += 1
@@ -263,8 +273,11 @@ class XhsAutoCrawlService:
                 ):
                     summary[key] += int(result.get(key, 0) or 0)
 
-            if not self.paused():
-                drained = await self._drain_discoveries(max_new_jobs=self.max_new_jobs_per_cycle())
+            if summary["searched"] > 0 and summary["errors"] == 0:
+                self.db.record_crawl_provider_check(self.PLATFORM, success=True)
+
+            if not self.paused() and remaining_job_budget > 0:
+                drained = await self._drain_discoveries(max_new_jobs=remaining_job_budget)
                 summary["queued"] += drained["queued"]
                 summary["skipped_existing"] += drained["reused"] + drained["resolved_existing"]
                 summary["skipped_rejected"] += drained["resolved_rejected"]
@@ -281,8 +294,14 @@ class XhsAutoCrawlService:
                 logger.warning(f"[PJSKPic] 小红书自动采集循环失败: {exc}", exc_info=True)
             if self.paused():
                 return
+            discovery_stats = self.db.count_crawl_discoveries_by_status(platform=self.PLATFORM)
+            timeout = (
+                self.discovery_dispatch_interval_seconds()
+                if int(discovery_stats.get("pending", 0) or 0) > 0
+                else self.interval_minutes() * 60
+            )
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_minutes() * 60)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 continue
 
@@ -346,6 +365,8 @@ class XhsAutoCrawlService:
         *,
         budget: dict[str, int],
         detail_cache: dict[str, XhsNoteDetail],
+        include_tags: set[str] | None = None,
+        exclude_tags: set[str] | None = None,
     ) -> dict[str, int]:
         result = {
             "searched": 0,
@@ -359,6 +380,8 @@ class XhsAutoCrawlService:
         }
         subscription_id = int(row["id"])
         tag_name = str(row["tag_name"] or "").strip()
+        resolved_include = include_tags or set()
+        resolved_exclude = exclude_tags or set()
         match_terms = self._platform_terms(tag_name, purpose="match")
         if not tag_name or not match_terms:
             self.db.update_crawl_subscription_state(
@@ -446,7 +469,15 @@ class XhsAutoCrawlService:
                                 raise
                             processed = True
                     if detail is not None:
-                        if not detail.images or not self._matches_target(detail, match_terms):
+                        filter_reason = self.crawl_service.filter_reason_for_tags(
+                            detail.topics,
+                            include_tags=resolved_include,
+                            exclude_tags=resolved_exclude,
+                            match_mode="exact",
+                        )
+                        if filter_reason is not None:
+                            result["skipped_filtered"] += 1
+                        elif not detail.images or not self._matches_target(detail, match_terms):
                             result["skipped_filtered"] += 1
                         else:
                             result["matched"] += 1
@@ -459,6 +490,8 @@ class XhsAutoCrawlService:
                                     "note_id": hit.note_id,
                                     "xsec_token": hit.xsec_token,
                                     "provider": "xiaohongshu_mcp_rest",
+                                    "filters_applied": True,
+                                    "detail_snapshot": xhs_note_detail_to_snapshot(detail),
                                 },
                             )
                             if created:
@@ -550,6 +583,8 @@ class XhsAutoCrawlService:
                     include_tags=[],
                     exclude_tags=[],
                     match_mode="exact",
+                    origin="auto_incremental",
+                    priority=20,
                 )
                 self.db.mark_crawl_discovery_submitted(discovery_id, job_id)
                 if created:

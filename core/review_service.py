@@ -41,8 +41,15 @@ class ReviewService:
             return False
         return self.looks_like_character_tag(tag_name)
 
-    async def review_image_for_tag(self, image_path: Path, tag_name: str) -> ReviewDecision:
-        if not self.is_character_tag(tag_name):
+    async def review_image_for_tag(
+        self,
+        image_path: Path,
+        tag_name: str,
+        *,
+        is_character: bool | None = None,
+    ) -> ReviewDecision:
+        character_tag = self.is_character_tag(tag_name) if is_character is None else bool(is_character)
+        if not character_tag:
             if self.config.get("approve_non_character_tags", True):
                 return ReviewDecision(status="approved", confidence=1.0, reason="非角色 tag 默认通过")
             return ReviewDecision(status="pending", confidence=0.0, reason="非角色 tag，等待人工审核")

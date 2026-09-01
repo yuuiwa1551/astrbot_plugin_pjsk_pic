@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import sys
@@ -45,11 +46,16 @@ db_module = importlib.import_module(f"{PACKAGE_NAME}.db")
 pixiv_api_module = importlib.import_module(f"{PACKAGE_NAME}.pixiv_app_api")
 search_module = importlib.import_module(f"{PACKAGE_NAME}.pixiv_search_service")
 auto_module = importlib.import_module(f"{PACKAGE_NAME}.auto_crawl_service")
+crawl_module = importlib.import_module(f"{PACKAGE_NAME}.crawl_service")
+pixiv_adapter_module = importlib.import_module(f"{PACKAGE_NAME}.adapters.pixiv_adapter")
 
 ImageIndexDB = db_module.ImageIndexDB
 PixivAppClient = pixiv_api_module.PixivAppClient
 PixivSearchHit = search_module.PixivSearchHit
+PixivSearchPage = search_module.PixivSearchPage
 AutoCrawlService = auto_module.AutoCrawlService
+CrawlService = crawl_module.CrawlService
+PixivAdapter = pixiv_adapter_module.PixivAdapter
 
 
 class FakeResponse:
@@ -128,6 +134,7 @@ class ExpiredAccessTokenSession(FakeSession):
 class FakeSearchService:
     def __init__(self, responses: dict[str, list[PixivSearchHit]]) -> None:
         self.responses = responses
+        self.calls: list[tuple[str, int | None]] = []
 
     def refresh_token(self) -> str:
         return "configured"
@@ -140,10 +147,37 @@ class FakeSearchService:
     async def search_tag(self, tag_name: str, **_kwargs) -> list[PixivSearchHit]:
         return list(self.responses.get(tag_name, []))
 
+    async def search_tag_page(
+        self,
+        tag_name: str,
+        *,
+        offset: int | None = None,
+        **_kwargs,
+    ) -> PixivSearchPage:
+        self.calls.append((tag_name, offset))
+        return PixivSearchPage(hits=list(self.responses.get(tag_name, [])), next_offset=None)
+
+
+class FakePagedSearchService(FakeSearchService):
+    def __init__(self, pages: dict[tuple[str, int | None], PixivSearchPage]) -> None:
+        super().__init__({})
+        self.pages = pages
+
+    async def search_tag_page(
+        self,
+        tag_name: str,
+        *,
+        offset: int | None = None,
+        **_kwargs,
+    ) -> PixivSearchPage:
+        self.calls.append((tag_name, offset))
+        return self.pages[(tag_name, offset)]
+
 
 class FakeCrawlService:
     def __init__(self) -> None:
         self.jobs: dict[str, tuple[int, list[str]]] = {}
+        self.excluded: set[str] = set()
 
     async def submit_job_once(
         self,
@@ -162,6 +196,13 @@ class FakeCrawlService:
         job_id = len(self.jobs) + 1
         self.jobs[source_url] = (job_id, list(tags))
         return job_id, True
+
+    def resolve_filter_sets(self, **_kwargs) -> tuple[set[str], set[str]]:
+        return set(), set(self.excluded)
+
+    def filter_reason_for_tags(self, candidate_tags, **_kwargs):
+        normalized = {str(tag).strip().casefold() for tag in candidate_tags}
+        return "exclude" if normalized & self.excluded else None
 
 
 def hit(illust_id: str, *raw_tags: str) -> PixivSearchHit:
@@ -228,6 +269,83 @@ class PixivClientTests(unittest.TestCase):
         self.assertEqual(2, session.auth_count)
         self.assertEqual(2, session.search_count)
         client.close()
+
+
+class PixivAdapterSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_snapshot_avoids_detail_request(self) -> None:
+        class CountingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fetch_illust_detail(self, *_args, **_kwargs):
+                self.calls += 1
+                raise AssertionError("detail should not be requested")
+
+        client = CountingClient()
+        adapter = PixivAdapter(
+            {"pixiv_refresh_token": "configured"},
+            pixiv_client=client,
+        )
+        snapshot = {
+            "id": 123,
+            "title": "初音未来",
+            "user": {"name": "tester"},
+            "tags": [{"name": "初音ミク", "translated_name": "初音未来"}],
+            "meta_pages": [],
+            "meta_single_page": {
+                "original_image_url": "https://i.pximg.net/img-original/test.jpg"
+            },
+            "image_urls": {},
+        }
+
+        candidates = await adapter.fetch_candidates(
+            "https://www.pixiv.net/artworks/123",
+            source_context={"detail_snapshot": snapshot},
+        )
+
+        self.assertEqual(0, client.calls)
+        self.assertEqual(1, len(candidates))
+        self.assertEqual(
+            "https://i.pximg.net/img-original/test.jpg",
+            candidates[0].image_url,
+        )
+
+    async def test_partial_multi_page_snapshot_fetches_full_detail(self) -> None:
+        class CountingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fetch_illust_detail(self, *_args, **_kwargs):
+                self.calls += 1
+                return {
+                    "id": 124,
+                    "page_count": 2,
+                    "meta_pages": [
+                        {"image_urls": {"original": "https://i.pximg.net/1.jpg"}},
+                        {"image_urls": {"original": "https://i.pximg.net/2.jpg"}},
+                    ],
+                }
+
+        client = CountingClient()
+        adapter = PixivAdapter(
+            {"pixiv_refresh_token": "configured"},
+            pixiv_client=client,
+        )
+        candidates = await adapter.fetch_candidates(
+            "https://www.pixiv.net/artworks/124",
+            source_context={
+                "detail_snapshot": {
+                    "id": 124,
+                    "page_count": 2,
+                    "meta_pages": [
+                        {"image_urls": {"original": "https://i.pximg.net/1.jpg"}},
+                    ],
+                }
+            },
+        )
+
+        self.assertEqual(1, client.calls)
+        self.assertEqual(2, len(candidates))
 
 
 class AutoCrawlReliabilityTests(unittest.IsolatedAsyncioTestCase):
@@ -302,16 +420,78 @@ class AutoCrawlReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, first["discovered"])
         self.assertEqual(1, first["queued"])
         self.assertEqual(2, len(self.db.list_pending_crawl_discoveries(platform="pixiv", limit=10)))
+        self.assertEqual(1, len(service.search_service.calls))
 
         second = await service.run_once(force=True)
         self.assertEqual(0, second["discovered"])
         self.assertEqual(1, second["queued"])
         self.assertEqual(1, len(self.db.list_pending_crawl_discoveries(platform="pixiv", limit=10)))
+        self.assertEqual(1, len(service.search_service.calls))
 
         third = await service.run_once(force=True)
         self.assertEqual(1, third["queued"])
         self.assertEqual(0, len(self.db.list_pending_crawl_discoveries(platform="pixiv", limit=10)))
         self.assertEqual(3, len(crawl_service.jobs))
+        self.assertEqual(1, len(service.search_service.calls))
+
+    async def test_discovery_filter_skips_excluded_hit_before_job_creation(self) -> None:
+        self._create_character()
+        service, crawl_service = self._service(
+            {"初音ミク": [hit("blocked", "初音ミク", "R-18")]}
+        )
+        crawl_service.excluded = {"r-18"}
+
+        summary = await service.run_once(force=True)
+
+        self.assertEqual(1, summary["skipped_filtered"])
+        self.assertEqual(0, summary["discovered"])
+        self.assertEqual({}, crawl_service.jobs)
+        self.assertEqual(
+            [],
+            self.db.list_pending_crawl_discoveries(platform="pixiv", limit=10),
+        )
+
+    async def test_saturated_cursor_resumes_from_checkpoint_before_advancing_watermark(self) -> None:
+        self._create_character()
+        service, _crawl_service = self._service({})
+        service.config["pixiv_auto_crawl_max_results_per_tag"] = 2
+        service.config["pixiv_auto_crawl_max_pages_per_tag"] = 1
+        service._sync_subscriptions()
+        subscription = self.db.list_crawl_subscriptions(platform="pixiv", enabled_only=True)[0]
+        term = self.db.list_crawl_subscription_terms(int(subscription["id"]))[0]
+        self.db.update_crawl_subscription_term_state(int(term["id"]), last_seen_source_uid="old")
+        service.search_service = FakePagedSearchService(
+            {
+                ("初音ミク", None): PixivSearchPage(
+                    hits=[hit("new-3", "初音ミク"), hit("new-2", "初音ミク")],
+                    next_offset=2,
+                ),
+                ("初音ミク", 2): PixivSearchPage(
+                    hits=[hit("new-1", "初音ミク"), hit("old", "初音ミク")],
+                    next_offset=None,
+                ),
+            }
+        )
+
+        first = await service._process_subscription(subscription)
+        first_term = self.db.list_crawl_subscription_terms(int(subscription["id"]))[0]
+        self.assertEqual(2, first["discovered"])
+        self.assertEqual("old", str(first_term["last_seen_source_uid"]))
+        self.assertEqual("2", str(first_term["scan_offset"]))
+        self.assertEqual("new-3", str(first_term["scan_high_watermark"]))
+
+        second = await service._process_subscription(subscription)
+        second_term = self.db.list_crawl_subscription_terms(int(subscription["id"]))[0]
+        self.assertEqual(1, second["discovered"])
+        self.assertEqual("new-3", str(second_term["last_seen_source_uid"]))
+        self.assertEqual("", str(second_term["scan_offset"]))
+        self.assertEqual(
+            {"new-1", "new-2", "new-3"},
+            {
+                str(row["source_uid"])
+                for row in self.db.list_pending_crawl_discoveries(platform="pixiv", limit=10)
+            },
+        )
 
     async def test_legacy_cursor_seeds_only_primary_term(self) -> None:
         tag_id = self._create_character()
@@ -354,6 +534,203 @@ class CrawlJobIdempotencyTests(unittest.TestCase):
             row = db.get_crawl_job(first_id)
             self.assertEqual({"初音未来", "镜音铃"}, set(str(row["tags_text"]).split(',')))
             self.assertEqual(1, sum(db.count_crawl_jobs_by_status().values()))
+
+    def test_existing_job_is_promoted_by_higher_priority_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = ImageIndexDB(Path(temp_dir) / "image_index.db")
+            job_id, created = db.get_or_create_crawl_job(
+                "pixiv",
+                "https://www.pixiv.net/artworks/456",
+                ["初音未来"],
+                origin="backfill",
+                priority=50,
+            )
+            self.assertTrue(created)
+
+            reused_id, reused_created = db.get_or_create_crawl_job(
+                "pixiv",
+                "https://www.pixiv.net/artworks/456",
+                ["初音未来"],
+                origin="auto_incremental",
+                priority=20,
+            )
+
+            self.assertFalse(reused_created)
+            self.assertEqual(job_id, reused_id)
+            row = db.get_crawl_job(job_id)
+            self.assertEqual("auto_incremental", str(row["origin"]))
+            self.assertEqual(20, int(row["priority"]))
+
+
+class CrawlPriorityQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_jobs_start_in_priority_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = ImageIndexDB(Path(temp_dir) / "image_index.db")
+            backfill_id = db.create_crawl_job(
+                "pixiv",
+                "https://www.pixiv.net/artworks/900",
+                ["初音未来"],
+                origin="backfill",
+                priority=50,
+            )
+            auto_id = db.create_crawl_job(
+                "pixiv",
+                "https://www.pixiv.net/artworks/901",
+                ["初音未来"],
+                origin="auto_incremental",
+                priority=20,
+            )
+            manual_id = db.create_crawl_job(
+                "pixiv",
+                "https://www.pixiv.net/artworks/902",
+                ["初音未来"],
+                origin="manual",
+                priority=0,
+            )
+
+            processed: list[int] = []
+            service = CrawlService(
+                db=db,
+                importer=None,
+                reviewer=None,
+                config={"crawl_worker_count": 1},
+            )
+
+            async def record(job_id: int) -> None:
+                processed.append(job_id)
+
+            service._process_job = record
+            await service.start()
+            await service._queue.join()
+            await service.stop()
+
+            self.assertEqual([manual_id, auto_id, backfill_id], processed)
+
+    async def test_two_workers_process_distinct_jobs_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = ImageIndexDB(Path(temp_dir) / "image_index.db")
+            for illust_id in (910, 911):
+                db.create_crawl_job(
+                    "pixiv",
+                    f"https://www.pixiv.net/artworks/{illust_id}",
+                    ["初音未来"],
+                    origin="auto_incremental",
+                    priority=20,
+                )
+            active = 0
+            max_active = 0
+            processed: set[int] = set()
+            service = CrawlService(
+                db=db,
+                importer=None,
+                reviewer=None,
+                config={"crawl_worker_count": 2},
+            )
+
+            async def record(job_id: int) -> None:
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.05)
+                processed.add(job_id)
+                active -= 1
+
+            service._process_job = record
+            await service.start()
+            await service._queue.join()
+            await service.stop()
+
+            self.assertEqual(2, max_active)
+            self.assertEqual(2, len(processed))
+
+    async def test_queued_job_priority_can_be_promoted_without_duplicate_processing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = ImageIndexDB(Path(temp_dir) / "image_index.db")
+            service = CrawlService(
+                db=db,
+                importer=None,
+                reviewer=None,
+                config={"crawl_worker_count": 1},
+            )
+            job_id, created = await service.submit_job_once(
+                "pixiv",
+                "https://www.pixiv.net/artworks/920",
+                ["初音未来"],
+                origin="backfill",
+                priority=50,
+            )
+            self.assertTrue(created)
+            reused_id, reused_created = await service.submit_job_once(
+                "pixiv",
+                "https://www.pixiv.net/artworks/920",
+                ["初音未来"],
+                origin="auto_incremental",
+                priority=20,
+            )
+            self.assertEqual(job_id, reused_id)
+            self.assertFalse(reused_created)
+
+            processed: list[int] = []
+
+            async def record(next_job_id: int) -> None:
+                processed.append(next_job_id)
+
+            service._process_job = record
+            await service.start()
+            await service._queue.join()
+            await service.stop()
+
+            self.assertEqual([job_id], processed)
+            self.assertEqual(20, int(db.get_crawl_job(job_id)["priority"]))
+
+    async def test_running_job_cannot_be_requeued_during_priority_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = ImageIndexDB(Path(temp_dir) / "image_index.db")
+            service = CrawlService(
+                db=db,
+                importer=None,
+                reviewer=None,
+                config={"crawl_worker_count": 2},
+            )
+            job_id, created = await service.submit_job_once(
+                "pixiv",
+                "https://www.pixiv.net/artworks/930",
+                ["初音未来"],
+                origin="backfill",
+                priority=50,
+            )
+            self.assertTrue(created)
+
+            started = 0
+            first_started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def record(_job_id: int) -> None:
+                nonlocal started
+                started += 1
+                first_started.set()
+                await release.wait()
+
+            service._process_job = record
+            await service.start()
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            reused_id, reused_created = await service.submit_job_once(
+                "pixiv",
+                "https://www.pixiv.net/artworks/930",
+                ["初音未来"],
+                origin="auto_incremental",
+                priority=20,
+            )
+            await asyncio.sleep(0.05)
+
+            self.assertEqual(job_id, reused_id)
+            self.assertFalse(reused_created)
+            self.assertEqual(1, started)
+            self.assertEqual(0, service.queue_size())
+
+            release.set()
+            await service._queue.join()
+            await service.stop()
 
 
 if __name__ == "__main__":

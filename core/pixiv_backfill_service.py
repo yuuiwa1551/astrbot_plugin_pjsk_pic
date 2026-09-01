@@ -159,7 +159,13 @@ class PixivBackfillService:
 
         tag_name = str(row["tag_name"] or "").strip()
         query_terms = self._query_terms_from_row(row)
+        include_tags = self._csv_texts(str(row["include_tags_text"] or ""))
         exclude_tags = self._csv_texts(str(row["exclude_tags_text"] or ""))
+        resolved_include, resolved_exclude = self.crawl_service.resolve_filter_sets(
+            platform="pixiv",
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+        )
         max_pages = self._bounded_int(row["max_pages"], 20, 1, 100)
         max_results = self._bounded_int(row["max_results"], 200, 1, 2000)
         max_new_jobs = self._bounded_int(row["max_new_jobs"], 100, 1, 500)
@@ -216,6 +222,15 @@ class PixivBackfillService:
                         stats["skipped_duplicate"] += 1
                         continue
                     seen_ids.add(hit.illust_id)
+                    filter_reason = self.crawl_service.filter_reason_for_tags(
+                        [*(hit.raw_tags or []), *(hit.translated_tags or [])],
+                        include_tags=resolved_include,
+                        exclude_tags=resolved_exclude,
+                        match_mode="exact",
+                    )
+                    if filter_reason is not None:
+                        stats["skipped_filtered"] += 1
+                        continue
                     if not self._matches_target_tag(tag_name, hit):
                         stats["skipped_filtered"] += 1
                         continue
@@ -226,13 +241,20 @@ class PixivBackfillService:
                     if self.db.has_source_post_url(hit.post_url, platform="pixiv"):
                         stats["skipped_existing"] += 1
                         continue
+                    await self.crawl_service.wait_for_backfill_capacity()
                     _, created = await self.crawl_service.submit_job_once(
                         "pixiv",
                         hit.post_url,
                         [tag_name],
+                        source_context={
+                            "filters_applied": True,
+                            "detail_snapshot": hit.detail_snapshot or {},
+                        },
                         include_tags=[],
-                        exclude_tags=exclude_tags,
+                        exclude_tags=[],
                         match_mode="exact",
+                        origin="backfill",
+                        priority=50,
                     )
                     if created:
                         stats["queued"] += 1

@@ -55,6 +55,7 @@ XhsProviderClient = provider_module.XhsProviderClient
 XhsProviderError = provider_module.XhsProviderError
 XhsSearchHit = provider_module.XhsSearchHit
 normalize_xhs_image_url = provider_module.normalize_xhs_image_url
+xhs_note_detail_to_snapshot = provider_module.xhs_note_detail_to_snapshot
 
 
 class FakeResponse:
@@ -175,11 +176,15 @@ class FakeDiscoveryProvider:
     def __init__(self) -> None:
         self.search_calls: list[str] = []
         self.detail_calls: list[str] = []
+        self.health_calls = 0
+        self.login_calls = 0
 
     def health(self, **_kwargs):
+        self.health_calls += 1
         return {"status": "healthy", "version": "v2.5.0"}
 
     def login_status(self, **_kwargs) -> bool:
+        self.login_calls += 1
         return True
 
     def search_notes(self, keyword: str, **_kwargs) -> list[XhsSearchHit]:
@@ -228,6 +233,7 @@ class RetryableFailureProvider(FakeDiscoveryProvider):
 class FakeCrawlService:
     def __init__(self) -> None:
         self.jobs: dict[str, dict] = {}
+        self.excluded: set[str] = set()
 
     async def submit_job_once(
         self,
@@ -250,6 +256,13 @@ class FakeCrawlService:
             "source_context": dict(kwargs.get("source_context") or {}),
         }
         return job_id, True
+
+    def resolve_filter_sets(self, **_kwargs) -> tuple[set[str], set[str]]:
+        return set(), set(self.excluded)
+
+    def filter_reason_for_tags(self, candidate_tags, **_kwargs):
+        normalized = {str(tag).strip().casefold() for tag in candidate_tags}
+        return "exclude" if normalized & self.excluded else None
 
 
 class XhsProviderContractTests(unittest.TestCase):
@@ -363,6 +376,40 @@ class XhsAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(range(1, 15)), [item.extra["page_index"] for item in candidates])
         self.assertTrue(all(item.extra["require_image_mime"] for item in candidates))
 
+    async def test_discovery_detail_snapshot_avoids_second_provider_request(self) -> None:
+        detail = XhsNoteDetail(
+            note_id="snapshot-note",
+            xsec_token="context",
+            post_url="https://www.xiaohongshu.com/explore/snapshot-note",
+            title="初音未来",
+            topics=["初音未来"],
+            images=[
+                XhsImageRef(
+                    url="https://sns-webpic-qc.xhscdn.com/path/snapshot.webp",
+                    index=1,
+                    width=1080,
+                    height=1440,
+                )
+            ],
+        )
+        provider = StaticDetailProvider(detail)
+        adapter = XiaohongshuAdapter(
+            {"xhs_max_images_per_note": 60},
+            provider_client=provider,
+        )
+
+        candidates = await adapter.fetch_candidates(
+            detail.post_url,
+            source_context={
+                "note_id": detail.note_id,
+                "xsec_token": detail.xsec_token,
+                "detail_snapshot": xhs_note_detail_to_snapshot(detail),
+            },
+        )
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual(0, provider.calls)
+
     async def test_abnormal_image_count_stops_instead_of_truncating(self) -> None:
         detail = XhsNoteDetail(
             note_id="note-61",
@@ -434,9 +481,14 @@ class XhsAutoCrawlTests(unittest.IsolatedAsyncioTestCase):
         first = await service.run_once(force=True)
         self.assertEqual(1, first["queued"], first)
         self.assertEqual(1, len(crawl_service.jobs))
+        self.assertEqual(0, provider.health_calls)
+        self.assertEqual(0, provider.login_calls)
         job = next(iter(crawl_service.jobs.values()))
         self.assertEqual({"初音未来", "镜音铃"}, set(job["tags"]))
         self.assertEqual("same-note", job["source_context"]["note_id"])
+        self.assertTrue(job["source_context"]["filters_applied"])
+        self.assertEqual("same-note", job["source_context"]["detail_snapshot"]["note_id"])
+        self.assertEqual(1, len(job["source_context"]["detail_snapshot"]["images"]))
         enabled_tags = {
             str(row["tag_name"])
             for row in self.db.list_crawl_subscriptions(
@@ -476,6 +528,30 @@ class XhsAutoCrawlTests(unittest.IsolatedAsyncioTestCase):
         state = service.state()
         self.assertIsNotNone(state)
         self.assertIn("timed out", str(state["last_error"]))
+
+    async def test_discovery_filter_skips_job_creation_after_detail_match(self) -> None:
+        provider = FakeDiscoveryProvider()
+        crawl_service = FakeCrawlService()
+        crawl_service.excluded = {"初音未来"}
+        service = XhsAutoCrawlService(
+            db=self.db,
+            crawl_service=crawl_service,
+            config={
+                "xhs_auto_crawl_enabled": True,
+                "xhs_provider_timeout_seconds": 10,
+                "xhs_auto_crawl_max_subscriptions_per_cycle": 1,
+                "xhs_auto_crawl_max_queries_per_cycle": 1,
+                "xhs_auto_crawl_max_details_per_cycle": 3,
+                "xhs_auto_crawl_max_new_jobs_per_cycle": 3,
+            },
+            provider_client=provider,
+        )
+
+        summary = await service.run_once(force=True, tag_name="初音未来")
+
+        self.assertEqual(1, summary["skipped_filtered"])
+        self.assertEqual(0, summary["discovered"])
+        self.assertEqual({}, crawl_service.jobs)
 
 
 if __name__ == "__main__":

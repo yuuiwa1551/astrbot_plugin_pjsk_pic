@@ -73,6 +73,54 @@ class XhsNoteDetail:
         return [self.title, self.description, *self.topics]
 
 
+def xhs_note_detail_to_snapshot(detail: XhsNoteDetail) -> dict[str, Any]:
+    return {
+        "note_id": detail.note_id,
+        "xsec_token": detail.xsec_token,
+        "post_url": detail.post_url,
+        "title": detail.title,
+        "description": detail.description,
+        "author": detail.author,
+        "note_type": detail.note_type,
+        "published_at_ms": detail.published_at_ms,
+        "topics": list(detail.topics),
+        "images": [
+            {
+                "url": image.url,
+                "index": image.index,
+                "width": image.width,
+                "height": image.height,
+            }
+            for image in detail.images
+        ],
+    }
+
+
+def xhs_note_detail_from_snapshot(value: Mapping[str, Any]) -> XhsNoteDetail:
+    images = [
+        XhsImageRef(
+            url=str(item.get("url", "") or "").strip(),
+            index=int(item.get("index", index) or index),
+            width=int(item.get("width", 0) or 0),
+            height=int(item.get("height", 0) or 0),
+        )
+        for index, item in enumerate(value.get("images") or [], start=1)
+        if isinstance(item, Mapping) and str(item.get("url", "") or "").strip()
+    ]
+    return XhsNoteDetail(
+        note_id=str(value.get("note_id", "") or "").strip(),
+        xsec_token=str(value.get("xsec_token", "") or "").strip(),
+        post_url=str(value.get("post_url", "") or "").strip(),
+        title=str(value.get("title", "") or "").strip(),
+        description=str(value.get("description", "") or "").strip(),
+        author=str(value.get("author", "") or "").strip(),
+        note_type=str(value.get("note_type", "normal") or "normal").strip(),
+        published_at_ms=int(value.get("published_at_ms", 0) or 0),
+        topics=[str(item) for item in (value.get("topics") or []) if str(item).strip()],
+        images=images,
+    )
+
+
 def canonical_xhs_post_url(note_id: str) -> str:
     value = str(note_id or "").strip()
     if not value:

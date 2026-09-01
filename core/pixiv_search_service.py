@@ -16,12 +16,36 @@ class PixivSearchHit:
     author: str = ""
     raw_tags: list[str] | None = None
     translated_tags: list[str] | None = None
+    detail_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
 class PixivSearchPage:
     hits: list[PixivSearchHit]
     next_offset: int | None = None
+
+
+def build_pixiv_detail_snapshot(illust: dict[str, Any]) -> dict[str, Any]:
+    user = illust.get("user") if isinstance(illust.get("user"), dict) else {}
+    return {
+        "id": illust.get("id"),
+        "title": illust.get("title", ""),
+        "user": {"name": user.get("name", "")},
+        "tags": [
+            {
+                "name": item.get("name", ""),
+                "translated_name": item.get("translated_name", ""),
+            }
+            for item in (illust.get("tags") or [])
+            if isinstance(item, dict)
+        ],
+        "page_count": illust.get("page_count", 0),
+        "meta_pages": illust.get("meta_pages") or [],
+        "meta_single_page": illust.get("meta_single_page") or {},
+        "image_urls": illust.get("image_urls") or {},
+        "x_restrict": illust.get("x_restrict"),
+        "illust_ai_type": illust.get("illust_ai_type"),
+    }
 
 
 class PixivSearchService:
@@ -184,4 +208,5 @@ class PixivSearchService:
             author=author,
             raw_tags=raw_tags,
             translated_tags=translated_tags,
+            detail_snapshot=build_pixiv_detail_snapshot(illust),
         )

@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import mimetypes
-import time
+import threading
 import urllib.parse
-import urllib.error
-import urllib.request
 from io import BytesIO
 from pathlib import Path
 
+import requests
 from PIL import Image
 
 from .db import ImageIndexDB
@@ -54,6 +53,7 @@ class ImportedImageService:
         enable_phash_dedupe: bool = True,
         phash_max_distance: int = 8,
         max_download_bytes: int = 25 * 1024 * 1024,
+        session: requests.Session | None = None,
     ) -> None:
         self.db = db
         self.data_dir = data_dir
@@ -66,10 +66,31 @@ class ImportedImageService:
             max(int(max_download_bytes or 25 * 1024 * 1024), 1024 * 1024),
             100 * 1024 * 1024,
         )
-        self.download_retry_times = 3
+        self.session = session or requests.Session()
+        self._store_lock = threading.RLock()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def close(self) -> None:
+        self.session.close()
 
     async def import_candidate(self, candidate: CrawlCandidate) -> ImportedImage:
         return await asyncio.to_thread(self._import_candidate_sync, candidate)
+
+    async def import_candidates(
+        self,
+        candidates: list[CrawlCandidate],
+        *,
+        concurrency: int = 3,
+    ) -> list[ImportedImage | Exception]:
+        semaphore = asyncio.Semaphore(min(max(1, int(concurrency or 1)), 8))
+
+        async def run(candidate: CrawlCandidate):
+            async with semaphore:
+                return await self.import_candidate(candidate)
+
+        return list(await asyncio.gather(*(run(candidate) for candidate in candidates), return_exceptions=True))
 
     async def import_local_file(self, source_path: str | Path, *, platform: str = "submission") -> ImportedImage:
         return await asyncio.to_thread(self._import_local_file_sync, Path(source_path), platform)
@@ -94,47 +115,40 @@ class ImportedImageService:
         )
 
     def _download_remote_bytes(self, image_url: str, *, headers: dict[str, str]) -> tuple[bytes, str, str]:
-        last_error: Exception | None = None
-        max_attempts = max(1, int(self.download_retry_times or 1))
-        for attempt in range(1, max_attempts + 1):
-            request = urllib.request.Request(image_url, headers=headers)
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    content_length = str(response.headers.get("Content-Length", "") or "").strip()
-                    if content_length:
-                        try:
-                            declared_size = int(content_length)
-                        except ValueError:
-                            declared_size = 0
-                        if declared_size > self.max_download_bytes:
-                            raise ValueError(
-                                f"图片响应超过下载上限：{declared_size} > {self.max_download_bytes} bytes"
-                            )
-                    body = response.read(self.max_download_bytes + 1)
-                    if len(body) > self.max_download_bytes:
-                        raise ValueError(
-                            f"图片实际内容超过下载上限：>{self.max_download_bytes} bytes"
-                        )
-                    return (
-                        body,
-                        response.headers.get("Content-Type", ""),
-                        response.geturl(),
+        with self.session.get(
+            image_url,
+            headers=headers,
+            timeout=self.timeout_seconds,
+            stream=True,
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            content_length = str(response.headers.get("Content-Length", "") or "").strip()
+            if content_length:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = 0
+                if declared_size > self.max_download_bytes:
+                    raise ValueError(
+                        f"图片响应超过下载上限：{declared_size} > {self.max_download_bytes} bytes"
                     )
-            except ValueError:
-                raise
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                last_error = exc
-                if attempt >= max_attempts:
-                    raise
-                time.sleep(min(1.5 * attempt, 3.0))
-            except Exception as exc:
-                last_error = exc
-                if attempt >= max_attempts:
-                    raise
-                time.sleep(min(1.5 * attempt, 3.0))
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("download failed without a captured error")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > self.max_download_bytes:
+                    raise ValueError(
+                        f"图片实际内容超过下载上限：>{self.max_download_bytes} bytes"
+                    )
+                chunks.append(chunk)
+            return (
+                b"".join(chunks),
+                response.headers.get("Content-Type", ""),
+                str(response.url),
+            )
 
     def _import_local_file_sync(self, source_path: Path, platform: str) -> ImportedImage:
         body = source_path.read_bytes()
@@ -154,7 +168,35 @@ class ImportedImageService:
         content_type: str,
         platform: str,
     ) -> ImportedImage:
+        with self._store_lock:
+            return self._store_imported_bytes_unlocked(
+                body,
+                source_name=source_name,
+                content_type=content_type,
+                platform=platform,
+            )
+
+    def _store_imported_bytes_unlocked(
+        self,
+        body: bytes,
+        *,
+        source_name: str,
+        content_type: str,
+        platform: str,
+    ) -> ImportedImage:
         sha256 = hashlib.sha256(body).hexdigest()
+        exact = self.db.get_active_image_by_sha256(sha256)
+        if exact is not None:
+            return ImportedImage(
+                image_id=int(exact["id"]),
+                file_path=Path(str(exact["file_path"])),
+                sha256=str(exact["sha256"]),
+                phash=str(exact["phash"] or ""),
+                width=int(exact["width"] or 0),
+                height=int(exact["height"] or 0),
+                format=str(exact["format"] or ""),
+                similar_image_ids=[],
+            )
         width, height, format_name = self._read_image_meta(body)
         phash = compute_image_phash(body) if self.enable_phash_dedupe else ""
         similar_rows = self.db.find_similar_images_by_phash(phash, max_distance=self.phash_max_distance) if phash else []

@@ -6,7 +6,12 @@ import urllib.parse
 
 from .common import BaseCrawlAdapter
 from ..models import CrawlCandidate
-from ..xhs_provider import XhsProviderClient, XhsProviderError, canonical_xhs_post_url
+from ..xhs_provider import (
+    XhsProviderClient,
+    XhsProviderError,
+    canonical_xhs_post_url,
+    xhs_note_detail_from_snapshot,
+)
 
 
 NOTE_ID_PATTERN = re.compile(r"/(?:explore|discovery/item|note)/([0-9a-zA-Z]+)")
@@ -41,12 +46,16 @@ class XiaohongshuAdapter(BaseCrawlAdapter):
                 "小红书结构化详情缺少 note_id 或 xsec_token，不能回退到网页正则",
                 category="configuration",
             )
-        detail = await asyncio.to_thread(
-            self.provider_client.fetch_note_detail,
-            note_id,
-            xsec_token,
-            timeout_seconds=timeout_seconds,
-        )
+        snapshot = context.get("detail_snapshot")
+        if isinstance(snapshot, dict):
+            detail = xhs_note_detail_from_snapshot(snapshot)
+        else:
+            detail = await asyncio.to_thread(
+                self.provider_client.fetch_note_detail,
+                note_id,
+                xsec_token,
+                timeout_seconds=timeout_seconds,
+            )
         safety_limit = self._image_safety_limit()
         if len(detail.images) > safety_limit:
             raise XhsProviderError(

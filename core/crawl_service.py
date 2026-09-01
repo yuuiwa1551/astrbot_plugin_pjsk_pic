@@ -41,10 +41,26 @@ class CrawlService:
         self.llm_review_service = llm_review_service
         self._xhs_pause_handler: Callable[[XhsProviderError], Awaitable[None] | None] | None = None
         self.tag_cleaner = TagCleaner(config)
-        self._queue: asyncio.Queue[int] = asyncio.Queue()
-        self._queued_ids: set[int] = set()
-        self._worker_task: asyncio.Task | None = None
+        self._queue: asyncio.PriorityQueue[tuple[int, int]] = asyncio.PriorityQueue()
+        self._queued_priorities: dict[int, int] = {}
+        self._running_ids: set[int] = set()
+        self._worker_tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
+
+    def worker_count(self) -> int:
+        return min(max(1, int(self.config.get("crawl_worker_count", 2) or 2)), 4)
+
+    def backfill_queue_high_watermark(self) -> int:
+        return min(
+            max(1, int(self.config.get("crawl_backfill_queue_high_watermark", 20) or 20)),
+            500,
+        )
+
+    def image_download_concurrency(self) -> int:
+        return min(
+            max(1, int(self.config.get("crawl_image_download_concurrency", 3) or 3)),
+            8,
+        )
 
     def _keep_primary_tags_only(self) -> bool:
         return bool(self.config.get("crawl_keep_primary_tags_only", True))
@@ -56,28 +72,35 @@ class CrawlService:
         self._xhs_pause_handler = handler
 
     def queue_size(self) -> int:
-        return int(self._queue.qsize())
+        return len(self._queued_priorities)
 
     def worker_running(self) -> bool:
-        return self._worker_task is not None and not self._worker_task.done()
+        return bool(self._worker_tasks) and all(not task.done() for task in self._worker_tasks)
 
     async def start(self) -> None:
         self.db.reset_running_jobs()
         self._stop_event.clear()
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._worker_loop(), name="pjsk-pic-crawl-worker")
-        for job_id in self.db.get_pending_job_ids():
-            await self._enqueue_job(job_id)
+        self._worker_tasks = [task for task in self._worker_tasks if not task.done()]
+        for row in self.db.get_pending_jobs():
+            await self._enqueue_job(
+                int(row["id"]),
+                priority=int(row["priority"]) if row["priority"] is not None else 20,
+            )
+        for worker_index in range(len(self._worker_tasks), self.worker_count()):
+            self._worker_tasks.append(
+                asyncio.create_task(
+                    self._worker_loop(),
+                    name=f"pjsk-pic-crawl-worker-{worker_index + 1}",
+                )
+            )
 
     async def stop(self) -> None:
         self._stop_event.set()
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-            self._worker_task = None
+        for task in self._worker_tasks:
+            task.cancel()
+        if self._worker_tasks:
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+        self._worker_tasks = []
 
     async def submit_job(
         self,
@@ -89,6 +112,8 @@ class CrawlService:
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = "exact",
+        origin: str = "manual",
+        priority: int = 0,
     ) -> int:
         normalized_platform = CrawlAdapterFactory.normalize_platform(platform)
         if not CrawlAdapterFactory.supports(normalized_platform):
@@ -103,8 +128,10 @@ class CrawlService:
             include_tags=include_tags,
             exclude_tags=exclude_tags,
             match_mode=match_mode,
+            origin=origin,
+            priority=priority,
         )
-        await self._enqueue_job(job_id)
+        await self._enqueue_job(job_id, priority=priority)
         return job_id
 
     async def submit_job_once(
@@ -117,6 +144,8 @@ class CrawlService:
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         match_mode: str = "exact",
+        origin: str = "auto_incremental",
+        priority: int = 20,
     ) -> tuple[int, bool]:
         normalized_platform = CrawlAdapterFactory.normalize_platform(platform)
         if not CrawlAdapterFactory.supports(normalized_platform):
@@ -131,33 +160,82 @@ class CrawlService:
             include_tags=include_tags,
             exclude_tags=exclude_tags,
             match_mode=match_mode,
+            origin=origin,
+            priority=priority,
         )
         if created:
-            await self._enqueue_job(job_id)
+            await self._enqueue_job(job_id, priority=priority)
+        else:
+            existing = self.db.get_crawl_job(job_id)
+            if existing and str(existing["status"] or "") in {"pending", "retry"}:
+                await self._enqueue_job(
+                    job_id,
+                    priority=(
+                        int(existing["priority"])
+                        if existing["priority"] is not None
+                        else priority
+                    ),
+                )
         return job_id, created
 
     async def retry_job(self, job_id: int) -> tuple[bool, str]:
         row = self.db.get_crawl_job(job_id)
         if not row:
             return False, f"采集任务不存在：{job_id}"
-        self.db.update_crawl_job(job_id, status="retry", progress=0, error_log="")
-        await self._enqueue_job(job_id)
+        try:
+            source_context = json.loads(str(row["source_context_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            source_context = {}
+        if not isinstance(source_context, dict):
+            source_context = {}
+        source_context.pop("detail_snapshot", None)
+        self.db.update_crawl_job(
+            job_id,
+            status="retry",
+            progress=0,
+            error_log="",
+            source_context=source_context,
+        )
+        await self._enqueue_job(
+            job_id,
+            priority=int(row["priority"]) if row["priority"] is not None else 20,
+        )
         return True, f"已重新入队采集任务 #{job_id}"
 
-    async def _enqueue_job(self, job_id: int) -> None:
-        if job_id in self._queued_ids:
+    async def _enqueue_job(self, job_id: int, *, priority: int | None = None) -> None:
+        if int(job_id) in self._running_ids:
             return
-        self._queued_ids.add(job_id)
-        await self._queue.put(job_id)
+        if priority is None:
+            row = self.db.get_crawl_job(job_id)
+            priority = (
+                int(row["priority"])
+                if row is not None and row["priority"] is not None
+                else 20
+            )
+        resolved_priority = int(priority)
+        current_priority = self._queued_priorities.get(int(job_id))
+        if current_priority is not None and current_priority <= resolved_priority:
+            return
+        self._queued_priorities[int(job_id)] = resolved_priority
+        await self._queue.put((resolved_priority, int(job_id)))
+
+    async def wait_for_backfill_capacity(self) -> None:
+        high_watermark = self.backfill_queue_high_watermark()
+        while not self._stop_event.is_set() and self.queue_size() >= high_watermark:
+            await asyncio.sleep(0.25)
 
     async def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                job_id = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                priority, job_id = await asyncio.wait_for(self._queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
-            self._queued_ids.discard(job_id)
+            if self._queued_priorities.get(job_id) != priority:
+                self._queue.task_done()
+                continue
+            self._queued_priorities.pop(job_id, None)
+            self._running_ids.add(job_id)
             try:
                 await self._process_job(job_id)
             except asyncio.CancelledError:
@@ -166,6 +244,7 @@ class CrawlService:
                 logger.error(f"[PJSKPic] 采集任务 #{job_id} 执行异常: {exc}", exc_info=True)
                 self.db.update_crawl_job(job_id, status="failed", error_log=str(exc), progress=0)
             finally:
+                self._running_ids.discard(job_id)
                 self._queue.task_done()
 
     async def _process_job(self, job_id: int) -> None:
@@ -183,7 +262,11 @@ class CrawlService:
         if not isinstance(source_context, dict):
             source_context = {}
         job_rules = CrawlTagRules.from_db_row(row)
-        default_rules = CrawlTagRules.from_config(self.config)
+        default_rules = (
+            CrawlTagRules()
+            if bool(source_context.get("filters_applied"))
+            else CrawlTagRules.from_config(self.config)
+        )
         manual_tags = job_rules.manual_tags
         include_tags = self._normalized_rule_tags(
             [*default_rules.include_tags, *job_rules.include_tags],
@@ -202,27 +285,20 @@ class CrawlService:
         )
         max_candidates = max(1, int(self.config.get("crawler_max_candidates", 6) or 6))
         timeout_seconds = max(5, int(self.config.get("platform_request_timeout", self.config.get("crawler_timeout_seconds", 20)) or 20))
-        retry_times = max(1, int(self.config.get("platform_retry_times", 2) or 2))
-
         self.db.update_crawl_job(job_id, status="running", progress=5, error_log="", result_summary="", attempt_count=attempt_count)
         candidates: list = []
         last_error = ""
-        for _ in range(retry_times):
-            try:
-                candidates = await adapter.fetch_candidates(
-                    source_url,
-                    max_candidates=max_candidates,
-                    timeout_seconds=timeout_seconds,
-                    source_context=source_context,
-                )
-                if candidates:
-                    break
-            except Exception as exc:
-                last_error = str(exc)
-                if platform == "xiaohongshu" and isinstance(exc, XhsProviderError) and exc.pause_required:
-                    await self._handle_xhs_provider_pause(exc)
-                if getattr(exc, "retryable", True) is False:
-                    break
+        try:
+            candidates = await adapter.fetch_candidates(
+                source_url,
+                max_candidates=max_candidates,
+                timeout_seconds=timeout_seconds,
+                source_context=source_context,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            if platform == "xiaohongshu" and isinstance(exc, XhsProviderError) and exc.pause_required:
+                await self._handle_xhs_provider_pause(exc)
         if not candidates:
             self.db.update_crawl_job(job_id, status="failed", progress=0, error_log=last_error or "未解析到可下载图片")
             return
@@ -239,37 +315,111 @@ class CrawlService:
         failed_candidates = 0
         candidate_errors: list[str] = []
 
-        for index, candidate in enumerate(candidates, start=1):
-            progress = 10 + int(index / max(1, len(candidates)) * 80)
-            self.db.update_crawl_job(job_id, progress=min(progress, 95))
-            try:
-                translated_tags: list[str] = []
-                if isinstance(candidate.extra, dict):
-                    translated = candidate.extra.get("translated_tags")
-                    if isinstance(translated, list):
-                        translated_tags = [str(item) for item in translated]
-                candidate_tags = self.tag_cleaner.normalize_tags(
-                    [*candidate.raw_tags, *translated_tags],
-                    drop_noise=False,
-                )
-                filter_reason = self._match_filter_reason(
-                    candidate_tags,
-                    include_tags=include_tags,
-                    exclude_tags=exclude_tags,
-                    match_mode=match_mode,
-                )
-                if filter_reason == "exclude":
-                    skipped_by_exclude += 1
-                    continue
-                if filter_reason == "include":
-                    skipped_by_include += 1
-                    continue
+        raw_tags: list[str] = []
+        translated_tags: list[str] = []
+        seen_raw: set[str] = set()
+        seen_translated: set[str] = set()
+        for candidate in candidates:
+            for value in candidate.raw_tags:
+                text = str(value or "").strip()
+                key = normalize_tag_name(text)
+                if text and key and key not in seen_raw:
+                    seen_raw.add(key)
+                    raw_tags.append(text)
+            translated = candidate.extra.get("translated_tags") if isinstance(candidate.extra, dict) else []
+            for value in translated if isinstance(translated, list) else []:
+                text = str(value or "").strip()
+                key = normalize_tag_name(text)
+                if text and key and key not in seen_translated and key not in seen_raw:
+                    seen_translated.add(key)
+                    translated_tags.append(text)
 
-                imported = await self.importer.import_candidate(candidate)
-                imported_count += 1
-                if imported.similar_image_ids:
-                    similar_hits += 1
-                self.db.upsert_source(
+        candidate_tags = self.tag_cleaner.normalize_tags(
+            [*raw_tags, *translated_tags],
+            drop_noise=False,
+        )
+        filter_reason = self._match_filter_reason(
+            candidate_tags,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            match_mode=match_mode,
+        )
+        if filter_reason == "exclude":
+            skipped_by_exclude = len(candidates)
+            candidates = []
+        elif filter_reason == "include":
+            skipped_by_include = len(candidates)
+            candidates = []
+
+        resolved_tags: list[str] = []
+        if candidates:
+            if platform == "xiaohongshu" or self._keep_primary_tags_only():
+                resolved_tags = self._canonicalize_primary_tags(
+                    manual_tags=manual_tags,
+                    include_tags=include_tags,
+                    raw_tags=[*raw_tags, *translated_tags],
+                    platform=platform,
+                )
+            else:
+                resolved_tags = self.tag_cleaner.clean_tags(
+                    self._merge_tags(manual_tags, [*raw_tags, *translated_tags]),
+                    platform=platform,
+                )
+                resolved_tags = self._collapse_similar_tags(
+                    resolved_tags,
+                    preferred_tags=[*manual_tags, *include_tags],
+                )
+
+        tag_entries: list[tuple[str, int, bool]] = []
+        if candidates:
+            for tag_name in resolved_tags[: max(1, int(self.config.get("max_tags_per_image", 12) or 12))]:
+                tag_id = self.db.get_or_create_tag(tag_name)
+                tag_entries.append((tag_name, tag_id, self.reviewer.is_character_tag(tag_name)))
+            if not tag_entries:
+                skipped_without_tags = len(candidates)
+                candidates = []
+
+        import_results = await self.importer.import_candidates(
+            candidates,
+            concurrency=self.image_download_concurrency(),
+        )
+        for index, (candidate, imported_result) in enumerate(
+            zip(candidates, import_results, strict=True),
+            start=1,
+        ):
+            try:
+                if isinstance(imported_result, Exception):
+                    raise imported_result
+                imported = imported_result
+                tag_reviews: list[dict] = []
+                for tag_name, tag_id, is_character in tag_entries:
+                    decision = await self.reviewer.review_image_for_tag(
+                        imported.file_path,
+                        tag_name,
+                        is_character=is_character,
+                    )
+                    tag_links += 1
+                    if decision.status in {"pending", "uncertain", "rejected"}:
+                        pending_reviews += 1
+                    if decision.status in {"approved", "manual_approved"}:
+                        approved_links += 1
+                    if decision.status in {"rejected", "manual_rejected"}:
+                        rejected_links += 1
+                    tag_reviews.append(
+                        {
+                            "tag_id": tag_id,
+                            "source_type": f"crawl:{platform}",
+                            "status": decision.status,
+                            "score": decision.confidence,
+                            "reason": decision.reason,
+                            "model_result": decision.raw_result,
+                            "create_review_task": (
+                                decision.status in {"pending", "uncertain", "rejected"}
+                                or is_character
+                            ),
+                        }
+                    )
+                self.db.commit_crawl_image(
                     image_id=imported.image_id,
                     platform=platform,
                     post_url=candidate.normalized_post_url or candidate.post_url,
@@ -282,58 +432,11 @@ class CrawlService:
                         "similar_image_ids": imported.similar_image_ids,
                         **(candidate.extra or {}),
                     },
+                    tag_reviews=tag_reviews,
                 )
-
-                if platform == "xiaohongshu" or self._keep_primary_tags_only():
-                    tags = self._canonicalize_primary_tags(
-                        manual_tags=manual_tags,
-                        include_tags=include_tags,
-                        raw_tags=[*candidate.raw_tags, *translated_tags],
-                        platform=platform,
-                    )
-                else:
-                    tags = self.tag_cleaner.clean_tags(
-                        self._merge_tags(manual_tags, [*candidate.raw_tags, *translated_tags]),
-                        platform=platform,
-                    )
-                    tags = self._collapse_similar_tags(tags, preferred_tags=[*manual_tags, *include_tags])
-                if not tags:
-                    skipped_without_tags += 1
-                    continue
-
-                for tag_name in tags[: max(1, int(self.config.get("max_tags_per_image", 12) or 12))]:
-                    tag_id = self.db.get_or_create_tag(tag_name)
-                    decision = await self.reviewer.review_image_for_tag(imported.file_path, tag_name)
-                    self.db.link_image_tag(
-                        imported.image_id,
-                        tag_id,
-                        source_type=f"crawl:{platform}",
-                        review_status=decision.status,
-                        score=decision.confidence,
-                        review_reason=decision.reason,
-                    )
-                    tag_links += 1
-                    if decision.status in {"pending", "uncertain", "rejected"}:
-                        pending_reviews += 1
-                        self.db.create_review_task(
-                            imported.image_id,
-                            tag_id,
-                            decision.status,
-                            model_result=decision.raw_result,
-                            reason=decision.reason,
-                        )
-                    elif self.reviewer.is_character_tag(tag_name):
-                        self.db.create_review_task(
-                            imported.image_id,
-                            tag_id,
-                            decision.status,
-                            model_result=decision.raw_result,
-                            reason=decision.reason,
-                        )
-                    if decision.status in {"approved", "manual_approved"}:
-                        approved_links += 1
-                    if decision.status in {"rejected", "manual_rejected"}:
-                        rejected_links += 1
+                imported_count += 1
+                if imported.similar_image_ids:
+                    similar_hits += 1
                 if self.llm_review_service is not None:
                     try:
                         self.llm_review_service.queue_image(
@@ -383,6 +486,7 @@ class CrawlService:
             progress=100,
             result_summary=summary,
             error_log="；".join(candidate_errors) if candidate_errors else "",
+            clear_source_context=True,
         )
 
     async def _handle_xhs_provider_pause(self, error: XhsProviderError) -> None:
@@ -446,6 +550,41 @@ class CrawlService:
             ):
                 add(term)
         return result
+
+    def resolve_filter_sets(
+        self,
+        *,
+        platform: str,
+        include_tags: Iterable[str] = (),
+        exclude_tags: Iterable[str] = (),
+        include_defaults: bool = True,
+    ) -> tuple[set[str], set[str]]:
+        defaults = CrawlTagRules.from_config(self.config) if include_defaults else CrawlTagRules()
+        resolved_include = self._normalized_rule_tags(
+            [*defaults.include_tags, *list(include_tags)],
+            platform=platform,
+        )
+        resolved_exclude = self._normalized_rule_tags(
+            [*defaults.exclude_tags, *list(exclude_tags)],
+            platform=platform,
+        )
+        return resolved_include, resolved_exclude
+
+    @classmethod
+    def filter_reason_for_tags(
+        cls,
+        candidate_tags: Iterable[str],
+        *,
+        include_tags: set[str],
+        exclude_tags: set[str],
+        match_mode: str = "exact",
+    ) -> str | None:
+        return cls._match_filter_reason(
+            candidate_tags,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            match_mode=match_mode,
+        )
 
     def _canonicalize_primary_tags(
         self,
