@@ -2575,7 +2575,7 @@ class PJSKPicPlugin(Star):
                     ".投稿 <tag> 或 .tg <tag>：附图投稿到指定 tag",
                     ".投稿 <tag> 别名 <alias1,alias2>：投稿时顺手补 alias",
                     ".tg <tag> alias <alias1,alias2>：同上",
-                    "也可以先回复一条带图消息，再发送投稿命令。",
+                    "也可以回复带图消息或合并转发，再发送 .tg <tag>；合集内所有图片统一归到该 tag。",
                     "陌生 tag 会登记为提案，不会自动建主 tag 或导入图片；管理员确认后需重新投稿。",
                 ]
             )

@@ -12,6 +12,7 @@ from .db import ImageIndexDB
 from .importer import ImportedImageService
 from .matcher import normalize_tag_name
 from .review_service import ReviewService
+from .message_images import MessageImage, collect_submission_images
 
 SUBMISSION_PATTERN = re.compile(r"(?:^|[\s])(?:[/!\uFF01.\u3002\uFF0E])?(?:\u6295\u7A3F|tg)\s+(?P<body>.+?)\s*$", re.IGNORECASE)
 ALIAS_PATTERN = re.compile(
@@ -182,6 +183,7 @@ class SubmissionService:
         aliases: list[str] | None = None,
         *,
         review_enabled: bool = True,
+        image_sources: list[MessageImage] | None = None,
     ) -> SubmissionResult:
         input_tag_name = str(tag_name or "").strip()
         if not input_tag_name:
@@ -197,11 +199,15 @@ class SubmissionService:
             canonical_tag_name=canonical_tag_name or input_tag_name,
         )
 
-        image_paths = await self._extract_image_paths(event)
-        if not image_paths:
+        extraction_errors = []
+        if image_sources is None:
+            collection = await collect_submission_images(event)
+            image_sources = collection.items
+            extraction_errors = collection.errors
+        if not image_sources:
             return SubmissionResult(
                 ok=False,
-                reply_message="投稿时请至少附带 1 张图片，或回复一条带图消息后发送 tg <tag>。",
+                reply_message='；'.join(extraction_errors) or "请附图或回复带图消息/合并转发后发送 .tg <tag>。",
                 input_tag_name=input_tag_name,
                 tag_name=canonical_tag_name or input_tag_name,
                 resolved_from_alias=resolved_from_alias,
@@ -267,9 +273,9 @@ class SubmissionService:
         skipped_aliases: list[str] = []
         items: list[SubmissionImageResult] = []
 
-        for image_index, image_path in enumerate(image_paths, start=1):
+        for image_index, image_source in enumerate(image_sources, start=1):
             try:
-                imported = await self.importer.import_local_file(image_path, platform="submission")
+                imported = await image_source.import_into(self.importer)
 
                 if not aliases_applied:
                     added_aliases, skipped_aliases = self._apply_aliases(canonical_tag_name, normalized_aliases)
@@ -311,7 +317,7 @@ class SubmissionService:
 
                 post_url = f"submission://{platform_name or 'unknown'}/{message_id or imported.sha256}"
                 image_url = f"{post_url}/{imported.sha256}"
-                author = str(sender_name or sender_id or "unknown")
+                author = str(image_source.metadata.get('source_sender_name') or image_source.metadata.get('source_sender_id') or sender_name or sender_id or "unknown")
 
                 raw_tags = self._build_raw_tags(
                     canonical_tag_name,
@@ -341,8 +347,9 @@ class SubmissionService:
                         "resolved_from_alias": resolved_from_alias,
                         "input_tag_resolved_to": canonical_tag_name if resolved_from_alias else "",
                         "image_index": image_index,
-                        "image_count": len(image_paths),
+                        "image_count": len(image_sources),
                         "similar_image_ids": imported.similar_image_ids,
+                        **image_source.metadata,
                     },
                 )
 
@@ -370,7 +377,7 @@ class SubmissionService:
                 )
             except Exception as exc:
                 logger.error(
-                    f"[PJSKPic] 投稿处理失败: tag={input_tag_name}, image_index={image_index}, path={image_path}, error={exc}",
+                    f"[PJSKPic] 投稿处理失败: tag={input_tag_name}, image_index={image_index}, error={type(exc).__name__}",
                     exc_info=True,
                 )
                 items.append(
@@ -398,6 +405,8 @@ class SubmissionService:
             message_id=message_id,
         )
         result.reply_message = self._build_reply_message(result)
+        if extraction_errors:
+            result.reply_message += '\n未能展开的消息：' + '；'.join(extraction_errors)
         return result
 
     def _resolve_target_tag(self, input_tag_name: str) -> tuple[str, bool]:
