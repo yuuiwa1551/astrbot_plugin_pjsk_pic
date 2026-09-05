@@ -32,6 +32,7 @@ from .core import (
     SubmissionService,
     TagGovernanceService,
     XhsAutoCrawlService,
+    XhsBackfillService,
     XhsProviderClient,
     extract_query_from_text,
     normalize_tag_status,
@@ -101,6 +102,14 @@ class PJSKPicPlugin(Star):
             context=context,
         )
         self.crawl_service.set_xhs_pause_handler(self.xhs_auto_crawl_service.pause_for_error)
+        self.xhs_backfill_service = XhsBackfillService(
+            db=self.db,
+            crawl_service=self.crawl_service,
+            config=config,
+            provider_client=self.xhs_provider_client,
+            pause_handler=self.xhs_auto_crawl_service.pause_for_error,
+            incremental_service=self.xhs_auto_crawl_service,
+        )
         self.pixiv_backfill_service = PixivBackfillService(
             db=self.db,
             crawl_service=self.crawl_service,
@@ -140,6 +149,7 @@ class PJSKPicPlugin(Star):
         await self.pixiv_backfill_service.start()
         await self.auto_crawl_service.start()
         await self.xhs_auto_crawl_service.start()
+        await self.xhs_backfill_service.start()
         await self.llm_image_review_service.start()
         if self._webui_enabled():
             try:
@@ -155,6 +165,7 @@ class PJSKPicPlugin(Star):
         await self.qq_review_service.clear()
         await self.webui.stop()
         await self.llm_image_review_service.stop()
+        await self.xhs_backfill_service.stop()
         await self.xhs_auto_crawl_service.stop()
         await self.auto_crawl_service.stop()
         await self.pixiv_backfill_service.stop()
@@ -1604,7 +1615,8 @@ class PJSKPicPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def crawl_diagnostics(self, event: AstrMessageEvent):
         job_counts = self.db.count_crawl_jobs_by_status()
-        backfill_counts = self.db.count_pixiv_backfill_tasks_by_status()
+        pixiv_backfill_counts = self.db.count_pixiv_backfill_tasks_by_status()
+        xhs_backfill_counts = self.db.count_xhs_backfill_tasks_by_status()
         pixiv_subs = self.db.list_crawl_subscriptions(platform="pixiv", limit=1000)
         xhs_subs = self.db.list_crawl_subscriptions(platform="xiaohongshu", limit=1000)
         enabled_pixiv_subs = [row for row in pixiv_subs if int(row["enabled"] or 0) == 1]
@@ -1629,8 +1641,10 @@ class PJSKPicPlugin(Star):
             f"最近检查：{last_checked}",
             f"最近成功：{last_success}",
             f"采集任务状态：{self._format_status_counts(job_counts, ('pending', 'retry', 'running', 'failed', 'completed'))}",
-            f"历史回填状态：{self._format_status_counts(backfill_counts, ('pending', 'retry', 'running', 'failed', 'completed'))}",
-            f"历史回填 worker：{'运行中' if self.pixiv_backfill_service.worker_running() else '未运行'}，队列 {self.pixiv_backfill_service.queue_size()}",
+            f"Pixiv 回填状态：{self._format_status_counts(pixiv_backfill_counts, ('pending', 'retry', 'running', 'failed', 'completed'))}",
+            f"Pixiv 回填 worker：{'运行中' if self.pixiv_backfill_service.worker_running() else '未运行'}，队列 {self.pixiv_backfill_service.queue_size()}",
+            f"小红书回填状态：{self._format_status_counts(xhs_backfill_counts, ('pending', 'retry', 'running', 'failed', 'limited', 'completed'))}",
+            f"小红书回填 worker：{'运行中' if self.xhs_backfill_service.worker_running() else '未运行'}，队列 {self.xhs_backfill_service.queue_size()}",
         ]
         if latest_job:
             lines.append(
@@ -1775,6 +1789,11 @@ class PJSKPicPlugin(Star):
             limit=200,
         )
         discovery_stats = self.db.count_crawl_discoveries_by_status(platform="xiaohongshu")
+        saturated_terms = self.db.list_saturated_crawl_subscription_terms(
+            platform="xiaohongshu",
+            limit=200,
+        )
+        backfill_counts = self.db.count_xhs_backfill_tasks_by_status()
         state = self.xhs_auto_crawl_service.state()
         state_text = str(state["status"] or "active") if state else "active"
         lines = [
@@ -1782,10 +1801,14 @@ class PJSKPicPlugin(Star):
             f"已启用：{'是' if self.xhs_auto_crawl_service.enabled() else '否'}",
             f"调度器：{'运行中' if self.xhs_auto_crawl_service.running() else '未运行'}",
             f"提供者状态：{state_text}",
+            f"提供者类型：{self.xhs_provider_client.provider_kind()}",
+            f"真实分页：{'支持' if self.xhs_provider_client.supports_pagination() else '不支持'}",
             f"提供者地址：{self.xhs_provider_client.base_url()}",
             f"轮询间隔：{self.xhs_auto_crawl_service.interval_minutes()} 分钟",
             f"自动订阅：{len(rows)} 个",
             f"待提交发现：{discovery_stats.get('pending', 0)}",
+            f"饱和查询词：{len(saturated_terms)}",
+            f"历史回填：{self._format_status_counts(backfill_counts, ('pending', 'retry', 'running', 'failed', 'limited', 'completed'))}",
             f"单轮预算：查询 {self.xhs_auto_crawl_service.max_queries_per_cycle()} / "
             f"详情 {self.xhs_auto_crawl_service.max_details_per_cycle()} / "
             f"新任务 {self.xhs_auto_crawl_service.max_new_jobs_per_cycle()}",
@@ -1820,6 +1843,14 @@ class PJSKPicPlugin(Star):
                     [
                         f"#{row['id']} {row['tag_name']}",
                         "query：" + ("、".join(str(term["query_term"]) for term in terms) or "-"),
+                        "saturated：" + (
+                            "、".join(
+                                str(term["query_term"])
+                                for term in terms
+                                if int(term["saturated"] or 0) == 1
+                            )
+                            or "-"
+                        ),
                         f"last_seen：{row['last_seen_source_uid'] or '-'}",
                         f"last_checked：{row['last_checked_at'] or '-'}",
                         f"last_error：{row['last_error'] or '-'}",
@@ -1841,7 +1872,7 @@ class PJSKPicPlugin(Star):
             f"详情 {summary['detailed']}，匹配 {summary['matched']}，新发现 {summary['discovered']}，"
             f"入队 {summary['queued']}，已存在 {summary['skipped_existing']}，"
             f"已拒绝 {summary['skipped_rejected']}，过滤 {summary['skipped_filtered']}，"
-            f"错误 {summary['errors']}。"
+            f"饱和 {summary['saturated']}，错误 {summary['errors']}。"
         )
 
     @pjsk_gallery.command("小红书采集暂停")
@@ -1855,6 +1886,82 @@ class PJSKPicPlugin(Star):
     async def resume_xhs_auto_crawl(self, event: AstrMessageEvent):
         changed = await self.xhs_auto_crawl_service.resume()
         yield event.plain_result("小红书自动采集已恢复。" if changed else "小红书自动采集当前未暂停。")
+
+    @pjsk_gallery.command("小红书回填添加")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def add_xhs_backfill_task(
+        self,
+        event: AstrMessageEvent,
+        tag_text: str,
+        max_pages: int = 10,
+        max_results: int = 200,
+        max_new_jobs: int = 50,
+    ):
+        try:
+            task_id, info = await self.xhs_backfill_service.create_task(
+                tag_text=tag_text,
+                max_pages=max_pages,
+                max_results=max_results,
+                max_new_jobs=max_new_jobs,
+            )
+        except Exception as exc:
+            yield event.plain_result(f"创建小红书历史回填任务失败：{exc}")
+            return
+        yield event.plain_result(
+            "已创建小红书历史回填任务：\n"
+            f"#{task_id} {tag_text} -> {info['tag_name']}\n"
+            f"搜索词：{'、'.join(info['query_terms'])}\n"
+            f"页数上限：{max_pages}，扫描上限：{max_results}，入队上限：{max_new_jobs}"
+        )
+
+    @pjsk_gallery.command("小红书回填列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_xhs_backfill_tasks(self, event: AstrMessageEvent):
+        rows = self.db.list_xhs_backfill_tasks(limit=10)
+        if not rows:
+            yield event.plain_result("当前没有小红书历史回填任务。")
+            return
+        lines = ["最近小红书历史回填任务："]
+        lines.append("limited 表示已达预算上限，不代表全部历史已扫完。")
+        for row in rows:
+            lines.append(
+                "\n".join(
+                    [
+                        f"#{row['id']} [{row['status']}] {row['tag_text'] or row['tag_name']} -> {row['tag_name']}",
+                        f"当前：{row['current_query_text'] or '-'}，下一页 {row['next_page']}/{row['max_pages']}",
+                        f"当前页已处理：{row['page_item_index']} 条",
+                        f"扫描 {row['scanned']}，详情 {row['detailed']}，匹配 {row['matched']}，入队 {row['queued']}",
+                        f"跳过：已存在 {row['skipped_existing']}，已拒绝 {row['skipped_rejected']}，过滤 {row['skipped_filtered']}，重复 {row['skipped_duplicate']}，详情失败 {row['failed_details']}",
+                        f"错误：{row['error_log'] or '-'}",
+                    ]
+                )
+            )
+        yield event.plain_result("\n\n".join(lines))
+
+    @pjsk_gallery.command("小红书回填重试")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def retry_xhs_backfill_task(self, event: AstrMessageEvent, task_id: int):
+        ok, message = await self.xhs_backfill_service.retry_task(int(task_id))
+        yield event.plain_result(message if ok else f"重试失败：{message}")
+
+    @pjsk_gallery.command("小红书饱和列表")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_xhs_saturated_terms(self, event: AstrMessageEvent):
+        rows = self.db.list_saturated_crawl_subscription_terms(
+            platform="xiaohongshu",
+            limit=30,
+        )
+        if not rows:
+            yield event.plain_result("当前没有标记为饱和的小红书查询词。")
+            return
+        lines = ["小红书饱和查询词："]
+        for row in rows:
+            lines.append(
+                f"#{row['id']} {row['tag_name']} / {row['query_term']}："
+                f"{row['saturated_reason'] or '-'}（{row['saturated_at'] or '-'}）"
+            )
+        lines.append("可用 .pp 小红书回填添加 <tag> [页数] [扫描上限] [入队上限] 显式创建回填。")
+        yield event.plain_result("\n".join(lines))
 
     @pjsk_gallery.command("历史回填添加")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2522,6 +2629,8 @@ class PJSKPicPlugin(Star):
                     ".pp 平台词列表 <Pixiv|小红书> [tag]；.pp 平台词删除 <term_id>",
                     ".pp 小红书采集状态；.pp 小红书采集列表",
                     ".pp 小红书采集执行 [tag]；.pp 小红书采集暂停 [原因]；.pp 小红书采集恢复",
+                    ".pp 小红书回填添加 <tag> [页数] [扫描上限] [入队上限]",
+                    ".pp 小红书回填列表；.pp 小红书回填重试 <任务ID>；.pp 小红书饱和列表",
                     "小红书只采集配置了显式 query 与 match/both 平台词的 tag。",
                 ]
             )

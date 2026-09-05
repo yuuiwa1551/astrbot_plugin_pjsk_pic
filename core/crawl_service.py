@@ -219,6 +219,11 @@ class CrawlService:
         self._queued_priorities[int(job_id)] = resolved_priority
         await self._queue.put((resolved_priority, int(job_id)))
 
+    async def enqueue_persisted_job(self, job_id: int) -> None:
+        row = self.db.get_crawl_job(job_id)
+        if row is not None and row['status'] in {'pending', 'retry'}:
+            await self._enqueue_job(job_id, priority=int(row['priority']))
+
     async def wait_for_backfill_capacity(self) -> None:
         high_watermark = self.backfill_queue_high_watermark()
         while not self._stop_event.is_set() and self.queue_size() >= high_watermark:

@@ -54,6 +54,7 @@ XhsNoteDetail = provider_module.XhsNoteDetail
 XhsProviderClient = provider_module.XhsProviderClient
 XhsProviderError = provider_module.XhsProviderError
 XhsSearchHit = provider_module.XhsSearchHit
+XhsSearchPage = provider_module.XhsSearchPage
 normalize_xhs_image_url = provider_module.normalize_xhs_image_url
 xhs_note_detail_to_snapshot = provider_module.xhs_note_detail_to_snapshot
 
@@ -86,6 +87,7 @@ class ContractSession:
                 {
                     "success": True,
                     "data": {
+                        "hasMore": True,
                         "feeds": [
                             {
                                 "id": "note-1",
@@ -126,6 +128,10 @@ class ContractSession:
                                 "time": 1_700_000_000_000,
                                 "user": {"nickname": "tester"},
                                 "imageList": images,
+                                "tagList": [
+                                    {"name": "初音未来"},
+                                    {"name": "巡音流歌"},
+                                ],
                             }
                         },
                     },
@@ -187,17 +193,24 @@ class FakeDiscoveryProvider:
         self.login_calls += 1
         return True
 
-    def search_notes(self, keyword: str, **_kwargs) -> list[XhsSearchHit]:
+    def search_notes_page(self, keyword: str, **_kwargs) -> XhsSearchPage:
         self.search_calls.append(keyword)
-        return [
-            XhsSearchHit(
-                note_id="same-note",
-                xsec_token="context-token",
-                post_url="https://www.xiaohongshu.com/explore/same-note",
-                title="初音未来与镜音铃",
-                author="tester",
-            )
-        ]
+        return XhsSearchPage(
+            hits=[
+                XhsSearchHit(
+                    note_id="same-note",
+                    xsec_token="context-token",
+                    post_url="https://www.xiaohongshu.com/explore/same-note",
+                    title="初音未来与镜音铃",
+                    author="tester",
+                )
+            ],
+            page=1,
+            has_more=False,
+        )
+
+    def source_name(self) -> str:
+        return "xiaohongshu_cli_rest"
 
     def fetch_note_detail(self, note_id: str, _token: str, **_kwargs) -> XhsNoteDetail:
         self.detail_calls.append(note_id)
@@ -221,13 +234,19 @@ class FakeDiscoveryProvider:
 
 
 class RetryableFailureProvider(FakeDiscoveryProvider):
-    def search_notes(self, keyword: str, **_kwargs) -> list[XhsSearchHit]:
+    def search_notes_page(self, keyword: str, **_kwargs) -> XhsSearchPage:
         self.search_calls.append(keyword)
         raise XhsProviderError(
             "provider browser timed out",
             category="timeout",
             retryable=True,
         )
+
+
+class SaturatedDiscoveryProvider(FakeDiscoveryProvider):
+    def search_notes_page(self, keyword: str, **_kwargs) -> XhsSearchPage:
+        page = super().search_notes_page(keyword, **_kwargs)
+        return XhsSearchPage(hits=page.hits, page=1, has_more=True)
 
 
 class FakeCrawlService:
@@ -264,6 +283,9 @@ class FakeCrawlService:
         normalized = {str(tag).strip().casefold() for tag in candidate_tags}
         return "exclude" if normalized & self.excluded else None
 
+    async def wait_for_backfill_capacity(self) -> None:
+        return None
+
 
 class XhsProviderContractTests(unittest.TestCase):
     def test_search_contract_omits_unlimited_filters_and_detail_keeps_all_images(self) -> None:
@@ -290,7 +312,28 @@ class XhsProviderContractTests(unittest.TestCase):
         detail = client.fetch_note_detail(hits[0].note_id, hits[0].xsec_token)
         self.assertEqual(14, len(detail.images))
         self.assertTrue(all(image.url.startswith("https://") for image in detail.images))
-        self.assertEqual(["初音未来", "PJSK"], detail.topics)
+        self.assertEqual(["初音未来", "PJSK", "巡音流歌"], detail.topics)
+
+    def test_cli_provider_sends_real_page_and_reads_has_more(self) -> None:
+        session = ContractSession()
+        client = XhsProviderClient(
+            {
+                "xhs_provider_kind": "xiaohongshu_cli",
+                "xhs_provider_base_url": "http://provider:18060",
+                "xhs_provider_min_interval_seconds": 0,
+            },
+            session=session,
+            sleep_func=lambda _seconds: None,
+            clock=lambda: 1000.0,
+        )
+
+        result = client.search_notes_page("初音未来", page=2, max_results=20)
+
+        search_call = next(call for call in session.calls if call["url"].endswith("/feeds/search"))
+        self.assertEqual(2, search_call["json"]["page"])
+        self.assertEqual(20, search_call["json"]["page_size"])
+        self.assertEqual(2, result.page)
+        self.assertTrue(result.has_more)
 
     def test_risk_control_is_non_retryable_and_requires_pause(self) -> None:
         client = XhsProviderClient(
@@ -552,6 +595,31 @@ class XhsAutoCrawlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, summary["skipped_filtered"])
         self.assertEqual(0, summary["discovered"])
         self.assertEqual({}, crawl_service.jobs)
+
+    async def test_first_page_with_more_results_marks_term_saturated(self) -> None:
+        provider = SaturatedDiscoveryProvider()
+        service = XhsAutoCrawlService(
+            db=self.db,
+            crawl_service=FakeCrawlService(),
+            config={
+                "xhs_auto_crawl_enabled": True,
+                "xhs_provider_timeout_seconds": 10,
+                "xhs_auto_crawl_max_subscriptions_per_cycle": 1,
+                "xhs_auto_crawl_max_queries_per_cycle": 1,
+                "xhs_auto_crawl_max_details_per_cycle": 3,
+                "xhs_auto_crawl_max_new_jobs_per_cycle": 3,
+            },
+            provider_client=provider,
+        )
+
+        summary = await service.run_once(force=True, tag_name="初音未来")
+
+        self.assertEqual(1, summary["saturated"])
+        rows = self.db.list_saturated_crawl_subscription_terms(
+            platform="xiaohongshu"
+        )
+        self.assertEqual(1, len(rows))
+        self.assertEqual("初音未来", str(rows[0]["tag_name"]))
 
 
 if __name__ == "__main__":

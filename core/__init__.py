@@ -25,12 +25,14 @@ from .tag_policy import (
     tag_type_label,
 )
 from .xhs_auto_crawl_service import XhsAutoCrawlService
+from .xhs_backfill_service import XhsBackfillService
 from .xhs_provider import (
     XhsImageRef,
     XhsNoteDetail,
     XhsProviderClient,
     XhsProviderError,
     XhsSearchHit,
+    XhsSearchPage,
 )
 
 __all__ = [
@@ -69,9 +71,11 @@ __all__ = [
     "tag_status_label",
     "tag_type_label",
     "XhsAutoCrawlService",
+    "XhsBackfillService",
     "XhsImageRef",
     "XhsNoteDetail",
     "XhsProviderClient",
     "XhsProviderError",
     "XhsSearchHit",
+    "XhsSearchPage",
 ]

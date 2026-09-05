@@ -84,7 +84,7 @@ class XiaohongshuAdapter(BaseCrawlAdapter):
                     title=detail.title,
                     extra={
                         "adapter": "xiaohongshu",
-                        "via": "xiaohongshu_mcp_rest",
+                        "via": str(context.get('provider') or f"{self.config.get('xhs_provider_kind', 'xiaohongshu_mcp')}_rest"),
                         "source_id": detail.note_id,
                         "description": detail.description,
                         "published_at_ms": detail.published_at_ms,

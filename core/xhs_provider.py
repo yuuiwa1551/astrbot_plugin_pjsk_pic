@@ -57,6 +57,13 @@ class XhsSearchHit:
 
 
 @dataclass(frozen=True, slots=True)
+class XhsSearchPage:
+    hits: list[XhsSearchHit]
+    page: int = 1
+    has_more: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class XhsNoteDetail:
     note_id: str
     xsec_token: str
@@ -218,6 +225,24 @@ class XhsProviderClient:
     def access_token(self) -> str:
         return str(self.config.get("xhs_provider_access_token", "") or "").strip()
 
+    def provider_kind(self) -> str:
+        value = str(
+            self.config.get("xhs_provider_kind", "xiaohongshu_mcp")
+            or "xiaohongshu_mcp"
+        ).strip().lower()
+        if value not in {"xiaohongshu_mcp", "xiaohongshu_cli"}:
+            raise XhsProviderError(
+                f"不支持的小红书提供者类型：{value}",
+                category="configuration",
+            )
+        return value
+
+    def supports_pagination(self) -> bool:
+        return self.provider_kind() == "xiaohongshu_cli"
+
+    def source_name(self) -> str:
+        return f"{self.provider_kind()}_rest"
+
     def min_interval_seconds(self) -> float:
         raw = self.config.get("xhs_provider_min_interval_seconds", 2.0)
         try:
@@ -257,20 +282,45 @@ class XhsProviderClient:
         max_results: int = 20,
         timeout_seconds: int = 45,
     ) -> list[XhsSearchHit]:
+        return self.search_notes_page(
+            keyword,
+            page=1,
+            max_results=max_results,
+            timeout_seconds=timeout_seconds,
+            publish_time="一周内",
+        ).hits
+
+    def search_notes_page(
+        self,
+        keyword: str,
+        *,
+        page: int = 1,
+        max_results: int = 20,
+        timeout_seconds: int = 45,
+        publish_time: str = "不限",
+    ) -> XhsSearchPage:
         term = str(keyword or "").strip()
         if not term:
             raise XhsProviderError("小红书搜索词不能为空", category="configuration")
+        resolved_page = max(1, int(page or 1))
+        if resolved_page > 1 and not self.supports_pagination():
+            raise XhsProviderError('当前 provider 不支持分页', category='configuration')
+        resolved_limit = min(max(1, int(max_results or 1)), 50)
+        request_body: dict[str, Any] = {
+            "keyword": term,
+            "filters": {
+                "sort_by": "最新",
+                "note_type": "图文",
+                "publish_time": str(publish_time or "不限"),
+            },
+        }
+        if self.supports_pagination():
+            request_body["page"] = resolved_page
+            request_body["page_size"] = resolved_limit
         payload = self._request_json(
             "POST",
             "/api/v1/feeds/search",
-            json_body={
-                "keyword": term,
-                "filters": {
-                    "sort_by": "最新",
-                    "note_type": "图文",
-                    "publish_time": "一周内",
-                },
-            },
+            json_body=request_body,
             timeout_seconds=timeout_seconds,
         )
         data = payload.get("data")
@@ -319,9 +369,14 @@ class XhsProviderClient:
                     position=position,
                 )
             )
-            if len(hits) >= max(1, int(max_results or 1)):
+            if not self.supports_pagination() and len(hits) >= resolved_limit:
                 break
-        return hits
+        has_more = bool(
+            data.get("hasMore", data.get("has_more", False))
+            if isinstance(data, dict)
+            else False
+        )
+        return XhsSearchPage(hits=hits, page=resolved_page, has_more=has_more)
 
     def fetch_note_detail(
         self,
@@ -406,6 +461,18 @@ class XhsProviderClient:
         except (TypeError, ValueError):
             published_at_ms = 0
         description = str(note.get("desc", "") or "").strip()
+        topics = extract_xhs_topics(description)
+        seen_topics = {item.casefold() for item in topics}
+        raw_tag_list = note.get("tagList")
+        if isinstance(raw_tag_list, list):
+            for item in raw_tag_list:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "") or "").strip().strip("#＃")
+                key = name.casefold()
+                if name and key not in seen_topics:
+                    seen_topics.add(key)
+                    topics.append(name)
         return XhsNoteDetail(
             note_id=response_note_id,
             xsec_token=str(note.get("xsecToken", "") or resolved_token).strip(),
@@ -415,7 +482,7 @@ class XhsProviderClient:
             author=author,
             note_type=note_type or "normal",
             published_at_ms=published_at_ms,
-            topics=extract_xhs_topics(description),
+            topics=topics[:40],
             images=images,
         )
 

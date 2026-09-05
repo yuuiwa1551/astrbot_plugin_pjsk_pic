@@ -229,6 +229,9 @@ class ImageIndexDB:
                     scan_offset TEXT DEFAULT '',
                     scan_high_watermark TEXT DEFAULT '',
                     scan_target_source_uid TEXT DEFAULT '',
+                    saturated INTEGER DEFAULT 0,
+                    saturated_at TEXT DEFAULT '',
+                    saturated_reason TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(subscription_id, normalized_term),
@@ -285,6 +288,36 @@ class ImageIndexDB:
                     skipped_rejected INTEGER DEFAULT 0,
                     skipped_filtered INTEGER DEFAULT 0,
                     skipped_duplicate INTEGER DEFAULT 0,
+                    error_log TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS xhs_backfill_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tag_id INTEGER DEFAULT 0,
+                    tag_name TEXT NOT NULL,
+                    normalized_tag TEXT NOT NULL,
+                    tag_text TEXT DEFAULT '',
+                    query_terms_json TEXT DEFAULT '[]',
+                    match_terms_json TEXT DEFAULT '[]',
+                    max_pages INTEGER DEFAULT 10,
+                    max_results INTEGER DEFAULT 200,
+                    max_new_jobs INTEGER DEFAULT 50,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    current_query_index INTEGER DEFAULT 0,
+                    current_query_text TEXT DEFAULT '',
+                    next_page INTEGER DEFAULT 1,
+                    scanned INTEGER DEFAULT 0,
+                    detailed INTEGER DEFAULT 0,
+                    matched INTEGER DEFAULT 0,
+                    queued INTEGER DEFAULT 0,
+                    skipped_existing INTEGER DEFAULT 0,
+                    skipped_rejected INTEGER DEFAULT 0,
+                    skipped_filtered INTEGER DEFAULT 0,
+                    skipped_duplicate INTEGER DEFAULT 0,
+                    failed_details INTEGER DEFAULT 0,
                     error_log TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -396,6 +429,13 @@ class ImageIndexDB:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_images_active ON images(is_active);
+                CREATE TABLE IF NOT EXISTS xhs_backfill_items (
+                    task_id INTEGER NOT NULL,
+                    note_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    crawl_job_id INTEGER DEFAULT 0,
+                    PRIMARY KEY(task_id, note_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256);
                 CREATE INDEX IF NOT EXISTS idx_image_files_image_id ON image_files(image_id);
                 CREATE INDEX IF NOT EXISTS idx_image_files_active ON image_files(is_active);
@@ -410,6 +450,7 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_crawl_subscription_terms_subscription ON crawl_subscription_terms(subscription_id, enabled, position);
                 CREATE INDEX IF NOT EXISTS idx_crawl_discoveries_status ON crawl_discoveries(platform, status, id);
                 CREATE INDEX IF NOT EXISTS idx_pixiv_backfill_tasks_status ON pixiv_backfill_tasks(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_xhs_backfill_tasks_status ON xhs_backfill_tasks(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_status_image ON review_tasks(status, image_id, id);
                 CREATE INDEX IF NOT EXISTS idx_review_tasks_image_status ON review_tasks(image_id, status);
@@ -464,6 +505,12 @@ class ImageIndexDB:
             self._ensure_column(conn, 'crawl_subscription_terms', 'scan_offset', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscription_terms', 'scan_high_watermark', "TEXT DEFAULT ''")
             self._ensure_column(conn, 'crawl_subscription_terms', 'scan_target_source_uid', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscription_terms', 'saturated', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'crawl_subscription_terms', 'saturated_at', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'crawl_subscription_terms', 'saturated_reason', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'xhs_backfill_tasks', 'page_snapshot_json', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'xhs_backfill_tasks', 'page_item_index', 'INTEGER DEFAULT 0')
+            self._ensure_column(conn, 'xhs_backfill_tasks', 'page_size', 'INTEGER DEFAULT 20')
             self._ensure_column(
                 conn,
                 'llm_image_review_runs',
@@ -4316,6 +4363,13 @@ class ImageIndexDB:
             ).fetchall()
         return {str(row["status"] or ""): int(row["total"] or 0) for row in rows}
 
+    def count_xhs_backfill_tasks_by_status(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS total FROM xhs_backfill_tasks GROUP BY status"
+            ).fetchall()
+        return {str(row["status"] or ""): int(row["total"] or 0) for row in rows}
+
     def get_latest_crawl_job(self, *, statuses: Iterable[str] | None = None) -> sqlite3.Row | None:
         sql = "SELECT * FROM crawl_jobs"
         params: list[Any] = []
@@ -4602,6 +4656,196 @@ class ImageIndexDB:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "UPDATE pixiv_backfill_tasks SET status = 'retry', updated_at = ? WHERE status = 'running'",
+                (utcnow_str(),),
+            )
+
+    def create_xhs_backfill_task(
+        self,
+        *,
+        tag_id: int,
+        tag_name: str,
+        tag_text: str,
+        query_terms: list[str],
+        match_terms: list[str],
+        max_pages: int = 10,
+        max_results: int = 200,
+        max_new_jobs: int = 50,
+    ) -> int:
+        now = utcnow_str()
+        canonical_tag = str(tag_name or '').strip()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO xhs_backfill_tasks(
+                    tag_id, tag_name, normalized_tag, tag_text,
+                    query_terms_json, match_terms_json,
+                    max_pages, max_results, max_new_jobs,
+                    status, current_query_index, current_query_text, next_page,
+                    scanned, detailed, matched, queued,
+                    skipped_existing, skipped_rejected, skipped_filtered,
+                    skipped_duplicate, failed_details, error_log,
+                    created_at, updated_at, completed_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', 1,
+                       0, 0, 0, 0, 0, 0, 0, 0, 0, '', ?, ?, '')
+                """,
+                (
+                    int(tag_id or 0),
+                    canonical_tag,
+                    normalize_tag_name(canonical_tag),
+                    str(tag_text or '').strip(),
+                    json.dumps(query_terms or [], ensure_ascii=False),
+                    json.dumps(match_terms or [], ensure_ascii=False),
+                    int(max_pages or 10),
+                    int(max_results or 200),
+                    int(max_new_jobs or 50),
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_xhs_backfill_task(self, task_id: int) -> sqlite3.Row | None:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                'SELECT * FROM xhs_backfill_tasks WHERE id = ?',
+                (int(task_id),),
+            ).fetchone()
+
+    def update_xhs_backfill_task(self, task_id: int, **fields: Any) -> None:
+        allowed = {
+            'page_snapshot_json', 'page_item_index', 'page_size',
+            'status',
+            'current_query_index',
+            'current_query_text',
+            'next_page',
+            'scanned',
+            'detailed',
+            'matched',
+            'queued',
+            'skipped_existing',
+            'skipped_rejected',
+            'skipped_filtered',
+            'skipped_duplicate',
+            'failed_details',
+            'error_log',
+            'completed_at',
+        }
+        assignments: list[str] = ['updated_at = ?']
+        params: list[Any] = [utcnow_str()]
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            assignments.append(f'{key} = ?')
+            params.append(value)
+        if len(assignments) == 1:
+            return
+        params.append(int(task_id))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"UPDATE xhs_backfill_tasks SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+
+    def list_xhs_backfill_tasks(
+        self,
+        *,
+        limit: int = 20,
+        statuses: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        sql = 'SELECT * FROM xhs_backfill_tasks'
+        params: list[Any] = []
+        if statuses:
+            status_values = [str(item).strip() for item in statuses if str(item).strip()]
+            if status_values:
+                placeholders = ','.join('?' for _ in status_values)
+                sql += f' WHERE status IN ({placeholders})'
+                params.extend(status_values)
+        sql += ' ORDER BY id DESC LIMIT ?'
+        params.append(max(1, int(limit or 20)))
+        with self._lock, self._connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def get_pending_xhs_backfill_task_ids(self) -> list[int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM xhs_backfill_tasks "
+                "WHERE status IN ('pending', 'retry') ORDER BY id ASC"
+            ).fetchall()
+            return [int(row['id']) for row in rows]
+
+    def has_xhs_backfill_item(self, task_id: int, note_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                'SELECT 1 FROM xhs_backfill_items WHERE task_id=? AND note_id=?',
+                (task_id, note_id),
+            ).fetchone() is not None
+
+    def commit_xhs_backfill_item(
+        self, task_id: int, *, note_id: str, post_url: str, next_index: int,
+        outcome: str, detailed: bool = False, source_context: dict | None = None,
+    ) -> int:
+        """Commit one disposition, its crawl job, counters and page position together."""
+        now = utcnow_str()
+        job_id = 0
+        with self._lock, self._connect() as conn:
+            task = conn.execute('SELECT * FROM xhs_backfill_tasks WHERE id=?', (task_id,)).fetchone()
+            if outcome == 'matched':
+                existing = conn.execute(
+                    'SELECT * FROM crawl_jobs WHERE platform=? AND source_url=? ORDER BY id DESC LIMIT 1',
+                    ('xiaohongshu', post_url),
+                ).fetchone()
+                if existing:
+                    job_id = int(existing['id'])
+                    self._merge_crawl_job_values_conn(
+                        conn, job_id, tags=[task['tag_name']], source_context=source_context,
+                        origin='backfill', priority=50, now=now,
+                    )
+                    outcome = 'skipped_existing'
+                else:
+                    cursor = conn.execute(
+                        """INSERT INTO crawl_jobs(
+                            platform, source_url, source_context_json, tags_text,
+                            origin, priority, status, progress, attempt_count, created_at, updated_at
+                        ) VALUES('xiaohongshu', ?, ?, ?, 'backfill', 50, 'pending', 0, 0, ?, ?)""",
+                        (post_url, self._serialize_source_context(source_context), task['tag_name'], now, now),
+                    )
+                    job_id = int(cursor.lastrowid)
+                    outcome = 'queued'
+            counters = {key: 0 for key in (
+                'queued', 'skipped_existing', 'skipped_rejected', 'skipped_filtered',
+                'skipped_duplicate', 'failed_details',
+            )}
+            counters[outcome] = 1
+            assignments = ', '.join(f'{key}={key}+?' for key in counters)
+            conn.execute(
+                f'UPDATE xhs_backfill_tasks SET {assignments}, scanned=scanned+1, '
+                'detailed=detailed+?, matched=matched+?, page_item_index=?, updated_at=? WHERE id=?',
+                (*counters.values(), int(detailed), int(source_context is not None), next_index, now, task_id),
+            )
+            conn.execute(
+                'INSERT OR IGNORE INTO xhs_backfill_items(task_id,note_id,outcome,crawl_job_id) VALUES(?,?,?,?)',
+                (task_id, note_id, outcome, job_id),
+            )
+        return job_id
+
+    def clear_xhs_backfill_saturation(self, task_id: int, query_term: str) -> None:
+        with self._lock, self._connect() as conn:
+            task = conn.execute('SELECT tag_id,created_at FROM xhs_backfill_tasks WHERE id=?', (task_id,)).fetchone()
+            conn.execute(
+                """UPDATE crawl_subscription_terms
+                SET saturated=0, saturated_at='', saturated_reason='', updated_at=?
+                WHERE normalized_term=? AND saturated_at<=? AND subscription_id IN (
+                    SELECT id FROM crawl_subscriptions WHERE platform='xiaohongshu' AND tag_id=?
+                )""",
+                (utcnow_str(), normalize_tag_name(query_term), task['created_at'], task['tag_id']),
+            )
+
+    def reset_running_xhs_backfill_tasks(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE xhs_backfill_tasks SET status = 'retry', updated_at = ? "
+                "WHERE status = 'running'",
                 (utcnow_str(),),
             )
 
@@ -6792,6 +7036,9 @@ class ImageIndexDB:
         scan_offset: str | None = None,
         scan_high_watermark: str | None = None,
         scan_target_source_uid: str | None = None,
+        saturated: bool | None = None,
+        saturated_at: str | None = None,
+        saturated_reason: str | None = None,
     ) -> None:
         fields = ['updated_at = ?']
         params: list[Any] = [utcnow_str()]
@@ -6816,9 +7063,38 @@ class ImageIndexDB:
         if scan_target_source_uid is not None:
             fields.append('scan_target_source_uid = ?')
             params.append(str(scan_target_source_uid))
+        if saturated is not None:
+            fields.append('saturated = ?')
+            params.append(1 if saturated else 0)
+        if saturated_at is not None:
+            fields.append('saturated_at = ?')
+            params.append(str(saturated_at))
+        if saturated_reason is not None:
+            fields.append('saturated_reason = ?')
+            params.append(str(saturated_reason))
         params.append(int(term_id))
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE crawl_subscription_terms SET {', '.join(fields)} WHERE id = ?", params)
+
+    def list_saturated_crawl_subscription_terms(
+        self,
+        *,
+        platform: str,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT cst.*, cs.tag_id, cs.tag_name
+                FROM crawl_subscription_terms cst
+                JOIN crawl_subscriptions cs ON cs.id = cst.subscription_id
+                WHERE cs.platform = ? AND cs.enabled = 1 AND cst.enabled = 1
+                  AND cst.saturated = 1
+                ORDER BY cst.saturated_at DESC, cst.id ASC
+                LIMIT ?
+                """,
+                (str(platform or '').strip().lower(), max(1, int(limit or 50))),
+            ).fetchall()
 
     def refresh_crawl_subscription_state(self, subscription_id: int) -> None:
         with self._lock, self._connect() as conn:

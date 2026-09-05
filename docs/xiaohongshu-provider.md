@@ -1,5 +1,13 @@
 # 小红书采集提供者契约
 
+## v0.21.0 分页入口
+
+三期增加 `xiaohongshu_cli` 类型的独立 REST provider，使用 `xiaohongshu-cli 0.6.4`。显式设置 provider 类型、地址和 token 后，增量与回填使用同一个实例。构建与部署见 [sidecar 说明](../provider/xhs_cli_sidecar/README.md)。下面 v2.5.0 部署记录属于旧 MCP provider，保留供回滚使用。
+
+分页搜索在原请求上增加 `page`、`page_size`，返回 `data.page`、`data.pageSize` 和 `data.hasMore`。新 provider 传递 `publish_time`，增量为一周内，回填不限。`tagList` 与正文话题合并后用于匹配。旧 MCP 不支持第二页，插件会明确报告。
+
+本期只增加分页与回填业务，不扩展自动重试或 provider 自动切换。回填请求遵守现有暂停状态；失败可用 QQ 命令从保存的页内位置继续。迁移新增 `xhs_backfill_tasks`、`xhs_backfill_items` 和查询词饱和字段。
+
 ## 选型与边界
 
 - 活动提供者固定为 `xpzouying/xiaohongshu-mcp:v2.5.0`，许可证为 Apache-2.0。

@@ -162,6 +162,7 @@ class XhsAutoCrawlService:
                 "skipped_existing": 0,
                 "skipped_rejected": 0,
                 "skipped_filtered": 0,
+                "saturated": 0,
                 "errors": 0,
                 "paused": 0,
             }
@@ -269,6 +270,7 @@ class XhsAutoCrawlService:
                     "skipped_existing",
                     "skipped_rejected",
                     "skipped_filtered",
+                    "saturated",
                     "errors",
                 ):
                     summary[key] += int(result.get(key, 0) or 0)
@@ -376,6 +378,7 @@ class XhsAutoCrawlService:
             "skipped_existing": 0,
             "skipped_rejected": 0,
             "skipped_filtered": 0,
+            "saturated": 0,
             "errors": 0,
         }
         subscription_id = int(row["id"])
@@ -408,12 +411,15 @@ class XhsAutoCrawlService:
             checked_at = utcnow_str()
             budget["queries"] -= 1
             try:
-                hits = await asyncio.to_thread(
-                    self.provider_client.search_notes,
+                search_page = await asyncio.to_thread(
+                    self.provider_client.search_notes_page,
                     query_term,
+                    page=1,
                     max_results=self.max_results_per_term(),
                     timeout_seconds=self.timeout_seconds(),
+                    publish_time="一周内",
                 )
+                hits = search_page.hits
                 result["searched"] += 1
             except XhsProviderError as exc:
                 self.db.update_crawl_subscription_term_state(
@@ -426,12 +432,17 @@ class XhsAutoCrawlService:
 
             last_seen = str(term_row["last_seen_source_uid"] or "").strip()
             pending_hits = []
+            cursor_found = False
             for hit in hits:
                 if last_seen and hit.note_id == last_seen:
+                    cursor_found = True
                     break
                 pending_hits.append(hit)
             if not last_seen:
                 pending_hits = pending_hits[: self.seed_max_notes_per_subscription()]
+            saturated = bool(search_page.has_more and (not last_seen or not cursor_found))
+            if saturated:
+                result["saturated"] += 1
 
             processed_any = False
             for hit in reversed(pending_hits):
@@ -489,7 +500,7 @@ class XhsAutoCrawlService:
                                 source_context={
                                     "note_id": hit.note_id,
                                     "xsec_token": hit.xsec_token,
-                                    "provider": "xiaohongshu_mcp_rest",
+                                    "provider": self.provider_client.source_name(),
                                     "filters_applied": True,
                                     "detail_snapshot": xhs_note_detail_to_snapshot(detail),
                                 },
@@ -516,6 +527,11 @@ class XhsAutoCrawlService:
                     last_checked_at=checked_at,
                     last_success_at=checked_at,
                     last_error="",
+                )
+            if saturated and not int(term_row['saturated'] or 0):
+                self.db.update_crawl_subscription_term_state(
+                    term_id, saturated=True, saturated_at=checked_at,
+                    saturated_reason="首批结果仍有下一页且未命中旧水位，等待历史补扫",
                 )
             self.db.refresh_crawl_subscription_state(subscription_id)
         return result

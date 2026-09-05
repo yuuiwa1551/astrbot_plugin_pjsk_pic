@@ -369,9 +369,14 @@
     "description": "小红书自动采集轮询间隔（分钟），运行时最低按 15 分钟处理。",
     "default": 180
   },
+  "xhs_provider_kind": {
+    "type": "string",
+    "description": "小红书提供者类型：xiaohongshu_mcp 为旧首屏 provider，xiaohongshu_cli 为支持真实分页的 v0.21 sidecar。不会自动切换。",
+    "default": "xiaohongshu_mcp"
+  },
   "xhs_provider_base_url": {
     "type": "string",
-    "description": "隔离运行的 xiaohongshu-mcp REST 地址；推荐使用与 AstrBot 同 Docker 网络的服务名。",
+    "description": "当前选中小红书 REST provider 的地址；三期 sidecar 推荐使用 Docker 私网服务名。",
     "default": "http://pjsk-xhs-provider:18060"
   },
   "xhs_provider_access_token": {
@@ -418,6 +423,16 @@
     "type": "int",
     "description": "小红书订阅首次启用时每个 query 词最多接纳的新笔记数，防止首屏灌入审核队列。",
     "default": 3
+  },
+  "xhs_backfill_page_size": {
+    "type": "int",
+    "description": "小红书历史回填每页请求结果数，默认 20。",
+    "default": 20
+  },
+  "xhs_backfill_page_interval_seconds": {
+    "type": "float",
+    "description": "小红书历史回填完成一页后等待的秒数，让日常增量优先使用 provider。",
+    "default": 30.0
   },
   "xhs_max_images_per_note": {
     "type": "int",
