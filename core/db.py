@@ -4012,6 +4012,7 @@ class ImageIndexDB:
                         image_id, tag_id, source_type, score, review_status,
                         review_reason, created_at, updated_at
                     )
+
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(image_id, tag_id, source_type)
                     DO UPDATE SET
@@ -4061,6 +4062,31 @@ class ImageIndexDB:
                         """,
                         (int(image_id), tag_id, status, model_result, reason, now, now),
                     )
+
+    def commit_chat_collection_image(self, *, image_id: int, image_url: str, author: str,
+                                     raw_tags: list[str], extra_json: dict[str, Any],
+                                     tag_ids: list[int], reason: str = '') -> dict[str, Any]:
+        now = utcnow_str()
+        source_changed = False
+        tags_changed = []
+        with self._lock, self._connect() as conn:
+            if not conn.execute('SELECT 1 FROM sources WHERE image_id = ? AND image_url = ?', (int(image_id), str(image_url))).fetchone():
+                conn.execute('INSERT INTO sources(image_id, platform, post_url, image_url, author, raw_tags, extra_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                             (int(image_id), 'chat', '', str(image_url), str(author or ''), json.dumps(raw_tags, ensure_ascii=False), json.dumps(extra_json, ensure_ascii=False), now))
+                source_changed = True
+            for tag_id in tag_ids:
+                rejected = conn.execute(
+                    "SELECT 1 FROM image_tags WHERE image_id = ? AND tag_id = ? "
+                    "AND review_status IN ('rejected', 'manual_rejected') LIMIT 1",
+                    (int(image_id), int(tag_id)),
+                ).fetchone()
+                if rejected:
+                    continue
+                cursor = conn.execute('INSERT OR IGNORE INTO image_tags(image_id, tag_id, source_type, score, review_status, review_reason, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                                      (int(image_id), int(tag_id), 'chat_auto_collection', 1.0, 'approved', str(reason or '主聊天自动收图'), now, now))
+                if cursor.rowcount:
+                    tags_changed.append(int(tag_id))
+        return {'changed': bool(source_changed or tags_changed), 'source_changed': source_changed, 'tag_ids_changed': tags_changed}
 
     @staticmethod
     def normalize_source_post_url(platform: str, post_url: str) -> str:

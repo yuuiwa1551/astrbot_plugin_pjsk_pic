@@ -59,6 +59,21 @@
     "description": "是否向 LLM 暴露本插件的工具能力。",
     "default": true
   },
+  "chat_image_collection_enabled": {
+    "type": "bool",
+    "description": "是否允许主聊天自动收录群聊图片；仅作用于已进入主聊天的群消息，不会单独触发 LLM。",
+    "default": false
+  },
+  "chat_image_collection_groups": {
+    "type": "string",
+    "description": "允许主聊天自动收图的 QQ 群号，多个群号用英文逗号分隔；留空表示所有群。私聊始终不启用。",
+    "default": ""
+  },
+  "chat_image_collection_attach_originals": {
+    "type": "bool",
+    "description": "上下文只有图片描述但能定位到原图时，是否把原图补入当前多模态请求。",
+    "default": true
+  },
   "ambiguous_candidate_limit": {
     "type": "int",
     "description": "歧义匹配时最多返回多少个候选 tag。",

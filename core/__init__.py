@@ -1,6 +1,7 @@
 from .auto_crawl_service import AutoCrawlService
 from .crawl_adapter import CrawlAdapterFactory
 from .crawl_service import CrawlService
+from .chat_image_collection_service import ChatImageCollectionService
 from .crawl_tag_rules import CrawlTagRules, parse_crawl_rule_text, parse_tag_csv
 from .db import ImageIndexDB
 from .importer import ImportedImageService
@@ -40,6 +41,7 @@ __all__ = [
     "CrawlAdapterFactory",
     "CrawlCandidate",
     "CrawlService",
+    "ChatImageCollectionService",
     "CrawlTagRules",
     "TagCleaner",
     "TagGovernanceService",
