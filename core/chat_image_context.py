@@ -38,7 +38,7 @@ class ChatImageContext:
         self._aliases = {}
         self._failures = OrderedDict()
         self._cache_dir = Path(cache_dir).resolve() if cache_dir else None
-        self._prefetch_tasks: set[asyncio.Task] = set()
+        self._prefetch_by_ref: dict[str, asyncio.Task] = {}
         if self._cache_dir is not None:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +61,7 @@ class ChatImageContext:
         if self._cache_dir is None:
             return
         for item in event.get_extra('pjsk_gallery_image_sources') or []:
-            if item.metadata.get('prefetch_task') is not None:
+            if item.ref in self._prefetch_by_ref:
                 continue
             if item.metadata.get('cache_path') or item.metadata.get('resolved_path'):
                 continue
@@ -70,9 +70,9 @@ class ChatImageContext:
             if self._failure_reason(item.location):
                 continue
             task = asyncio.get_running_loop().create_task(self._prefetch(item))
-            item.metadata['prefetch_task'] = task
-            self._prefetch_tasks.add(task)
-            task.add_done_callback(self._prefetch_tasks.discard)
+            self._prefetch_by_ref[item.ref] = task
+            task.add_done_callback(
+                lambda _, ref=item.ref: self._prefetch_by_ref.pop(ref, None))
 
     def cleanup_cache(self):
         if self._cache_dir is None or not self._cache_dir.is_dir():
@@ -173,7 +173,7 @@ class ChatImageContext:
                 return prepared_locations[location]
             item = item or find(location)
             identity = item.location if item is not None else location
-            task = item.metadata.get('prefetch_task') if item is not None else None
+            task = self._prefetch_by_ref.get(item.ref) if item is not None else None
             if task is not None and not task.done():
                 try:
                     await task

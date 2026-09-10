@@ -417,7 +417,7 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
             item = event.get_extra("pjsk_gallery_image_sources")[0]
 
             ctx.start_prefetch(event)
-            task = item.metadata.get("prefetch_task")
+            task = ctx._prefetch_by_ref.get(item.ref)
             self.assertIsNotNone(task)
             await task
 
@@ -425,6 +425,7 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(cached.exists())
             self.assertEqual(payload, cached.read_bytes())
             self.assertEqual(hashlib.sha256(payload).hexdigest(), item.metadata["content_sha256"])
+            json.dumps(item.metadata)
 
     async def test_import_into_prefers_cache_path_over_resolved_path(self):
         class Importer:
