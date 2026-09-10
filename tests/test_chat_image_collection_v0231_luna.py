@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import importlib
 import json
 import shutil
@@ -240,9 +241,8 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
 
                 found = await ctx.prepare(event, req, attach_originals=True)
 
-                self.assertEqual(1, len(found))
-                self.assertEqual(location, found[0].location)
-                self.assertEqual("historical_unknown", found[0].metadata["source_origin"])
+                # 历史图片只保留在请求里供模型参考，不再作为本轮收图候选。
+                self.assertEqual([], found)
                 image_parts = [
                     part for part in req.contexts[0]["content"]
                     if part.get("type") == "image_url"
@@ -297,8 +297,7 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
         found = await ctx.prepare(event, req, attach_originals=True)
 
         self.assertEqual([current], req.image_urls)
-        self.assertEqual({current, good}, {item.location for item in found})
-        self.assertNotIn(bad, {item.location for item in found})
+        self.assertEqual([current], [item.location for item in found])
         self.assertNotIn(bad, req.prompt)
         context_images = [
             part["image_url"]["url"]
@@ -354,6 +353,125 @@ class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
             isinstance(part, ImageURLPart) and part.image_url.id == captured.ref
             for part in req.extra_user_content_parts
         ))
+
+    async def test_second_round_normalizes_annotations_without_collecting_history(self):
+        event = Event([{"type": "image", "data": {"file": "/original/one.png"}}])
+        ctx = chat_context.ChatImageContext()
+        ctx.capture(event)
+        item = event.get_extra("pjsk_gallery_image_sources")[0]
+
+        first = Request(image_urls=["/original/one.png"], prompt="第一轮")
+        captured = await ctx.prepare(event, first, attach_originals=True)
+        self.assertEqual([item.ref], [x.ref for x in captured])
+        self.assertIn(f"本次请求附图按顺序对应 image_ref：{item.ref}", first.prompt)
+
+        # Framework persists the in-flight request; the next round copies it back as history.
+        second = Request(contexts=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"第一轮\n本次请求附图按顺序对应 image_ref：{item.ref}"},
+                {"type": "text", "text": f"下面这张图片的 image_ref={item.ref}"},
+                {"type": "text", "text": f"上下文图片原图，image_ref={item.ref}"},
+                {"type": "image_url", "image_url": {"url": "/original/one.png"}},
+            ],
+        }])
+
+        found = await ctx.prepare(event, second, attach_originals=True)
+
+        self.assertEqual([], found)
+        content = second.contexts[0]["content"]
+        self.assertEqual(1, len([p for p in content if p.get("type") == "image_url"]))
+        self.assertEqual(["第一轮"], [
+            p["text"] for p in content if p.get("type") == "text"
+        ])
+
+    async def test_failed_history_source_is_not_downloaded_again(self):
+        bad = "https://bad.invalid/history.png"
+        MEDIA_RESOLVER_FAILURES.add(bad)
+        event = Event([])
+        ctx = chat_context.ChatImageContext()
+
+        async def round_request():
+            req = Request(contexts=[{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": bad}}],
+            }])
+            await ctx.prepare(event, req, attach_originals=True)
+
+        await round_request()
+        await round_request()
+
+        self.assertEqual([("to_path", bad, "image")], [
+            call for call in MEDIA_RESOLVER_CALLS if call[1] == bad
+        ])
+
+    async def test_prefetch_caches_local_copy_and_content_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            url = "https://cdn.invalid/current.png"
+            payload = b"cached-image"
+            MEDIA_RESOLVER_PATHS[url] = str(Path(td) / "download.png")
+            Path(MEDIA_RESOLVER_PATHS[url]).write_bytes(payload)
+            event = Event([{"type": "image", "data": {"file": url}}])
+            ctx = chat_context.ChatImageContext(cache_dir=Path(td) / "cache")
+            ctx.capture(event)
+            item = event.get_extra("pjsk_gallery_image_sources")[0]
+
+            ctx.start_prefetch(event)
+            task = item.metadata.get("prefetch_task")
+            self.assertIsNotNone(task)
+            await task
+
+            cached = Path(item.metadata["cache_path"])
+            self.assertTrue(cached.exists())
+            self.assertEqual(payload, cached.read_bytes())
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), item.metadata["content_sha256"])
+
+    async def test_import_into_prefers_cache_path_over_resolved_path(self):
+        class Importer:
+            def __init__(self):
+                self.local_paths = []
+
+            async def import_local_file(self, path: Path, *, platform: str):
+                self.local_paths.append((path, platform))
+                return "local"
+
+        item = message_images.MessageImage(
+            FakeImage(None, url="https://cdn.invalid/original.png"),
+            {"cache_path": "/cache/original.png", "resolved_path": "/resolved/original.png"},
+        )
+        importer = Importer()
+
+        result = await item.import_into(importer)
+
+        self.assertEqual("local", result)
+        self.assertEqual([(Path("/cache/original.png"), "submission")], importer.local_paths)
+
+    async def test_quoted_message_images_keep_original_sender(self):
+        class Bot:
+            async def call_action(self, name, **params):
+                if name != "get_msg":
+                    raise AssertionError(name)
+                return {"data": {
+                    "sender": {"user_id": "u-quoted", "nickname": "原图作者"},
+                    "message": [{"type": "image", "data": {"url": "https://img.invalid/q.png"}}],
+                }}
+
+        url = "https://img.invalid/q.png"
+        MEDIA_RESOLVER_PATHS[url] = "/resolved/quoted.png"
+        MEDIA_RESOLVER_PAYLOADS["/resolved/quoted.png"] = b"quoted-image"
+        event = Event([{"type": "reply", "data": {"id": "123"}}, {"type": "text", "data": {"text": "这张"}}])
+        event.bot = Bot()
+        ctx = chat_context.ChatImageContext()
+
+        found = await ctx.prepare(event, Request(prompt="这张"), attach_originals=False)
+
+        self.assertEqual(1, len(found))
+        quoted = found[0]
+        self.assertEqual(url, quoted.location)
+        self.assertEqual("u-quoted", quoted.metadata["source_sender_id"])
+        self.assertEqual("原图作者", quoted.metadata["source_sender_name"])
+        self.assertEqual("123", quoted.metadata["source_message_id"])
+        self.assertEqual("123", quoted.metadata["reply_message_id"])
 
     async def test_forward_nodes_keep_original_sender_and_position(self):
         class Bot:

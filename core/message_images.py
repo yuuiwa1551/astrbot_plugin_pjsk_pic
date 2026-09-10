@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Mapping
 
+from astrbot.api import logger
 from astrbot.api.message_components import Image
 from .models import CrawlCandidate
 
@@ -24,8 +25,9 @@ class MessageImage:
         return 'g' + hashlib.sha256(value.encode()).hexdigest()[:16]
 
     async def import_into(self, importer):
-        if self.metadata.get('resolved_path'):
-            return await importer.import_local_file(Path(self.metadata['resolved_path']), platform='submission')
+        local_path = self.metadata.get('cache_path') or self.metadata.get('resolved_path')
+        if local_path:
+            return await importer.import_local_file(Path(local_path), platform='submission')
         if self.location.startswith(('https://', 'http://')):
             return await importer.import_candidate(CrawlCandidate(
                 platform='submission', post_url='', image_url=self.location,
@@ -71,6 +73,38 @@ def direct_message_images(event) -> list[MessageImage]:
         image = Image(file=data.get('file', ''), url=data.get('url', '')) if data is not None else component
         result.append(MessageImage(image, {**message_metadata(event), 'image_index': len(result) + 1}))
     return result
+
+
+async def quoted_message_images(event) -> list[MessageImage]:
+    for component in original_chain(event):
+        if component_kind(component) != 'reply':
+            continue
+        if not hasattr(event, 'bot'):
+            return []
+        try:
+            reply_id = str(component['data']['id'] if isinstance(component, dict) else component.id)
+            response = await event.bot.call_action('get_msg', message_id=int(reply_id))
+            payload = response.get('data', response) if isinstance(response, dict) else response
+        except Exception as exc:
+            logger.warning('[PJSKPic] 引用消息获取失败 error=%s', type(exc).__name__)
+            return []
+        sender = payload.get('sender', {}) if isinstance(payload, dict) else {}
+        metadata = {
+            **message_metadata(event),
+            'reply_message_id': reply_id,
+            'source_message_id': reply_id,
+            'source_sender_id': str(sender.get('user_id', '')),
+            'source_sender_name': str(sender.get('nickname', '')),
+        }
+        result = []
+        for node in payload.get('message', []) or []:
+            if component_kind(node) != 'image':
+                continue
+            data = node.get('data', {}) if isinstance(node, dict) else None
+            image = Image(file=data.get('file', ''), url=data.get('url', '')) if data is not None else node
+            result.append(MessageImage(image, {**metadata, 'image_index': len(result) + 1}))
+        return result
+    return []
 
 
 async def collect_submission_images(event) -> ImageCollection:

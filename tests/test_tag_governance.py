@@ -47,9 +47,14 @@ if message_components_module is None:
 class _Image:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self.file = str(self.path)
+        self.url = ""
 
     async def convert_to_file_path(self) -> str:
         return str(self.path)
+
+
+_Image.__name__ = "Image"
 
 
 class _Reply:
@@ -75,8 +80,14 @@ TagIdentityService = importlib.import_module(f"{PACKAGE_NAME}.tag_identity_servi
 
 class _FakeEvent:
     def __init__(self, image_path: Path) -> None:
-        self.message_obj = types.SimpleNamespace(message=[_Image(image_path)], message_id="message-1")
+        message = [_Image(image_path)]
+        self.message_obj = types.SimpleNamespace(
+            message=message, message_id="message-1", raw_message={"message": message},
+        )
         self.unified_msg_origin = "group:1"
+
+    def get_messages(self):
+        return self.message_obj.message
 
     @staticmethod
     def get_sender_id() -> str:

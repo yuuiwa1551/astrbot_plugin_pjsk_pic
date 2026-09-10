@@ -133,7 +133,7 @@ class PJSKPicPlugin(Star):
         self.chat_image_collection_service = ChatImageCollectionService(
             self.db, self.importer, self.data_dir,
         )
-        self.chat_image_context = ChatImageContext()
+        self.chat_image_context = ChatImageContext(cache_dir=self.data_dir / "chat_cache")
         self.tag_governance_service = TagGovernanceService(self.db)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
         self.qq_review_service = QQReviewSessionService(self.db, config)
@@ -185,6 +185,7 @@ class PJSKPicPlugin(Star):
     async def capture_gallery_images(self, event: AstrMessageEvent):
         if self._chat_collection_allowed(event) and str(event.get_sender_id()) != str(event.get_self_id()):
             self.chat_image_context.capture(event)
+            self.chat_image_context.start_prefetch(event)
 
     @event_filter.on_llm_request(priority=-10)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -194,10 +195,17 @@ class PJSKPicPlugin(Star):
             event, req,
             attach_originals=bool(self.config.get("chat_image_collection_attach_originals", True)),
         )
-        if not images:
+        state = event.get_extra("pjsk_chat_collection")
+        if images:
+            if state is None:
+                state = await self.chat_image_collection_service.prepare(images)
+                event.set_extra("pjsk_chat_collection", state)
+            else:
+                for item in images:
+                    if item.location:
+                        state.images.setdefault(item.ref, item)
+        if state is None or not state.images:
             return
-        state = await self.chat_image_collection_service.prepare(images)
-        event.set_extra("pjsk_chat_collection", state)
         # Request-local tools leave the global registry and unrelated chats unchanged.
         req.func_tool = ToolSet(list(req.func_tool.tools) if req.func_tool else [])
         req.func_tool.add_tool(FunctionTool(
@@ -256,6 +264,10 @@ class PJSKPicPlugin(Star):
     async def initialize(self) -> None:
         if self.config.get('chat_image_collection_enabled', False):
             await self.chat_image_collection_service.prepare([])
+            try:
+                await asyncio.to_thread(self.chat_image_context.cleanup_cache)
+            except Exception as exc:
+                logger.warning(f"[PJSKPic] 清理聊天图片缓存失败: {exc}")
         library_root = self._library_root()
         library_root.mkdir(parents=True, exist_ok=True)
         if self.config.get("scan_on_startup", True):
