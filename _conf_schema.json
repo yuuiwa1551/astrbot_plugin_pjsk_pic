@@ -61,12 +61,12 @@
   },
   "chat_image_collection_enabled": {
     "type": "bool",
-    "description": "是否允许主聊天自动收录群聊图片；仅作用于已进入主聊天的群消息，不会单独触发 LLM。",
+    "description": "是否启用群聊收图独立管线：捕获群内图片、独立审核、群内确认后入库；主聊天不参与收图。",
     "default": false
   },
   "chat_image_collection_groups": {
     "type": "string",
-    "description": "允许主聊天自动收图的 QQ 群号，多个群号用英文逗号分隔；留空表示所有群。私聊始终不启用。",
+    "description": "允许收图的 QQ 群号，多个群号用英文逗号分隔；留空表示所有群。私聊始终不启用。",
     "default": ""
   },
   "chat_image_collection_attach_originals": {
@@ -74,6 +74,62 @@
     "description": "上下文只有图片描述但能定位到原图时，是否把原图补入当前多模态请求。",
     "default": true
   },
+  "chat_image_audit_interval_seconds": {
+    "type": "int",
+    "description": "群聊收图审核 worker 的轮询间隔（秒），运行时限制在 15-3600。",
+    "default": 60
+  },
+  "chat_image_audit_max_per_cycle": {
+    "type": "int",
+    "description": "每轮审核最多处理的候选图片数量，范围 1-20。",
+    "default": 3
+  },
+  "chat_image_audit_prompt_version": {
+    "type": "string",
+    "description": "群聊收图审核提示词版本标记，用于区分不同审核口径的记录。",
+    "default": "chat-v1"
+  },
+  "chat_image_confirm_interval_seconds": {
+    "type": "int",
+    "description": "群内确认 worker 的轮询间隔（秒），运行时限制在 15-3600。",
+    "default": 60
+  },
+  "chat_image_confirm_max_per_cycle": {
+    "type": "int",
+    "description": "每轮确认最多发送的批次数，范围 1-20。",
+    "default": 3
+  },
+  "chat_image_confirm_timeout_hours": {
+    "type": "int",
+    "description": "群内确认等待回复的超时时间（小时），超时后候选转入 WebUI 待处理，范围 1-168。",
+    "default": 24
+  },
+  "chat_image_confirm_batch_size": {
+    "type": "int",
+    "description": "单条确认消息最多展示多少张候选图片，范围 1-20。",
+    "default": 10
+  },
+  "chat_image_confirm_receipt_enabled": {
+    "type": "bool",
+    "description": "写库成功后是否在群里发送简短回执。",
+    "default": true
+  },
+  "chat_image_auto_approve_enabled": {
+    "type": "bool",
+    "description": "自动批准开关：开启后审核通过的候选跳过群内确认直接入库，默认关闭。",
+    "default": false
+  },
+  "chat_image_confirm_accept_words": {
+    "type": "string",
+    "description": "确认词，多个词用英文或中文逗号分隔；留空使用默认：确认,对,可以,没问题,收。",
+    "default": ""
+  },
+  "chat_image_confirm_reject_words": {
+    "type": "string",
+    "description": "拒绝词，多个词用英文或中文逗号分隔；留空使用默认：不要,不对,拒绝,不收。",
+    "default": ""
+  },
+
   "ambiguous_candidate_limit": {
     "type": "int",
     "description": "歧义匹配时最多返回多少个候选 tag。",

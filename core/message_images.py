@@ -55,6 +55,47 @@ def component_kind(component) -> str:
     return component.__class__.__name__.lower()
 
 
+def _is_emoji_sub_type(value) -> bool:
+    if value is None:
+        return False
+    try:
+        return int(value) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_emoji_summary(value) -> bool:
+    text = str(value or '').lower()
+    return '表情' in text or 'emoji' in text or 'sticker' in text
+
+
+def is_platform_emoji(component) -> bool:
+    data = {}
+    if isinstance(component, dict):
+        raw_data = component.get('data', {})
+        data = raw_data if isinstance(raw_data, dict) else {}
+    else:
+        try:
+            raw = component.toDict()
+            raw_data = raw.get('data', {}) if isinstance(raw, dict) else {}
+            data = raw_data if isinstance(raw_data, dict) else {}
+        except Exception:
+            data = {}
+    sub_type = data.get('sub_type')
+    if sub_type is None:
+        sub_type = data.get('subType')
+    if sub_type is None and not isinstance(component, dict):
+        sub_type = getattr(component, 'sub_type', None)
+        if sub_type is None:
+            sub_type = getattr(component, 'subType', None)
+    if _is_emoji_sub_type(sub_type):
+        return True
+    image_type = data.get('type') or data.get('imageType') or data.get('image_type')
+    if str(image_type or '').lower() in {'emoji', 'sticker', 'face', 'meme'}:
+        return True
+    return _is_emoji_summary(data.get('summary'))
+
+
 def message_metadata(event) -> dict:
     return {
         'session_id': event.unified_msg_origin,
@@ -71,7 +112,11 @@ def direct_message_images(event) -> list[MessageImage]:
             continue
         data = component.get('data', {}) if isinstance(component, dict) else None
         image = Image(file=data.get('file', ''), url=data.get('url', '')) if data is not None else component
-        result.append(MessageImage(image, {**message_metadata(event), 'image_index': len(result) + 1}))
+        result.append(MessageImage(image, {
+            **message_metadata(event),
+            'image_index': len(result) + 1,
+            'platform_emoji': is_platform_emoji(component),
+        }))
     return result
 
 
@@ -102,7 +147,11 @@ async def quoted_message_images(event) -> list[MessageImage]:
                 continue
             data = node.get('data', {}) if isinstance(node, dict) else None
             image = Image(file=data.get('file', ''), url=data.get('url', '')) if data is not None else node
-            result.append(MessageImage(image, {**metadata, 'image_index': len(result) + 1}))
+            result.append(MessageImage(image, {
+                **metadata,
+                'image_index': len(result) + 1,
+                'platform_emoji': is_platform_emoji(node),
+            }))
         return result
     return []
 

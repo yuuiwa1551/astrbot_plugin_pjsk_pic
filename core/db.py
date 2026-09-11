@@ -388,6 +388,43 @@ class ImageIndexDB:
                     FOREIGN KEY(image_id) REFERENCES images(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS chat_image_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ref TEXT NOT NULL UNIQUE,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    group_id TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL DEFAULT '',
+                    sender_id TEXT NOT NULL DEFAULT '',
+                    sender_name TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL DEFAULT '',
+                    image_index INTEGER NOT NULL DEFAULT 0,
+                    image_url TEXT NOT NULL DEFAULT '',
+                    file_path TEXT NOT NULL DEFAULT '',
+                    content_sha256 TEXT NOT NULL DEFAULT '',
+                    dedupe_of INTEGER NOT NULL DEFAULT 0,
+                    image_id INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'captured',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    occurrences_json TEXT NOT NULL DEFAULT '[]',
+                    audit_provider TEXT NOT NULL DEFAULT '',
+                    audit_prompt_version TEXT NOT NULL DEFAULT '',
+                    audit_decision TEXT NOT NULL DEFAULT '',
+                    audit_quality_json TEXT NOT NULL DEFAULT '{}',
+                    audit_flags_json TEXT NOT NULL DEFAULT '[]',
+                    audit_reason TEXT NOT NULL DEFAULT '',
+                    proposed_tag_ids_json TEXT NOT NULL DEFAULT '[]',
+                    confirmed_tag_ids_json TEXT NOT NULL DEFAULT '[]',
+                    confirm_message_id TEXT NOT NULL DEFAULT '',
+                    confirm_user_id TEXT NOT NULL DEFAULT '',
+                    error_log TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    audited_at TEXT NOT NULL DEFAULT '',
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    confirmed_at TEXT NOT NULL DEFAULT '',
+                    wrote_at TEXT NOT NULL DEFAULT ''
+                );
+
                 CREATE TABLE IF NOT EXISTS rejected_sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     platform TEXT NOT NULL,
@@ -457,6 +494,10 @@ class ImageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_llm_image_review_runs_status ON llm_image_review_runs(status, id);
                 CREATE INDEX IF NOT EXISTS idx_llm_image_review_runs_image ON llm_image_review_runs(image_id, id);
                 CREATE INDEX IF NOT EXISTS idx_llm_image_review_runs_created ON llm_image_review_runs(created_at, status);
+                CREATE INDEX IF NOT EXISTS idx_chat_image_candidates_status ON chat_image_candidates(status, id);
+                CREATE INDEX IF NOT EXISTS idx_chat_image_candidates_sha ON chat_image_candidates(content_sha256, status);
+                CREATE INDEX IF NOT EXISTS idx_chat_image_candidates_confirm ON chat_image_candidates(confirm_message_id, status);
+                CREATE INDEX IF NOT EXISTS idx_chat_image_candidates_session ON chat_image_candidates(session_id, sender_id, status, id);
                 CREATE INDEX IF NOT EXISTS idx_send_logs_session_id ON send_logs(session_id);
                 CREATE INDEX IF NOT EXISTS idx_platform_tag_terms_tag_id ON platform_tag_terms(tag_id, platform);
                 CREATE INDEX IF NOT EXISTS idx_rejected_sources_platform ON rejected_sources(platform, normalized_post_url);
@@ -953,6 +994,20 @@ class ImageIndexDB:
     def get_image_row(self, image_id: int) -> sqlite3.Row | None:
         with self._lock, self._connect() as conn:
             return conn.execute("SELECT * FROM images WHERE id = ? LIMIT 1", (image_id,)).fetchone()
+
+    def has_approved_character_tags(self, image_id: int) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM image_tags it
+                JOIN tags t ON t.id = it.tag_id
+                WHERE it.image_id = ? AND it.review_status IN ('approved', 'manual_approved')
+                  AND t.is_character = 1 AND t.status = 'active'
+                LIMIT 1
+                """,
+                (int(image_id),),
+            ).fetchone()
+        return row is not None
 
     def attach_image_variant(
         self,
@@ -4119,6 +4174,471 @@ class ImageIndexDB:
         return {'changed': bool(accepted and (source_changed or changed)),
                 'source_changed': source_changed, 'tag_ids_changed': changed,
                 'tag_ids_accepted': accepted, 'tag_ids_skipped': [x for x in tag_ids if x not in accepted]}
+
+    @staticmethod
+    def _chat_candidate_row(row: sqlite3.Row | dict | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        defaults: dict[str, Any] = {
+            'occurrences_json': [],
+            'audit_quality_json': {},
+            'audit_flags_json': [],
+            'proposed_tag_ids_json': [],
+            'confirmed_tag_ids_json': [],
+        }
+        for key, default in defaults.items():
+            try:
+                item[key] = json.loads(str(item.get(key) or 'null'))
+            except json.JSONDecodeError:
+                item[key] = default
+        return item
+
+    def create_chat_image_candidate(self, *, ref: str, session_id: str, group_id: str = '',
+                                    platform: str = '', sender_id: str = '', sender_name: str = '',
+                                    source_message_id: str = '', image_index: int = 0,
+                                    image_url: str = '', file_path: str = '',
+                                    content_sha256: str = '') -> dict[str, Any]:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO chat_image_candidates(
+                    ref, session_id, group_id, platform, sender_id, sender_name,
+                    source_message_id, image_index, image_url, file_path, content_sha256,
+                    status, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?, ?)
+                """,
+                (str(ref), str(session_id), str(group_id), str(platform), str(sender_id),
+                 str(sender_name), str(source_message_id), int(image_index or 0),
+                 str(image_url), str(file_path), str(content_sha256), now, now),
+            )
+            row = conn.execute(
+                'SELECT * FROM chat_image_candidates WHERE ref = ? LIMIT 1', (str(ref),)
+            ).fetchone()
+        return self._chat_candidate_row(row) or {}
+
+    @staticmethod
+    def _backfill_chat_candidate_context(conn: sqlite3.Connection, image_id: int) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            'session_id': '', 'group_id': '', 'platform': '', 'sender_id': '',
+            'sender_name': '', 'source_message_id': '', 'image_index': 0, 'image_url': '',
+        }
+        rows = conn.execute(
+            "SELECT post_url, author, extra_json FROM sources "
+            "WHERE image_id = ? AND platform = 'chat' ORDER BY id",
+            (int(image_id),),
+        ).fetchall()
+        for row in rows:
+            try:
+                extra = json.loads(str(row['extra_json'] or '{}'))
+            except json.JSONDecodeError:
+                extra = {}
+            if not isinstance(extra, dict) or str(extra.get('source_kind') or '') != 'chat_auto_collection':
+                continue
+            session_id = str(extra.get('session_id') or '')
+            parts = session_id.split(':')
+            context.update({
+                'session_id': session_id,
+                'group_id': parts[-1] if len(parts) >= 3 else '',
+                'platform': parts[0] if parts else '',
+                'sender_id': str(extra.get('source_sender_id') or ''),
+                'sender_name': str(extra.get('source_sender_name') or row['author'] or ''),
+                'source_message_id': str(extra.get('source_message_id') or ''),
+                'image_index': int(extra.get('image_index') or 0),
+                'image_url': str(row['post_url'] or ''),
+            })
+            break
+        return context
+
+    def backfill_pending_webui_chat_candidates(self) -> dict[str, int]:
+        """把已入库的 chat_auto_collection 历史图补进 WebUI 群聊候选待审列表。"""
+        now = utcnow_str()
+        inserted = 0
+        skipped = 0
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT it.image_id AS image_id, it.tag_id AS tag_id,
+                       i.file_path AS file_path, i.sha256 AS sha256
+                FROM image_tags it
+                JOIN images i ON i.id = it.image_id
+                WHERE it.source_type = 'chat_auto_collection'
+                  AND it.review_status = 'approved'
+                  AND i.is_active = 1
+                ORDER BY it.image_id, it.tag_id
+                """
+            ).fetchall()
+            tag_ids_by_image: dict[int, list[int]] = {}
+            image_info: dict[int, tuple[str, str]] = {}
+            for row in rows:
+                image_id = int(row['image_id'])
+                tag_ids_by_image.setdefault(image_id, []).append(int(row['tag_id']))
+                image_info[image_id] = (str(row['file_path'] or ''), str(row['sha256'] or ''))
+            for image_id, tag_ids in tag_ids_by_image.items():
+                ref = f'backfill:chat_auto:{image_id}'
+                if not image_info[image_id][0]:
+                    skipped += 1
+                    continue
+                candidate_context = self._backfill_chat_candidate_context(conn, image_id)
+                file_path, sha256 = image_info[image_id]
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO chat_image_candidates(
+                        ref, session_id, group_id, platform, sender_id, sender_name,
+                        source_message_id, image_index, image_url, file_path, content_sha256,
+                        image_id, status, audit_provider, audit_decision, audit_reason,
+                        proposed_tag_ids_json, confirmed_tag_ids_json, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             'pending_webui', 'backfill', 'manual_review', ?,
+                             ?, '[]', ?, ?)
+                    """,
+                    (
+                        ref,
+                        candidate_context['session_id'],
+                        candidate_context['group_id'],
+                        candidate_context['platform'],
+                        candidate_context['sender_id'],
+                        candidate_context['sender_name'],
+                        candidate_context['source_message_id'],
+                        candidate_context['image_index'],
+                        candidate_context['image_url'],
+                        file_path,
+                        sha256,
+                        image_id,
+                        '历史群聊自动收图，待人工复核',
+                        json.dumps(tag_ids, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                if cursor.rowcount:
+                    inserted += 1
+                else:
+                    skipped += 1
+        return {'inserted': inserted, 'skipped': skipped}
+
+    def get_chat_image_candidate(self, candidate_id: int) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM chat_image_candidates WHERE id = ? LIMIT 1', (int(candidate_id),)
+            ).fetchone()
+        return self._chat_candidate_row(row)
+
+    def get_chat_image_candidate_by_ref(self, ref: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM chat_image_candidates WHERE ref = ? LIMIT 1', (str(ref),)
+            ).fetchone()
+        return self._chat_candidate_row(row)
+
+    def update_chat_image_candidate_local(self, candidate_id: int, *, file_path: str,
+                                          content_sha256: str = '') -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                'UPDATE chat_image_candidates SET file_path = ?, content_sha256 = ?, updated_at = ? '
+                'WHERE id = ?',
+                (str(file_path), str(content_sha256), utcnow_str(), int(candidate_id)),
+            )
+
+    def mark_chat_image_candidate_download_failed(self, candidate_id: int, error: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_image_candidates SET status = 'download_failed', error_log = ?, updated_at = ? "
+                'WHERE id = ?',
+                (str(error)[:1000], utcnow_str(), int(candidate_id)),
+            )
+
+    def find_chat_image_candidate_by_sha(self, sha256: str, *, exclude_id: int = 0) -> dict[str, Any] | None:
+        sha = str(sha256 or '').strip()
+        if not sha:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_image_candidates WHERE content_sha256 = ? AND id != ? "
+                "AND status NOT IN ('duplicate', 'download_failed') ORDER BY id DESC LIMIT 1",
+                (sha, int(exclude_id)),
+            ).fetchone()
+        return self._chat_candidate_row(row)
+
+    def attach_chat_image_candidate_occurrence(self, candidate_id: int, occurrence: dict[str, Any]) -> None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                'SELECT occurrences_json FROM chat_image_candidates WHERE id = ? LIMIT 1',
+                (int(candidate_id),),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                items = json.loads(str(row['occurrences_json'] or '[]'))
+            except json.JSONDecodeError:
+                items = []
+            if not isinstance(items, list):
+                items = []
+            items.append(dict(occurrence))
+            conn.execute(
+                'UPDATE chat_image_candidates SET occurrences_json = ?, updated_at = ? WHERE id = ?',
+                (json.dumps(items[-50:], ensure_ascii=False), utcnow_str(), int(candidate_id)),
+            )
+
+    def mark_chat_image_candidate_duplicate(self, candidate_id: int, *, duplicate_of: int,
+                                            reason: str = '内容重复') -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_image_candidates SET status = 'duplicate', dedupe_of = ?, error_log = ?, "
+                'updated_at = ? WHERE id = ?',
+                (int(duplicate_of), str(reason)[:500], utcnow_str(), int(candidate_id)),
+            )
+
+    def reset_running_chat_image_candidates(self) -> int:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE chat_image_candidates SET status = 'captured', updated_at = ? "
+                "WHERE status = 'auditing'",
+                (utcnow_str(),),
+            )
+            return int(cursor.rowcount or 0)
+
+    def claim_next_chat_image_candidate(self) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_image_candidates WHERE status = 'captured' AND file_path != '' "
+                'ORDER BY id LIMIT 1'
+            ).fetchone()
+            if row is None:
+                return None
+            now = utcnow_str()
+            conn.execute(
+                "UPDATE chat_image_candidates SET status = 'auditing', updated_at = ? WHERE id = ?",
+                (now, int(row['id'])),
+            )
+            claimed = dict(row)
+        claimed['status'] = 'auditing'
+        return self._chat_candidate_row(claimed)
+
+    def complete_chat_image_candidate_audit(self, candidate_id: int, *, status: str, decision: str,
+                                            provider: str, prompt_version: str,
+                                            quality: dict[str, Any], flags: list[str],
+                                            reason: str, proposed_tag_ids: list[int]) -> None:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE chat_image_candidates SET
+                    status = ?, audit_decision = ?, audit_provider = ?, audit_prompt_version = ?,
+                    audit_quality_json = ?, audit_flags_json = ?, audit_reason = ?,
+                    proposed_tag_ids_json = ?, audited_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (str(status), str(decision), str(provider), str(prompt_version),
+                 json.dumps(quality or {}, ensure_ascii=False),
+                 json.dumps(list(flags or []), ensure_ascii=False),
+                 str(reason or '')[:1000], json.dumps([int(x) for x in proposed_tag_ids], ensure_ascii=False),
+                 now, now, int(candidate_id)),
+            )
+
+    def fail_chat_image_candidate_audit(self, candidate_id: int, *, error: str,
+                                        max_attempts: int = 3) -> str:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                'SELECT attempt_count, error_log FROM chat_image_candidates WHERE id = ? LIMIT 1',
+                (int(candidate_id),),
+            ).fetchone()
+            if row is None:
+                return 'audit_error'
+            attempt_count = int(row['attempt_count'] or 0) + 1
+            status = 'audit_error' if attempt_count >= max(1, int(max_attempts)) else 'captured'
+            history = str(row['error_log'] or '')
+            entry = f"{utcnow_str()} {str(error)[:500]}"
+            history = (history + '\n' + entry)[-2000:].strip()
+            conn.execute(
+                'UPDATE chat_image_candidates SET status = ?, attempt_count = ?, error_log = ?, '
+                'updated_at = ? WHERE id = ?',
+                (status, attempt_count, history, utcnow_str(), int(candidate_id)),
+            )
+        return status
+
+    def retry_chat_image_candidate_audit(self, candidate_id: int) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE chat_image_candidates SET status = 'captured', updated_at = ? "
+                "WHERE id = ? AND status = 'audit_error'",
+                (utcnow_str(), int(candidate_id)),
+            )
+            return bool(cursor.rowcount)
+
+    def list_chat_image_candidates_for_notify(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM chat_image_candidates WHERE status = 'audited' AND audit_decision = 'approve' "
+                'ORDER BY id LIMIT ?',
+                (int(limit),),
+            ).fetchall()
+        return [self._chat_candidate_row(row) for row in rows]
+
+    def mark_chat_image_candidates_asked(self, candidate_ids: list[int], *, confirm_message_id: str,
+                                         expires_at: str) -> int:
+        ids = [int(x) for x in candidate_ids]
+        if not ids:
+            return 0
+        now = utcnow_str()
+        placeholders = ','.join('?' for _ in ids)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE chat_image_candidates SET status = 'asked', confirm_message_id = ?, "
+                f'expires_at = ?, updated_at = ? WHERE status = \'audited\' AND id IN ({placeholders})',
+                (str(confirm_message_id), str(expires_at), now, *ids),
+            )
+            return int(cursor.rowcount or 0)
+
+    def mark_chat_image_candidates_pending_webui(self, candidate_ids: list[int], *, error: str = '') -> int:
+        ids = [int(x) for x in candidate_ids]
+        if not ids:
+            return 0
+        placeholders = ','.join('?' for _ in ids)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE chat_image_candidates SET status = 'pending_webui', error_log = ?, updated_at = ? "
+                f"WHERE id IN ({placeholders})",
+                (str(error)[:1000], utcnow_str(), *ids),
+            )
+            return int(cursor.rowcount or 0)
+
+    def find_chat_image_candidates_by_confirm(self, confirm_message_id: str, *,
+                                              sender_id: str = '') -> list[dict[str, Any]]:
+        sql = ("SELECT * FROM chat_image_candidates WHERE confirm_message_id = ? AND status = 'asked' "
+               "AND (expires_at = '' OR expires_at >= ?)")
+        params: list[Any] = [str(confirm_message_id), utcnow_str()]
+        if sender_id:
+            sql += ' AND sender_id = ?'
+            params.append(str(sender_id))
+        sql += ' ORDER BY id'
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._chat_candidate_row(row) for row in rows]
+
+    def find_latest_asked_chat_image_candidates(self, session_id: str, sender_id: str) -> list[dict[str, Any]]:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            latest = conn.execute(
+                "SELECT confirm_message_id FROM chat_image_candidates "
+                "WHERE session_id = ? AND sender_id = ? AND status = 'asked' "
+                "AND (expires_at = '' OR expires_at >= ?) "
+                'ORDER BY id DESC LIMIT 1',
+                (str(session_id), str(sender_id), now),
+            ).fetchone()
+            if latest is None:
+                return []
+            confirm_message_id = str(latest['confirm_message_id'] or '')
+            rows = conn.execute(
+                "SELECT * FROM chat_image_candidates WHERE session_id = ? AND sender_id = ? "
+                "AND status = 'asked' AND confirm_message_id = ? "
+                "AND (expires_at = '' OR expires_at >= ?) ORDER BY id",
+                (str(session_id), str(sender_id), confirm_message_id, now),
+            ).fetchall()
+        return [self._chat_candidate_row(row) for row in rows]
+
+    def expire_asked_chat_image_candidates(self, now: str) -> int:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE chat_image_candidates SET status = 'pending_webui', updated_at = ? "
+                "WHERE status = 'asked' AND expires_at != '' AND expires_at < ?",
+                (utcnow_str(), str(now)),
+            )
+            return int(cursor.rowcount or 0)
+
+    def mark_chat_image_candidates_confirmed(self, candidate_ids: list[int], *, user_id: str,
+                                             statuses: Iterable[str] = ('asked',)) -> int:
+        ids = [int(x) for x in candidate_ids]
+        if not ids:
+            return 0
+        wanted = [str(x) for x in statuses if str(x)]
+        if not wanted:
+            return 0
+        placeholders = ','.join('?' for _ in ids)
+        status_placeholders = ','.join('?' for _ in wanted)
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE chat_image_candidates SET status = 'confirmed', confirm_user_id = ?, "
+                f"confirmed_at = ?, updated_at = ? WHERE status IN ({status_placeholders}) "
+                f"AND id IN ({placeholders})",
+                (str(user_id), now, now, *wanted, *ids),
+            )
+            return int(cursor.rowcount or 0)
+
+    def mark_chat_image_candidate_corrected(self, candidate_id: int, *, corrected_tag_ids: list[int],
+                                            user_id: str) -> bool:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE chat_image_candidates SET status = 'corrected', confirmed_tag_ids_json = ?, "
+                "confirm_user_id = ?, confirmed_at = ?, updated_at = ? WHERE id = ? AND status = 'asked'",
+                (json.dumps([int(x) for x in corrected_tag_ids], ensure_ascii=False), str(user_id),
+                 now, now, int(candidate_id)),
+            )
+            return bool(cursor.rowcount)
+
+    def mark_chat_image_candidates_rejected(self, candidate_ids: list[int], *, user_id: str,
+                                            statuses: Iterable[str] = ('asked',)) -> int:
+        ids = [int(x) for x in candidate_ids]
+        if not ids:
+            return 0
+        wanted = [str(x) for x in statuses if str(x)]
+        if not wanted:
+            return 0
+        placeholders = ','.join('?' for _ in ids)
+        status_placeholders = ','.join('?' for _ in wanted)
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE chat_image_candidates SET status = 'rejected', confirm_user_id = ?, "
+                f"confirmed_at = ?, updated_at = ? WHERE status IN ({status_placeholders}) "
+                f"AND id IN ({placeholders})",
+                (str(user_id), now, now, *wanted, *ids),
+            )
+            return int(cursor.rowcount or 0)
+
+    def mark_chat_image_candidate_written(self, candidate_id: int, *, image_id: int,
+                                          tag_ids: list[int]) -> None:
+        now = utcnow_str()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_image_candidates SET status = 'approved_written', image_id = ?, "
+                "confirmed_tag_ids_json = ?, wrote_at = ?, updated_at = ? WHERE id = ?",
+                (int(image_id), json.dumps([int(x) for x in tag_ids], ensure_ascii=False),
+                 now, now, int(candidate_id)),
+            )
+
+    def mark_chat_image_candidate_write_failed(self, candidate_id: int, *, error: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_image_candidates SET status = 'write_failed', error_log = ?, updated_at = ? "
+                'WHERE id = ?',
+                (str(error)[:1000], utcnow_str(), int(candidate_id)),
+            )
+
+    def list_chat_image_candidates(self, *, statuses: Iterable[str] | None = None,
+                                   limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        wanted = [str(x) for x in (statuses or []) if str(x)]
+        sql = 'SELECT * FROM chat_image_candidates'
+        params: list[Any] = []
+        if wanted:
+            placeholders = ','.join('?' for _ in wanted)
+            sql += f' WHERE status IN ({placeholders})'
+            params.extend(wanted)
+        sql += ' ORDER BY id DESC LIMIT ? OFFSET ?'
+        params.extend([int(limit), int(offset)])
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._chat_candidate_row(row) for row in rows]
+
+    def get_chat_image_candidate_stats(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                'SELECT status, COUNT(*) AS c FROM chat_image_candidates GROUP BY status'
+            ).fetchall()
+        return {str(row['status']): int(row['c']) for row in rows}
 
     @staticmethod
     def normalize_source_post_url(platform: str, post_url: str) -> str:

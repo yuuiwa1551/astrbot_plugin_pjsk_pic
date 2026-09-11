@@ -160,6 +160,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="active" data-page-button="overview" onclick="showPage('overview')">概览</button>
     <button data-page-button="gallery" onclick="showPage('gallery')">图片检索</button>
     <button data-page-button="reviews" onclick="showPage('reviews')">审核任务</button>
+    <button data-page-button="chat-candidates" onclick="showPage('chat-candidates')">群聊候选</button>
     <button data-page-button="jobs" onclick="showPage('jobs')">采集任务</button>
     <button data-page-button="tags" onclick="showPage('tags')">tag 管理</button>
     <button data-page-button="pixiv-review" onclick="showPage('pixiv-review')">Pixiv 审批</button>
@@ -209,6 +210,15 @@ HTML_PAGE = """<!DOCTYPE html>
         <button onclick="loadReviews()">刷新审核</button>
       </div>
       <div class="list" id="reviews"></div>
+    </section>
+    <section class="page-section" data-page="chat-candidates">
+      <h2>群聊候选</h2>
+      <div class="muted">群聊收图中确认超时或自动驳回的图片会出现在这里，可在此入库或忽略。</div>
+      <div class="row">
+        <button onclick="loadChatCandidates()">刷新候选</button>
+        <span class="muted" id="chatCandidateStats"></span>
+      </div>
+      <div class="grid" id="chatCandidates"></div>
     </section>
     <section class="page-section" data-page="tags">
       <h2>tag 管理</h2>
@@ -454,6 +464,7 @@ const pageLoaders = {
   overview: [loadSummary],
   gallery: [loadImages],
   reviews: [loadReviews],
+  'chat-candidates': [loadChatCandidates],
   jobs: [loadJobs],
   tags: [loadTags],
   'pixiv-review': [loadPixivReviewImages],
@@ -709,6 +720,47 @@ async function reviewDecision(reviewId, approved) {
   const result = await fetchJson('/api/reviews/decision', {method: 'POST', body: JSON.stringify({review_id: reviewId, approved})});
   await refreshAfterReviewMutation({toastMessage: result.message || '审核任务已更新'});
   if (imagePreviewState.imageId) await refreshImagePreview();
+}
+
+async function loadChatCandidates() {
+  const data = await fetchJson('/api/chat-candidates?limit=50');
+  const stats = data.stats || {};
+  const statsEl = document.getElementById('chatCandidateStats');
+  if (statsEl) {
+    statsEl.textContent = `待处理 ${stats.pending_webui || 0} 张 · 已入库 ${stats.approved_written || 0} 张 · 已忽略 ${stats.rejected || 0} 张`;
+  }
+  document.getElementById('chatCandidates').innerHTML = (data.items || []).map(item => {
+    const candidateId = Number(item.id || 0);
+    const tags = (item.tags || []).map(tag => `<span class="pill">${escapeHtml(tag.name || '')}</span>`).join(' ');
+    const flags = (item.audit_flags || []).map(escapeHtml).join('、');
+    const thumb = item.has_file
+      ? `<div class="card-thumb-wrap"><img src="${api(`/api/chat-candidate-file?candidate_id=${candidateId}`)}" loading="lazy" /></div>`
+      : '';
+    return `
+      <div class="card">
+        ${thumb}
+        <div class="body">
+          <div><strong>#${candidateId}</strong> <span class="pill">${escapeHtml(item.status || '')}</span> ${escapeHtml(item.audit_decision || '')}</div>
+          <div class="muted">群 ${escapeHtml(item.group_id || '-')} · ${escapeHtml(item.sender_name || item.sender_id || '-')} · ${escapeHtml(item.created_at || '')}</div>
+          <div class="muted">${escapeHtml(item.audit_reason || '')}</div>
+          <div class="muted">flags: ${flags || '无'}</div>
+          <div>${tags || '<span class="muted">无候选标签</span>'}</div>
+          <div class="row">
+            <button onclick="chatCandidateDecision(${candidateId}, 'approve')">入库</button>
+            <button class="secondary" onclick="chatCandidateDecision(${candidateId}, 'reject')">忽略</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('') || '<div class="muted">暂无群聊候选</div>';
+}
+
+async function chatCandidateDecision(candidateId, decision) {
+  const result = await fetchJson('/api/chat-candidates/decision', {method: 'POST', body: JSON.stringify({ids: [candidateId], decision})});
+  showToast(result.message || '群聊候选已更新');
+  markPagesDirty(['chat-candidates', 'overview', 'gallery', 'reviews']);
+  await loadChatCandidates();
+  loadSummary().catch(err => console.error(err));
 }
 
 async function loadTags() {
@@ -1841,6 +1893,7 @@ class GalleryWebUI:
         pixiv_client: PixivAppClient | None = None,
         context=None,
         config=None,
+        chat_image_service=None,
     ) -> None:
         self.db = db
         self.crawl_service = crawl_service
@@ -1853,6 +1906,7 @@ class GalleryWebUI:
         self.context = context
         self.config = config if config is not None else getattr(crawl_service, "config", {})
         self.pixiv_client = pixiv_client or PixivAppClient(self.config)
+        self.chat_image_service = chat_image_service
         self.host = "0.0.0.0"
         self.port = 9099
         self.access_token = ""
@@ -1891,6 +1945,9 @@ class GalleryWebUI:
                 web.post("/api/jobs/pixiv-backfill/retry", self.api_jobs_pixiv_backfill_retry),
                 web.post("/api/jobs/retry", self.api_jobs_retry),
                 web.get("/api/reviews", self.api_reviews),
+                web.get("/api/chat-candidates", self.api_chat_candidates),
+                web.get("/api/chat-candidate-file", self.api_chat_candidate_file),
+                web.post("/api/chat-candidates/decision", self.api_chat_candidate_decision),
                 web.get("/api/pixiv-review-images", self.api_pixiv_review_images),
                 web.get("/api/pixiv-review-image", self.api_pixiv_review_image),
                 web.post("/api/pixiv-review/submit", self.api_pixiv_review_submit),
@@ -2672,6 +2729,102 @@ class GalleryWebUI:
             limit=min(max(int(args.get("limit", 20) or 20), 1), 100),
         )
         return self._json_response({"items": [dict(row) for row in rows]})
+
+    def _build_chat_candidate_item(self, row: dict[str, Any]) -> dict[str, Any]:
+        tag_ids: list[int] = []
+        for value in row.get("proposed_tag_ids_json") or []:
+            try:
+                tag_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if tag_id > 0:
+                tag_ids.append(tag_id)
+        tags: list[dict[str, Any]] = []
+        for tag_id in tag_ids:
+            tag_row = self.db.get_tag_row_by_id(tag_id)
+            if tag_row is None:
+                continue
+            tags.append({
+                "id": tag_id,
+                "name": str(tag_row["name"] or ""),
+                "tag_type": str(tag_row["tag_type"] or ""),
+            })
+        return {
+            "id": int(row["id"]),
+            "status": str(row.get("status") or ""),
+            "group_id": str(row.get("group_id") or ""),
+            "sender_id": str(row.get("sender_id") or ""),
+            "sender_name": str(row.get("sender_name") or ""),
+            "image_url": str(row.get("image_url") or ""),
+            "source_message_id": str(row.get("source_message_id") or ""),
+            "audit_decision": str(row.get("audit_decision") or ""),
+            "audit_reason": str(row.get("audit_reason") or ""),
+            "audit_flags": row.get("audit_flags_json") or [],
+            "created_at": str(row.get("created_at") or ""),
+            "has_file": bool(str(row.get("file_path") or "")),
+            "tags": tags,
+        }
+
+    async def api_chat_candidates(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        args = request.query
+        limit, offset = _pagination_from_query(args, default_limit=30, max_limit=100)
+        rows = self.db.list_chat_image_candidates(
+            statuses=["pending_webui"],
+            limit=limit,
+            offset=offset,
+        )
+        stats = self.db.get_chat_image_candidate_stats()
+        total = int(stats.get("pending_webui", 0) or 0)
+        return self._json_response({
+            "items": [self._build_chat_candidate_item(row) for row in rows],
+            "stats": stats,
+            **_pagination_payload(total, limit, offset),
+        })
+
+    async def api_chat_candidate_file(self, request: web.Request) -> web.StreamResponse:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        candidate_id = int(request.query.get("candidate_id", request.query.get("id", 0)) or 0)
+        row = self.db.get_chat_image_candidate(candidate_id)
+        if not row:
+            return self._json_response({"error": "candidate_not_found"}, status=404)
+        path = Path(str(row.get("file_path") or ""))
+        if not path.is_file():
+            return self._json_response({"error": "file_not_found"}, status=404)
+        return web.FileResponse(path, headers=dict(IMAGE_FILE_CACHE_HEADERS))
+
+    async def api_chat_candidate_decision(self, request: web.Request) -> web.Response:
+        denied = self._check_access(request)
+        if denied is not None:
+            return denied
+        service = self.chat_image_service
+        if service is None:
+            return self._json_response({"ok": False, "message": "群聊收图服务未启用。"}, status=400)
+        data = await self._json_body(request)
+        decision = str(data.get("decision", "") or "").strip().lower()
+        if decision not in {"approve", "reject"}:
+            return self._json_response({"ok": False, "message": "decision 必须是 approve 或 reject。"}, status=400)
+        ids: list[int] = []
+        for value in data.get("ids", []) or []:
+            try:
+                candidate_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if candidate_id > 0:
+                ids.append(candidate_id)
+        if not ids:
+            return self._json_response({"ok": False, "message": "缺少候选 ID。"}, status=400)
+        if decision == "approve":
+            result = await service.approve_candidates(ids, user_id="webui")
+            message = f"已入库 {int(result.get('approved', 0))} 张，失败 {int(result.get('failed', 0))} 张。"
+        else:
+            rejected = service.reject_candidates(ids, user_id="webui")
+            message = f"已忽略 {int(rejected)} 张候选。"
+        return self._json_response({"ok": True, "message": message})
 
     async def api_pixiv_review_images(self, request: web.Request) -> web.Response:
         denied = self._check_access(request)

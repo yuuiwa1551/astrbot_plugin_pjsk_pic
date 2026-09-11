@@ -58,10 +58,15 @@ class ChatImageContext:
         ))
 
     def start_prefetch(self, event):
+        self.start_prefetch_items(event.get_extra('pjsk_gallery_image_sources') or [])
+
+    def start_prefetch_items(self, items):
         if self._cache_dir is None:
             return
-        for item in event.get_extra('pjsk_gallery_image_sources') or []:
+        for item in items:
             if item.ref in self._prefetch_by_ref:
+                continue
+            if item.metadata.get('platform_emoji'):
                 continue
             if item.metadata.get('cache_path') or item.metadata.get('resolved_path'):
                 continue

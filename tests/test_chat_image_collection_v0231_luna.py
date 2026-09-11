@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import importlib
@@ -129,7 +128,6 @@ message_images = importlib.import_module(f"{PACKAGE}.message_images")
 chat_context = importlib.import_module(f"{PACKAGE}.chat_image_context")
 collection_module = importlib.import_module(f"{PACKAGE}.chat_image_collection_service")
 db_module = importlib.import_module(f"{PACKAGE}.db")
-models = importlib.import_module(f"{PACKAGE}.models")
 
 
 class MessageObj:
@@ -169,21 +167,6 @@ class Request:
         self.prompt = prompt
         self.contexts = contexts
         self.extra_user_content_parts = list(extra or [])
-
-
-class FakeImporter:
-    def __init__(self, root: Path, db) -> None:
-        self.root = root
-        self.db = db
-        self.calls = 0
-
-    async def import_local_file(self, path: Path, *, platform: str):
-        self.calls += 1
-        image_id = self.db.upsert_image(
-            file_path=str(path), file_name=path.name, sha256=f"sha-{path.name}",
-            width=100, height=100, format_="png",
-        )
-        return models.ImportedImage(image_id=image_id, file_path=path, sha256=f"sha-{path.name}", phash="", width=100, height=100, format="png")
 
 
 class ChatImageContextTests(unittest.IsolatedAsyncioTestCase):
@@ -508,9 +491,8 @@ class CollectionAndDBTests(unittest.IsolatedAsyncioTestCase):
                 name: db.get_or_create_tag(name, tag_type="pairing")
                 for name in ("杏豆", "遥实")
             }
-            service = collection_module.ChatImageCollectionService(db, None, Path(td))
-            state = await service.prepare([])
-            candidates = service.candidate_tags()
+            service = collection_module.ChatImageCollectionService(db)
+            candidates = service.ensure_candidates()
             mafuyu = next(x for x in candidates if x["standard_name"] == "朝比奈真冬")
             self.assertEqual(80, mafuyu["tag_id"])
             self.assertEqual(80, db.resolve_tag("朝比奈まふゆ", allow_fuzzy=False).tag_id)
@@ -525,9 +507,9 @@ class CollectionAndDBTests(unittest.IsolatedAsyncioTestCase):
             })
             self.assertEqual(pair_ids["杏豆"], by_name["杏豆"]["tag_id"])
             self.assertEqual(pair_ids["遥实"], by_name["遥实"]["tag_id"])
-            self.assertEqual(26 + 6 + 2, len(state.candidates))
+            self.assertEqual(26 + 6 + 2, len(candidates))
 
-    async def test_save_duplicate_call_summary_and_rejected_tag_not_success(self):
+    async def test_commit_chat_collection_image_skips_rejected_tag(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             db = db_module.ImageIndexDB(root / "index.db")
@@ -545,22 +527,6 @@ class CollectionAndDBTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([accepted_id], result["tag_ids_accepted"])
             self.assertEqual([rejected_id], result["tag_ids_skipped"])
             self.assertTrue(result["changed"])
-            importer = FakeImporter(root, db)
-            service = collection_module.ChatImageCollectionService(db, importer, root)
-            item = message_images.MessageImage(FakeImage(file=str(image_path)), {"session_id": "s", "source_message_id": "m1", "source_sender_name": "sender"})
-            state = collection_module.ChatImageCollection(images={item.ref: item}, candidates=[
-                {"tag_id": accepted_id, "name": "白石杏", "tag_type": "character"},
-                {"tag_id": rejected_id, "name": "小豆泽心羽", "tag_type": "character"},
-            ])
-            first = await service.save(state, item.ref, [accepted_id], reason="测试")
-            second = await service.save(state, item.ref, [accepted_id], reason="测试")
-            self.assertTrue(first["ok"])
-            self.assertTrue(first["changed"])
-            self.assertFalse(second["changed"])
-            self.assertEqual("顺手收了 1 张：白石杏", await service.summary(state))
-            rejected = await service.save(state, item.ref, [rejected_id], reason="测试")
-            self.assertFalse(rejected["ok"])
-            self.assertFalse(rejected.get("changed", False))
 
 
 class MarkerInstallerTests(unittest.TestCase):

@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
-
-from .message_images import MessageImage
 
 CHARACTERS = (
     ("初音未来", "Hatsune Miku"), ("镜音铃", "Kagamine Rin"), ("镜音连", "Kagamine Len"), ("巡音流歌", "Megurine Luka"), ("MEIKO", "MEIKO"), ("KAITO", "KAITO"),
@@ -26,19 +21,9 @@ JAPANESE_NAMES = (
 )
 KNOWN_PAIRINGS = {'杏豆': ('白石杏', '小豆泽心羽'), '遥实': ('桐谷遥', '花里实乃理')}
 
-@dataclass
-class ChatImageCollection:
-    images: dict[str, MessageImage] = field(default_factory=dict)
-    candidates: list[dict[str, Any]] = field(default_factory=list)
-    saved: dict[str, dict[str, Any]] = field(default_factory=dict)
-    agent_done: bool = False
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-
 class ChatImageCollectionService:
-    def __init__(self, db, importer, data_dir: Path, max_candidates: int = 26):
-        self.db, self.importer, self.data_dir = db, importer, data_dir
-        self.max_candidates = max_candidates
-        self._candidate_lock = asyncio.Lock()
+    def __init__(self, db):
+        self.db = db
         self._candidates: list[dict[str, Any]] | None = None
 
     def _initialize_candidates(self):
@@ -74,48 +59,7 @@ class ChatImageCollectionService:
                 result.append(candidate)
         return result
 
-    def candidate_tags(self):
+    def ensure_candidates(self):
         if self._candidates is None:
-            raise RuntimeError('candidate tags are initialized by prepare')
+            self._candidates = self._initialize_candidates()
         return [dict(item) for item in self._candidates]
-
-    async def prepare(self, images: list[MessageImage]) -> ChatImageCollection:
-        if self._candidates is None:
-            async with self._candidate_lock:
-                if self._candidates is None:
-                    self._candidates = self._initialize_candidates()
-        return ChatImageCollection({item.ref: item for item in images if item.location}, self.candidate_tags())
-
-    async def save(self, state: ChatImageCollection, image_ref: str, tag_ids: list[int], reason: str = ''):
-        async with state.lock:
-            candidates = {int(x['tag_id']): x for x in state.candidates}
-            item = state.images.get(str(image_ref))
-            if item is None: return {'ok': False, 'message': '图片引用已失效，只能保存本次请求实际看到的图片。'}
-            if not isinstance(tag_ids, list) or not tag_ids or any(type(x) is not int for x in tag_ids) or len(set(tag_ids)) != len(tag_ids) or not set(tag_ids) <= candidates.keys():
-                return {'ok': False, 'message': '只能选择本次请求提供的唯一有效整数 tag ID。'}
-            if not any(candidates[x]['tag_type'] == 'character' for x in tag_ids):
-                return {'ok': False, 'message': '至少选择一个 PJSK 角色 tag。'}
-            if any(not set(candidates[x].get('member_ids', [])).issubset(tag_ids) for x in tag_ids):
-                return {'ok': False, 'message': '组合标签的成员未全部选中，请只标注实际出现的角色。'}
-            try:
-                imported = await item.import_into(self.importer)
-                tags = [candidates[x] for x in tag_ids]
-                result = self.db.commit_chat_collection_image(image_id=int(imported.image_id), image_url=item.location, author=str(item.metadata.get('source_sender_name', '')), raw_tags=[x['name'] for x in tags], extra_json={'source_kind': 'chat_auto_collection', **item.metadata}, tag_ids=tag_ids, reason=reason, tag_members={x: candidates[x].get('member_ids', []) for x in tag_ids})
-            except Exception as exc:
-                return {'ok': False, 'message': f'保存失败：{type(exc).__name__}'}
-            accepted = result['tag_ids_accepted']
-            result = {'ok': bool(accepted), 'image_id': int(imported.image_id),
-                      'tags': [candidates[x]['name'] for x in accepted], **result}
-            previous = state.saved.get(str(image_ref))
-            cumulative = dict(result)
-            if previous:
-                cumulative['changed'] = previous['changed'] or result['changed']
-                cumulative['tags'] = list(dict.fromkeys([*previous['tags'], *result['tags']]))
-            state.saved[str(image_ref)] = cumulative
-            return result
-
-    async def summary(self, state: ChatImageCollection) -> str:
-        async with state.lock: saved = list(state.saved.values())
-        changed = [x for x in saved if x.get('changed')]
-        names = list(dict.fromkeys(n for x in changed for n in x['tags']))
-        return f"顺手收了 {len({x['image_id'] for x in changed})} 张：" + '、'.join(names) if changed else ''
