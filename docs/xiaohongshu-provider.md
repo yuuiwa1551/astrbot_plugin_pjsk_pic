@@ -163,3 +163,31 @@ python -m unittest tests.test_xhs_integration -v
 上线就绪检查必须同时通过 `/health`、登录状态和一次低频受限搜索。若健康与登录正常、但搜索连续超时，说明浏览器页面可能已经卡死；重启原登录容器后，再次确认登录态与搜索成功，才能恢复自动调度。
 
 Cookie、token、提供者数据目录、下载图片、数据库与日志均不得提交到源码仓库。
+
+## CLI sidecar 运行恢复
+
+适用于 `xhs_provider_kind=xiaohongshu_cli`，与上文旧浏览器提供者的过渡部署区分。
+
+1. 先从 **AstrBot 容器内部** 检查配置中的提供者域名、`/health` 和带 Bearer 鉴权的 `/api/v1/login/status`。宿主机能打开端口不代表容器间互通。
+2. 同为 HTTP 401，响应 `code=UNAUTHORIZED` 表示接口令牌不匹配；`code=SESSION_EXPIRED` 表示小红书账号登录过期。必须读取脱敏后的错误码，不要仅凭状态码更换 token。
+3. 使用原登录容器完成扫码，确认它写入的 Cookie 文件就是 sidecar 的只读挂载源。sidecar 在初始化时读取 Cookie，扫码成功后需重启 **sidecar**，再从 AstrBot 内检查登录及一次受限搜索。
+4. 提供者就绪后，才解除图库持久暂停。常规管理员入口为 `.pp 小红书采集恢复`，它会恢复现有调度器；不要另起长期采集进程。需要静默运维时，可在数据库备份后调用现有 `ImageIndexDB.set_crawl_provider_state` 解除暂停，再受控重载插件/重启 AstrBot，让插件初始化现有调度器，不调用 QQ 通知入口。
+5. 验收实际任务完成、来源入库和图片落盘；把任务处理图片数与去重后的新增图片数分开统计。已提交发现记录、历史水位和审核状态不能因为重新登录而清空。
+
+若使用独立 Docker 网络，必须在 AstrBot 的 Compose 定义中保留连接，避免重建时丢失。示例（网络名按实际部署替换，保留已有网络配置）：
+
+```yaml
+services:
+  astrbot:
+    networks:
+      - astrbot_network
+      - pjsk_xhs_private
+networks:
+  astrbot_network:
+    driver: bridge
+  pjsk_xhs_private:
+    external: true
+    name: pjsk_xhs_private
+```
+
+仅靠一次 `docker network connect` 不具备 Compose 重建持久性。网络恢复后保留提供者鉴权与宿主机回环端口绑定；临时用于扫码的登录容器在确认 Cookie 落盘后可以停止。
