@@ -4505,17 +4505,39 @@ class ImageIndexDB:
             return int(cursor.rowcount or 0)
 
     def find_chat_image_candidates_by_confirm(self, confirm_message_id: str, *,
-                                              sender_id: str = '') -> list[dict[str, Any]]:
-        sql = ("SELECT * FROM chat_image_candidates WHERE confirm_message_id = ? AND status = 'asked' "
+                                              sender_id: str = '', session_id: str = '',
+                                              include_resolved: bool = False) -> list[dict[str, Any]]:
+        sql = ("SELECT * FROM chat_image_candidates WHERE confirm_message_id = ? "
                "AND (expires_at = '' OR expires_at >= ?)")
         params: list[Any] = [str(confirm_message_id), utcnow_str()]
+        if not include_resolved:
+            sql += " AND status = 'asked'"
         if sender_id:
             sql += ' AND sender_id = ?'
             params.append(str(sender_id))
+        if session_id:
+            sql += ' AND session_id = ?'
+            params.append(str(session_id))
         sql += ' ORDER BY id'
         with self._lock, self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._chat_candidate_row(row) for row in rows]
+
+    def find_single_asked_chat_image_batch(self, session_id: str, sender_id: str) -> list[dict[str, Any]]:
+        """Unquoted confirmation is safe only with one unambiguous pending batch."""
+        with self._lock, self._connect() as conn:
+            batches = conn.execute(
+                "SELECT DISTINCT confirm_message_id FROM chat_image_candidates "
+                "WHERE session_id = ? AND sender_id = ? AND status = 'asked' "
+                "AND (expires_at = '' OR expires_at >= ?) LIMIT 2",
+                (str(session_id), str(sender_id), utcnow_str()),
+            ).fetchall()
+        if len(batches) != 1:
+            return []
+        return self.find_chat_image_candidates_by_confirm(
+            str(batches[0]['confirm_message_id']), sender_id=sender_id,
+            session_id=session_id, include_resolved=True,
+        )
 
     def find_latest_asked_chat_image_candidates(self, session_id: str, sender_id: str) -> list[dict[str, Any]]:
         now = utcnow_str()

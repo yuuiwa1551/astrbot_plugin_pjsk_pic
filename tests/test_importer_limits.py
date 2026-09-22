@@ -104,6 +104,7 @@ class ImporterDownloadLimitTests(unittest.TestCase):
             content_type="image/jpeg",
             platform="pixiv",
         )
+        self.assertTrue(first.is_new)
 
         with patch.object(importer_module, "compute_image_phash", side_effect=AssertionError("should not run")):
             second = service._store_imported_bytes(
@@ -114,6 +115,27 @@ class ImporterDownloadLimitTests(unittest.TestCase):
             )
 
         self.assertEqual(first.image_id, second.image_id)
+        self.assertFalse(second.is_new)
+        service.close()
+
+    def test_quality_variants_report_existing_image_id(self) -> None:
+        service = ImportedImageService(self.db, Path(self.temp_dir.name))
+        image = Image.new('RGB', (128, 128), (20, 40, 60))
+        jpeg = BytesIO()
+        png = BytesIO()
+        image.save(jpeg, format='JPEG')
+        image.save(png, format='PNG')
+        first = service._store_imported_bytes(jpeg.getvalue(), source_name='a.jpg',
+                                              content_type='image/jpeg', platform='chat')
+        better = service._store_imported_bytes(png.getvalue(), source_name='a.png',
+                                               content_type='image/png', platform='chat')
+        reused = service._store_imported_bytes(jpeg.getvalue(), source_name='b.jpg',
+                                               content_type='image/jpeg', platform='chat')
+        self.assertTrue(first.is_new)
+        self.assertEqual(first.image_id, better.image_id)
+        self.assertEqual(first.image_id, reused.image_id)
+        self.assertFalse(better.is_new)
+        self.assertFalse(reused.is_new)
         service.close()
 
     def test_phash_lookup_includes_images_older_than_500_rows(self) -> None:

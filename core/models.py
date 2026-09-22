@@ -41,6 +41,7 @@ class ImportedImage:
     height: int
     format: str
     similar_image_ids: list[int] = field(default_factory=list)
+    is_new: bool = True
 
 
 @dataclass

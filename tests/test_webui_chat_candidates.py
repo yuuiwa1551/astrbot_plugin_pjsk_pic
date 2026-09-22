@@ -69,7 +69,7 @@ class FakeImporter:
 
     async def import_local_file(self, source_path, *, platform="submission"):
         self.calls.append(str(source_path))
-        return types.SimpleNamespace(image_id=self.image_id)
+        return types.SimpleNamespace(image_id=self.image_id, is_new=True)
 
 
 class FakeContext:

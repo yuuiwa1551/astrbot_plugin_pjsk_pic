@@ -196,6 +196,7 @@ class ImportedImageService:
                 height=int(exact["height"] or 0),
                 format=str(exact["format"] or ""),
                 similar_image_ids=[],
+                is_new=False,
             )
         width, height, format_name = self._read_image_meta(body)
         phash = compute_image_phash(body) if self.enable_phash_dedupe else ""
@@ -247,6 +248,7 @@ class ImportedImageService:
                         image_id,
                         [int(row["id"]) for row in similar_rows if int(row["id"]) != image_id],
                     ),
+                    is_new=False,
                 )
 
             existing = self.db.get_image_row(target_id)
@@ -265,6 +267,7 @@ class ImportedImageService:
                     target_id,
                     [int(row["id"]) for row in similar_rows if int(row["id"]) != target_id],
                 ),
+                is_new=False,
             )
 
         if not file_path.exists():

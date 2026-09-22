@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import asyncio
+import base64
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from PIL import Image as PillowImage
 
 
 CORE_DIR = Path(__file__).resolve().parents[1] / "core"
@@ -144,10 +147,12 @@ class FakeImporter:
     async def import_local_file(self, source_path, *, platform="submission"):
         key = Path(source_path).name
         self.calls.append(key)
-        image_id, sha = self._resolve(key)
+        entry = self._resolve(key)
+        image_id, sha = entry[:2]
         return models.ImportedImage(
             image_id=image_id, file_path=Path(source_path), sha256=sha,
             phash="", width=10, height=10, format="png",
+            is_new=entry[2] if len(entry) > 2 else True,
         )
 
 
@@ -217,11 +222,13 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def make_audited(self, name="a.png", tag_ids=None, *, message_id="m1"):
+        local_path = Path(self.tmp.name) / name
+        PillowImage.new('RGB', (10, 10), color=(len(name), ord(name[0]), 30)).save(local_path)
         candidate = self.db.create_chat_image_candidate(
             ref=f"ref-{name}-{message_id}", session_id=SESSION, group_id="1",
             platform="aiocqhttp", sender_id="u1", sender_name="Alice",
             source_message_id=message_id, image_index=1,
-            image_url=f"https://example.com/{name}", file_path=f"/tmp/{name}",
+            image_url=f"https://example.com/{name}", file_path=str(local_path),
         )
         self.db.complete_chat_image_candidate_audit(
             int(candidate["id"]), status="audited", decision="approve",
@@ -250,6 +257,10 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, group_id)
         self.assertEqual("at", segments[0]["type"])
         self.assertEqual("u1", segments[0]["data"]["qq"])
+        image_segments = [part for part in segments if part['type'] == 'image']
+        self.assertEqual(1, len(image_segments))
+        self.assertEqual(Path(candidate['file_path']).read_bytes(),
+                         base64.b64decode(image_segments[0]['data']['file'].removeprefix('base64://')))
         asked = self.db.get_chat_image_candidate(int(candidate["id"]))
         self.assertEqual("asked", asked["status"])
         self.assertEqual("555", asked["confirm_message_id"])
@@ -267,8 +278,11 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("东云彰人", {tag["name"] for tag in detail["tags"]})
         self.assertTrue(any(source["platform"] == "chat" for source in detail["sources"]))
         self.assertEqual(2, len(bot.sent))
+        self.assertEqual('reply', bot.sent[-1][1][0]['type'])
+        self.assertIn(f'第1张 → 图片 ID：#{image_id}', bot.sent[-1][1][-1]['data']['text'])
+        self.assertFalse(any(part['type'] == 'image' for part in bot.sent[-1][1]))
 
-    async def test_announce_merges_same_tag_sets(self):
+    async def test_announce_pairs_each_number_with_its_image_even_with_same_tags(self):
         self.importer = FakeImporter(default=(1, "sha-x"))
         bot = FakeBot(message_id=555)
         service = self.make_service(bot)
@@ -276,9 +290,16 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
         self.make_audited("b.png", [self.tag_akito], message_id="m2")
         self.make_audited("c.png", [self.tag_akito, self.tag_toya], message_id="m3")
         await service.run_once()
-        text = bot.sent[0][1][-1]["data"]["text"]
-        self.assertIn("· 第1、2张：东云彰人", text)
-        self.assertIn("· 第3张：东云彰人、青柳冬弥", text)
+        parts = bot.sent[0][1]
+        labels = [part['data']['text'] for part in parts if part['type'] == 'text']
+        self.assertIn('\n第1张：东云彰人\n', labels)
+        self.assertIn('\n第2张：东云彰人\n', labels)
+        self.assertIn('\n第3张：东云彰人、青柳冬弥\n', labels)
+        image_parts = [part for part in parts if part['type'] == 'image']
+        self.assertEqual(3, len(image_parts))
+        for filename, part in zip(['a.png', 'b.png', 'c.png'], image_parts):
+            self.assertEqual((Path(self.tmp.name) / filename).read_bytes(),
+                             base64.b64decode(part['data']['file'].removeprefix('base64://')))
 
     async def test_auto_approve_writes_without_asking(self):
         image_id = self.make_image("a.png")
@@ -319,7 +340,7 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
         row = self.db.get_chat_image_candidate(int(candidate["id"]))
         self.assertEqual("asked", row["status"])
 
-    async def test_at_bot_confirms_latest_asked(self):
+    async def test_at_bot_confirms_only_unambiguous_batch(self):
         image_id = self.make_image("a.png")
         self.importer = FakeImporter({"a.png": (image_id, "sha-a")})
         bot = FakeBot(message_id=555)
@@ -382,14 +403,14 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
             "sender": {"user_id": "bot", "nickname": "Bot"},
             "message": [
                 {"type": "at", "data": {"qq": "u1"}},
-                {"type": "text", "data": {"text": "【收图确认】收到 1 张可能适合图库的图片："}},
+                {"type": "text", "data": {"text": "【收图确认】确认批次：local:" + "a" * 32}},
             ],
         }
         bot = FakeBot(message_id=None, get_msg=get_msg)
         service = self.make_service(bot)
         candidate = self.make_audited("a.png")
         self.db.mark_chat_image_candidates_asked(
-            [int(candidate["id"])], confirm_message_id="local:abc",
+            [int(candidate["id"])], confirm_message_id="local:" + "a" * 32,
             expires_at="2999-01-01T00:00:00+00:00",
         )
         event = Event(
@@ -476,6 +497,149 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
         self.make_audited("a.png")
         summary = await service.run_once()
         self.assertEqual(0, summary["sent"])
+
+    async def test_missing_preview_moves_to_review_without_text_only_question(self):
+        self.importer = FakeImporter(default=(1, 'sha-x'))
+        bot = FakeBot()
+        service = self.make_service(bot)
+        candidate = self.make_audited()
+        Path(candidate['file_path']).unlink()
+        result = await service.run_once()
+        self.assertEqual(0, result['sent'])
+        self.assertEqual([], bot.sent)
+        self.assertEqual('pending_webui', self.db.get_chat_image_candidate(candidate['id'])['status'])
+
+    async def test_generated_fallback_token_selects_original_not_newest_batch(self):
+        image_a = self.make_image('a.png', 'sha-a')
+        self.importer = FakeImporter({'a.png': (image_a, 'sha-a')})
+        bot = FakeBot(message_id=None)
+        service = self.make_service(bot)
+        first = self.make_audited('a.png')
+        await service.run_once()
+        first_message = bot.sent[0][1]
+        second = self.make_audited('b.png')
+        await service.run_once()
+        bot.get_msg = {'sender': {'user_id': 'bot'}, 'group_id': 1, 'message': first_message}
+        event = Event([{'type': 'reply', 'data': {'id': '9001'}}], message_str='确认', bot=bot)
+        self.assertTrue(await service.handle_reply(event))
+        self.assertEqual('approved_written', self.db.get_chat_image_candidate(first['id'])['status'])
+        self.assertEqual('asked', self.db.get_chat_image_candidate(second['id'])['status'])
+        self.assertEqual(['a.png'], self.importer.calls)
+
+    async def test_selective_confirmation_keeps_original_number_after_partial_write(self):
+        image_a = self.make_image('a.png', 'sha-a')
+        image_b = self.make_image('b.png', 'sha-b')
+        self.importer = FakeImporter({'a.png': (image_a, 'sha-a'), 'b.png': (image_b, 'sha-b')})
+        bot = FakeBot()
+        service = self.make_service(bot)
+        first = self.make_audited('a.png')
+        second = self.make_audited('b.png')
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '555'}}], message_str='收第2张', bot=bot)
+        self.assertTrue(await service.handle_reply(event))
+        self.assertEqual('asked', self.db.get_chat_image_candidate(first['id'])['status'])
+        self.assertIn(f'第2张 → 图片 ID：#{image_b}', bot.sent[-1][1][-1]['data']['text'])
+        event.message_str = '全部收'
+        self.assertTrue(await service.handle_reply(event))
+        receipt = bot.sent[-1][1][-1]['data']['text']
+        self.assertIn(f'第1张 → 图片 ID：#{image_a}', receipt)
+        self.assertNotIn(f'#{image_b}', receipt)
+        self.assertEqual(['b.png', 'a.png'], self.importer.calls)
+
+    async def test_failure_does_not_renumber_success_or_claim_a_failed_id(self):
+        image_b = self.make_image('b.png', 'sha-b')
+        self.importer = FakeImporter({'b.png': (image_b, 'sha-b')})
+        bot = FakeBot()
+        service = self.make_service(bot)
+        first = self.make_audited('a.png')
+        self.make_audited('b.png')
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '555'}}], message_str='确认', bot=bot)
+        await service.handle_reply(event)
+        text = bot.sent[-1][1][-1]['data']['text']
+        self.assertIn('第1张：收录失败', text)
+        self.assertIn(f'第2张 → 图片 ID：#{image_b}', text)
+        self.assertEqual('write_failed', self.db.get_chat_image_candidate(first['id'])['status'])
+
+    async def test_duplicate_uses_existing_gallery_id(self):
+        existing_id = self.make_image()
+        self.importer = FakeImporter({'a.png': (existing_id, 'sha-a', False)})
+        bot = FakeBot()
+        service = self.make_service(bot)
+        self.make_audited()
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '555'}}], message_str='确认', bot=bot)
+        await service.handle_reply(event)
+        receipt = bot.sent[-1][1][-1]['data']['text']
+        self.assertIn(f'图片 ID：#{existing_id}', receipt)
+        self.assertIn('已在图库，本次未新增图片', receipt)
+
+    async def test_parallel_repeated_confirmation_imports_once(self):
+        existing_id = self.make_image()
+        self.importer = FakeImporter({'a.png': (existing_id, 'sha-a')})
+        bot = FakeBot()
+        service = self.make_service(bot)
+        self.make_audited()
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '555'}}], message_str='确认', bot=bot)
+        results = await asyncio.gather(service.handle_reply(event), service.handle_reply(event))
+        self.assertEqual([True, False], results)
+        self.assertEqual(['a.png'], self.importer.calls)
+
+    async def test_multiple_batches_at_only_does_not_choose_latest(self):
+        self.importer = FakeImporter(default=(1, 'sha-x'))
+        bot = FakeBot()
+        service = self.make_service(bot)
+        first = self.make_audited('a.png')
+        await service.run_once()
+        bot.message_id = 556
+        second = self.make_audited('b.png')
+        await service.run_once()
+        event = Event([{'type': 'at', 'data': {'qq': 'bot'}}], message_str='确认', bot=bot)
+        self.assertTrue(await service.handle_reply(event))
+        self.assertIn('有多批图片', bot.sent[-1][1][-1]['data']['text'])
+        self.assertEqual([], self.importer.calls)
+        for row in [first, second]:
+            self.assertEqual('asked', self.db.get_chat_image_candidate(row['id'])['status'])
+
+    async def test_old_expired_quote_with_at_cannot_confirm_new_batch(self):
+        self.importer = FakeImporter(default=(1, 'sha-x'))
+        bot = FakeBot(get_msg={'sender': {'user_id': 'bot'}, 'message': [
+            {'type': 'at', 'data': {'qq': 'u1'}},
+            {'type': 'text', 'data': {'text': '【收图确认】旧的文字确认'}},
+        ]})
+        service = self.make_service(bot)
+        old = self.make_audited('a.png')
+        self.db.mark_chat_image_candidates_asked([old['id']], confirm_message_id='554',
+                                                expires_at='2000-01-01T00:00:00+00:00')
+        new = self.make_audited('b.png')
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '554'}},
+                       {'type': 'at', 'data': {'qq': 'bot'}}], message_str='确认', bot=bot)
+        self.assertFalse(await service.handle_reply(event))
+        self.assertEqual([], self.importer.calls)
+        self.assertEqual('asked', self.db.get_chat_image_candidate(new['id'])['status'])
+
+    async def test_cross_group_quote_does_not_confirm(self):
+        self.importer = FakeImporter(default=(1, 'sha-x'))
+        bot = FakeBot()
+        service = self.make_service(bot)
+        self.make_audited()
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '555'}}], message_str='确认',
+                      session='aiocqhttp:GroupMessage:2', group_id='2', bot=bot)
+        self.assertFalse(await service.handle_reply(event))
+        self.assertEqual([], self.importer.calls)
+
+    async def test_rejected_send_ack_does_not_mark_asked(self):
+        class RejectedBot(FakeBot):
+            async def send_group_msg(self, group_id, message):
+                return {'status': 'failed', 'retcode': 100}
+        self.importer = FakeImporter(default=(1, 'sha-x'))
+        service = self.make_service(RejectedBot())
+        candidate = self.make_audited()
+        self.assertEqual(0, (await service.run_once())['sent'])
+        self.assertEqual('audited', self.db.get_chat_image_candidate(candidate['id'])['status'])
 
 
 if __name__ == "__main__":

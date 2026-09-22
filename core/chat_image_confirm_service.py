@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -12,11 +13,13 @@ from astrbot.api import logger
 from .message_images import component_kind, original_chain
 
 CONFIRM_HEADER = '【收图确认】'
+CONFIRM_TOKEN_PATTERN = re.compile(r'确认批次：(local:[0-9a-f]{32})\s*$')
+SELECT_PATTERN = re.compile(r'^(?:收|确认)\s*第\s*([0-9０-９一二三四五六七八九十两]+)\s*张$')
 CORRECTION_PATTERN = re.compile(
     r'^第\s*([0-9０-９一二三四五六七八九十两]+)\s*张\s*(?:是|改成|改为|换成|[:：])\s*(.+)$'
 )
 CORRECTION_HINT_PATTERN = re.compile(r'^第\s*.{1,6}?\s*张')
-DEFAULT_ACCEPT_WORDS = ('确认', '对', '可以', '没问题', '收')
+DEFAULT_ACCEPT_WORDS = ('确认', '对', '可以', '没问题', '收', '全部收', '全部确认')
 DEFAULT_REJECT_WORDS = ('不要', '不对', '拒绝', '不收')
 _STRIP_CHARS = ' \t\u3000。．.!！~～?？,，、;；:：'
 _NUMBER_CHARS = {
@@ -102,6 +105,7 @@ class ChatImageConfirmService:
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
+        self._reply_lock = asyncio.Lock()
 
     def enabled(self) -> bool:
         return bool(self.config.get("chat_image_collection_enabled", False))
@@ -196,7 +200,7 @@ class ChatImageConfirmService:
                 if not chunk:
                     continue
                 ids = [int(row['id']) for row in chunk]
-                self.db.mark_chat_image_candidates_confirmed(ids, user_id='auto')
+                self.db.mark_chat_image_candidates_confirmed(ids, user_id='auto', statuses=('audited',))
                 fresh = [self.db.get_chat_image_candidate(candidate_id) for candidate_id in ids]
                 await self._write_batch([row for row in fresh if row], user_id='auto', notify=False)
                 summary["auto"] += len(chunk)
@@ -243,33 +247,44 @@ class ChatImageConfirmService:
     async def _announce(self, batch: list[dict[str, Any]]) -> bool:
         if not batch:
             return False
+        batch = sorted(batch, key=lambda row: int(row['id']))
+        previews: list[tuple[dict[str, Any], str]] = []
+        for candidate in batch:
+            try:
+                path = Path(str(candidate.get('file_path') or ''))
+                body = await asyncio.to_thread(path.read_bytes)
+                if not body:
+                    raise ValueError('empty preview')
+                previews.append((candidate, base64.b64encode(body).decode('ascii')))
+            except (OSError, ValueError):
+                self.db.mark_chat_image_candidates_pending_webui(
+                    [int(candidate['id'])], error='确认图片缺失或不可读取，转入待审')
+        if not previews:
+            return False
+        batch = [row for row, _ in previews]
         lookup = self._tag_lookup()
-        groups: dict[tuple[int, ...], list[int]] = {}
-        order: list[tuple[int, ...]] = []
-        for index, candidate in enumerate(batch, 1):
-            key = tuple(int(x) for x in (candidate.get('proposed_tag_ids_json') or []))
-            if key not in groups:
-                groups[key] = []
-                order.append(key)
-            groups[key].append(index)
-        lines = []
-        for key in order:
-            indexes = groups[key]
-            label = "、".join(self._tag_names(list(key), lookup)) or "（无标签）"
-            prefix = "、".join(str(index) for index in indexes)
-            lines.append(f"· 第{prefix}张：{label}")
         sender_name = str(batch[0].get('sender_name') or batch[0].get('sender_id') or '')
-        text = "\n".join([
-            f"{CONFIRM_HEADER}本批 {len(batch)} 张，请 {sender_name} 引用本条回复「确认」入库：",
-            *lines,
-            "要改请回复「第2张是<tag名>」；回复「不要」取消本批。",
-            f"{self.timeout_hours()} 小时内未回复会自动转入待审。",
-        ])
+        token = f"local:{uuid.uuid4().hex}"
+        text = f"{CONFIRM_HEADER}本批 {len(batch)} 张，请 {sender_name} 引用本条确认：\n"
+        segments: list[dict[str, Any]] = [{'type': 'text', 'data': {'text': text}}]
+        for index, (candidate, encoded) in enumerate(previews, 1):
+            tag_ids = [int(x) for x in (candidate.get('proposed_tag_ids_json') or [])]
+            label = '、'.join(self._tag_names(tag_ids, lookup)) or '（无标签）'
+            segments.extend([
+                {'type': 'text', 'data': {'text': f'\n第{index}张：{label}\n'}},
+                {'type': 'image', 'data': {'file': f'base64://{encoded}'}},
+            ])
+        segments.append({'type': 'text', 'data': {'text': (
+            '\n回复「确认」或「全部收」收录本批；回复「收第2张」只收对应图片。\n'
+            '要改请回复「第2张是<tag名>」（更正该张并确认本批剩余图片）；回复「不要」取消剩余图片。\n'
+            f'{self.timeout_hours()} 小时内未回复会自动转入待审。\n确认批次：{token}'
+        )}})
         ok, message_id = await self._send_group(
-            str(batch[0].get('session_id') or ''), text, at_qq=str(batch[0].get('sender_id') or ''))
+            str(batch[0].get('session_id') or ''), text,
+            at_qq=str(batch[0].get('sender_id') or ''), message_segments=segments)
         if not ok:
             return False
-        token = message_id or f"local:{uuid.uuid4().hex}"
+        token = message_id or token
         expires_at = (
             datetime.now(timezone.utc) + timedelta(hours=self.timeout_hours())
         ).isoformat(timespec='seconds')
@@ -358,6 +373,10 @@ class ChatImageConfirmService:
         return rejected
 
     async def handle_reply(self, event) -> bool:
+        async with self._reply_lock:
+            return await self._handle_reply(event)
+
+    async def _handle_reply(self, event) -> bool:
         if not self.enabled() or event.is_private_chat():
             return False
         self_id = str(event.get_self_id() or '')
@@ -376,15 +395,28 @@ class ChatImageConfirmService:
         session_id = str(event.unified_msg_origin)
         batch: list[dict[str, Any]] = []
         if reply_id:
-            batch = self.db.find_chat_image_candidates_by_confirm(reply_id, sender_id=sender_id)
-        if not batch and at_self:
-            batch = self.db.find_latest_asked_chat_image_candidates(session_id, sender_id)
-        if not batch and reply_id and await self._is_bot_confirm_message(event, reply_id, self_id, sender_id):
-            batch = self.db.find_latest_asked_chat_image_candidates(session_id, sender_id)
+            batch = self.db.find_chat_image_candidates_by_confirm(
+                reply_id, sender_id=sender_id, session_id=session_id, include_resolved=True)
+            if not batch:
+                token = await self._confirm_token_from_reply(event, reply_id, self_id, sender_id)
+                if token:
+                    batch = self.db.find_chat_image_candidates_by_confirm(
+                        token, sender_id=sender_id, session_id=session_id, include_resolved=True)
+        elif at_self:
+            batch = self.db.find_single_asked_chat_image_batch(session_id, sender_id)
+            if not batch and (self.db.find_latest_asked_chat_image_candidates(session_id, sender_id)):
+                if (_normalize_text(text) in self.accept_words() | self.reject_words()
+                        or SELECT_PATTERN.match(text) or looks_like_correction(text)):
+                    await self._send_group(session_id, f'{CONFIRM_HEADER}有多批图片待确认，请引用对应的带图确认消息回复。')
+                    return True
         if not batch:
             return False
         if str(batch[0].get('session_id') or '') != session_id:
             return False
+        if not any(row.get('status') == 'asked' for row in batch):
+            return False
+        for index, candidate in enumerate(batch, 1):
+            candidate['_confirm_index'] = index
         return await self._apply_reply(event, batch, text, sender_id)
 
     async def _apply_reply(self, event, batch: list[dict[str, Any]], text: str,
@@ -398,11 +430,22 @@ class ChatImageConfirmService:
             self.db.mark_chat_image_candidates_rejected(
                 [int(row['id']) for row in batch], user_id=sender_id)
             return True
-        if normalized in self.accept_words():
-            ids = [int(row['id']) for row in batch]
+        selection = SELECT_PATTERN.match(str(text).strip(_STRIP_CHARS))
+        if normalized in self.accept_words() or selection:
+            selected = batch
+            if selection:
+                index = _parse_index(selection.group(1)) or 0
+                if index < 1 or index > len(batch):
+                    await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}本批共 {len(batch)} 张，没有第 {index} 张。')
+                    return True
+                selected = [batch[index - 1]]
+                if selected[0].get('status') != 'asked':
+                    await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}第 {index} 张已处理，无需重复确认。')
+                    return True
+            selected = [row for row in selected if row.get('status') == 'asked']
+            ids = [int(row['id']) for row in selected]
             self.db.mark_chat_image_candidates_confirmed(ids, user_id=sender_id)
-            fresh = [self.db.get_chat_image_candidate(candidate_id) for candidate_id in ids]
-            await self._write_batch([row for row in fresh if row], user_id=sender_id)
+            await self._write_batch(self._refresh_selected(selected), user_id=sender_id)
             return True
         if looks_like_correction(text):
             await self._send_group(
@@ -427,14 +470,24 @@ class ChatImageConfirmService:
             await self._send_group(str(event.unified_msg_origin), f"{CONFIRM_HEADER}{error}")
             return
         target = batch[index - 1]
-        self.db.mark_chat_image_candidate_corrected(
-            int(target['id']), corrected_tag_ids=tag_ids, user_id=sender_id)
-        peers = [int(row['id']) for row in batch if int(row['id']) != int(target['id'])]
+        if not self.db.mark_chat_image_candidate_corrected(
+                int(target['id']), corrected_tag_ids=tag_ids, user_id=sender_id):
+            await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}第 {index} 张已处理，无需重复更正。')
+            return
+        selected = [row for row in batch if row.get('status') == 'asked']
+        peers = [int(row['id']) for row in selected if int(row['id']) != int(target['id'])]
         if peers:
             self.db.mark_chat_image_candidates_confirmed(peers, user_id=sender_id)
-        ids = [int(row['id']) for row in batch]
-        fresh = [self.db.get_chat_image_candidate(candidate_id) for candidate_id in ids]
-        await self._write_batch([row for row in fresh if row], user_id=sender_id)
+        await self._write_batch(self._refresh_selected(selected), user_id=sender_id)
+
+    def _refresh_selected(self, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        fresh = []
+        for candidate in selected:
+            row = self.db.get_chat_image_candidate(int(candidate['id']))
+            if row and row.get('status') in {'confirmed', 'corrected'}:
+                row['_confirm_index'] = candidate.get('_confirm_index', len(fresh) + 1)
+                fresh.append(row)
+        return fresh
 
     def _resolve_correction_tags(self, names: list[str]) -> tuple[list[int], str]:
         lookup = self._tag_lookup()
@@ -474,9 +527,12 @@ class ChatImageConfirmService:
         if not batch:
             return
         lookup = self._tag_lookup()
-        written: list[tuple[dict[str, Any], list[str]]] = []
+        written: list[tuple[dict[str, Any], list[str], int, bool]] = []
         failed: list[dict[str, Any]] = []
-        for candidate in batch:
+        for index, candidate in enumerate(batch, 1):
+            candidate.setdefault('_confirm_index', index)
+            if candidate.get('status') not in {'confirmed', 'corrected'}:
+                continue
             candidate_id = int(candidate['id'])
             tag_ids = [
                 int(value)
@@ -532,25 +588,36 @@ class ChatImageConfirmService:
                 continue
             self.db.mark_chat_image_candidate_written(
                 candidate_id, image_id=int(imported.image_id), tag_ids=accepted)
-            written.append((candidate, self._tag_names(accepted, lookup)))
+            written.append((candidate, self._tag_names(accepted, lookup),
+                            int(imported.image_id), bool(imported.is_new)))
         if notify:
             await self._send_receipt(batch[0], written, failed)
 
     async def _send_receipt(self, candidate: dict[str, Any],
-                            written: list[tuple[dict[str, Any], list[str]]],
+                            written: list[tuple[dict[str, Any], list[str], int, bool]],
                             failed: list[dict[str, Any]]) -> None:
         if not self.receipt_enabled():
             return
         lines: list[str] = []
         if written:
-            lines.append(f"【收图回执】已收录 {len(written)} 张：")
-            for index, (_, names) in enumerate(written, 1):
-                lines.append(f"{index}. " + ("、".join(names) if names else "（无标签）"))
+            lines.append(f"【收图回执】已处理 {len(written)} 张：")
+            for row, names, image_id, is_new in written:
+                index = int(row.get('_confirm_index', 1))
+                action = '已收录' if is_new else '已在图库，本次未新增图片'
+                lines.append(f"第{index}张 → 图片 ID：#{image_id}（{action}）\n标签："
+                             + ("、".join(names) if names else "（无标签）"))
         if failed:
-            lines.append(f"有 {len(failed)} 张写库失败，已记录原因，可在待审页处理。")
+            if not written:
+                lines.append('【收图回执】本次未能完成收录：')
+            for row in failed:
+                lines.append(f"第{int(row.get('_confirm_index', 1))}张：收录失败，未确认入库；已记录原因，可在待审页处理。")
         if not lines:
             lines.append("【收图回执】本批没有可收录的图片。")
-        await self._send_group(str(candidate.get('session_id') or ''), "\n".join(lines))
+        confirm_id = str(candidate.get('confirm_message_id') or '')
+        segments = [{'type': 'reply', 'data': {'id': confirm_id}}] if confirm_id.isdigit() else []
+        segments.append({'type': 'text', 'data': {'text': '\n'.join(lines)}})
+        await self._send_group(str(candidate.get('session_id') or ''), '\n'.join(lines),
+                               message_segments=segments)
 
     @staticmethod
     def _reply_id(event) -> str:
@@ -592,21 +659,23 @@ class ChatImageConfirmService:
                 chunks.append(self._component_text(component))
         return ''.join(chunks).strip()
 
-    async def _is_bot_confirm_message(self, event, reply_id: str, self_id: str,
-                                      sender_id: str) -> bool:
+    async def _confirm_token_from_reply(self, event, reply_id: str, self_id: str,
+                                        sender_id: str) -> str:
         bot = getattr(event, 'bot', None)
         if bot is None or not reply_id:
-            return False
+            return ''
         try:
             response = await bot.call_action('get_msg', message_id=int(reply_id))
             payload = response.get('data', response) if isinstance(response, dict) else response
         except Exception:
-            return False
+            return ''
         if not isinstance(payload, dict):
-            return False
+            return ''
+        if payload.get('group_id') is not None and str(payload['group_id']) != str(event.get_group_id()):
+            return ''
         sender = payload.get('sender') or {}
         if str(sender.get('user_id') or '') != self_id:
-            return False
+            return ''
         at_sender = False
         chunks = []
         for node in payload.get('message') or []:
@@ -620,7 +689,9 @@ class ChatImageConfirmService:
                     at_sender = True
             elif kind in {'text', 'plain'}:
                 chunks.append(self._component_text(node))
-        return at_sender and CONFIRM_HEADER in ''.join(chunks)
+        text = ''.join(chunks)
+        match = CONFIRM_TOKEN_PATTERN.search(text)
+        return match.group(1) if at_sender and CONFIRM_HEADER in text and match else ''
 
     def _configured_groups(self) -> set[str]:
         raw = self.config.get("chat_image_collection_groups", "")
@@ -647,24 +718,29 @@ class ChatImageConfirmService:
                 return getattr(platform, 'bot', None)
         return None
 
-    async def _send_group(self, session_id: str, text: str, *, at_qq: str = '') -> tuple[bool, str]:
+    async def _send_group(self, session_id: str, text: str, *, at_qq: str = '',
+                          message_segments: list[dict[str, Any]] | None = None) -> tuple[bool, str]:
         session_text = str(session_id or '')
         parts = session_text.split(':')
         platform_name = parts[0] if parts else ''
         group_id = parts[-1] if len(parts) >= 3 else ''
         bot = self._get_bot(platform_name)
         send_group_msg = getattr(bot, 'send_group_msg', None) if bot is not None else None
+        segments: list[dict[str, Any]] = []
+        if at_qq:
+            segments.append({'type': 'at', 'data': {'qq': str(at_qq)}})
+        segments.extend(message_segments if message_segments is not None
+                        else [{'type': 'text', 'data': {'text': text}}])
         if send_group_msg is not None and str(group_id).isdigit():
-            segments: list[dict[str, Any]] = []
-            if at_qq:
-                segments.append({'type': 'at', 'data': {'qq': str(at_qq)}})
-            segments.append({'type': 'text', 'data': {'text': text}})
             try:
                 result = await send_group_msg(group_id=int(group_id), message=segments)
             except Exception as exc:
                 logger.warning(
                     f"[PJSKPic] 群聊确认消息直接发送失败：{type(exc).__name__}: {exc}")
             else:
+                if isinstance(result, dict) and (result.get('status') == 'failed'
+                        or result.get('retcode', 0) not in (0, '0', None)):
+                    return False, ''
                 message_id = ''
                 if isinstance(result, dict):
                     payload = result.get('data')
@@ -675,13 +751,18 @@ class ChatImageConfirmService:
                 return True, message_id
         try:
             from astrbot.core.message.message_event_result import MessageChain
-            chain = MessageChain().message(text)
-            if at_qq:
-                try:
-                    from astrbot.api.message_components import At
-                    chain.chain.insert(0, At(qq=int(at_qq)))
-                except Exception:
-                    pass
+            from astrbot.api.message_components import At, Image, Plain, Reply
+            chain = MessageChain()
+            for segment in segments:
+                data = segment['data']
+                if segment['type'] == 'text':
+                    chain.chain.append(Plain(data['text']))
+                elif segment['type'] == 'at':
+                    chain.chain.append(At(qq=data['qq']))
+                elif segment['type'] == 'image':
+                    chain.chain.append(Image.fromBase64(data['file'].removeprefix('base64://')))
+                elif segment['type'] == 'reply':
+                    chain.chain.append(Reply(id=data['id']))
             ok = bool(await self.context.send_message(session_text, chain))
             return ok, ''
         except Exception as exc:
