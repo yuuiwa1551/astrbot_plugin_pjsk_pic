@@ -2760,6 +2760,8 @@ class GalleryWebUI:
             "audit_decision": str(row.get("audit_decision") or ""),
             "audit_reason": str(row.get("audit_reason") or ""),
             "audit_flags": row.get("audit_flags_json") or [],
+            "audit_quality": row.get("audit_quality_json") or {},
+            "audit_identity": row.get("audit_identity_json") or {"identity_state": "unknown"},
             "created_at": str(row.get("created_at") or ""),
             "has_file": bool(str(row.get("file_path") or "")),
             "tags": tags,
@@ -2770,14 +2772,18 @@ class GalleryWebUI:
         if denied is not None:
             return denied
         args = request.query
+        status = str(args.get('status', 'pending_webui'))
+        if status not in {'pending_webui', 'audit_error', 'audited', 'asked',
+                          'approved_written', 'rejected', 'captured', 'auditing'}:
+            return self._json_response({'error': 'invalid_candidate_status'}, status=400)
         limit, offset = _pagination_from_query(args, default_limit=30, max_limit=100)
         rows = self.db.list_chat_image_candidates(
-            statuses=["pending_webui"],
+            statuses=[status],
             limit=limit,
             offset=offset,
         )
         stats = self.db.get_chat_image_candidate_stats()
-        total = int(stats.get("pending_webui", 0) or 0)
+        total = int(stats.get(status, 0) or 0)
         return self._json_response({
             "items": [self._build_chat_candidate_item(row) for row in rows],
             "stats": stats,

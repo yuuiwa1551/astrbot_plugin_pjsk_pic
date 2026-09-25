@@ -146,6 +146,18 @@ class WebuiChatCandidateTests(unittest.IsolatedAsyncioTestCase):
             item["tags"],
         )
         self.assertEqual(1, payload["stats"]["pending_webui"])
+        self.assertEqual({'identity_state': 'unknown'}, item['audit_identity'])
+
+    async def test_audit_error_filter_exposes_bounded_trace(self):
+        candidate = self.make_pending_candidate()
+        self.db.fail_chat_image_candidate_audit(candidate['id'], error='format failure', retryable=False,
+            audit_identity={'identity_state': 'error', 'last_error_category': 'invalid_json', 'call_count': 1})
+        response = await self.webui.api_chat_candidates(FakeRequest(query={'status': 'audit_error'}))
+        payload = json.loads(response.text)
+        self.assertEqual(1, payload['total'])
+        self.assertEqual('invalid_json', payload['items'][0]['audit_identity']['last_error_category'])
+        invalid = await self.webui.api_chat_candidates(FakeRequest(query={'status': 'unknown-status'}))
+        self.assertEqual(400, invalid.status)
 
     async def test_decision_approve_writes_image(self):
         candidate = self.make_pending_candidate()

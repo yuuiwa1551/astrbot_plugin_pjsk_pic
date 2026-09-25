@@ -86,8 +86,24 @@
   },
   "chat_image_audit_prompt_version": {
     "type": "string",
-    "description": "群聊收图审核提示词版本标记，用于区分不同审核口径的记录。",
+    "description": "群聊收图审核提示词版本前缀；实际记录会追加实现版本，用于区分审核口径。",
     "default": "chat-v1"
+  },
+  "chat_image_audit_provider_id": {
+    "type": "string",
+    "description": "群聊收图独立视觉 Provider ID；留空沿用图库审核 Provider，不影响其他图库审核任务的模型设置。",
+    "default": ""
+  },
+  "chat_image_audit_identity_mode": {
+    "type": "string",
+    "description": "群聊角色置信度分流：shadow 只记录建议、不改变确认行为；off 不生成分流建议。当前不提供自动执行分流模式。",
+    "options": ["shadow", "off"],
+    "default": "shadow"
+  },
+  "chat_image_audit_identity_threshold": {
+    "type": "float",
+    "description": "群聊身份置信度的旁路观察阈值（0-1），独立于图库审核阈值；不是校准后的正确率，不用于自动收录。",
+    "default": 0.93
   },
   "chat_image_confirm_interval_seconds": {
     "type": "int",

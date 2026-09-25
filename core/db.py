@@ -517,6 +517,7 @@ class ImageIndexDB:
             had_tag_type = 'tag_type' in tag_columns_before_migration
 
             self._ensure_column(conn, 'images', 'phash', "TEXT DEFAULT ''")
+            self._ensure_column(conn, 'chat_image_candidates', 'audit_identity_json', "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, 'tags', 'is_character', 'INTEGER DEFAULT 0')
             self._ensure_column(conn, 'tags', 'tag_type', "TEXT NOT NULL DEFAULT 'other'")
             self._ensure_column(conn, 'tags', 'status', "TEXT NOT NULL DEFAULT 'active'")
@@ -4183,6 +4184,7 @@ class ImageIndexDB:
         defaults: dict[str, Any] = {
             'occurrences_json': [],
             'audit_quality_json': {},
+            'audit_identity_json': {},
             'audit_flags_json': [],
             'proposed_tag_ids_json': [],
             'confirmed_tag_ids_json': [],
@@ -4192,6 +4194,8 @@ class ImageIndexDB:
                 item[key] = json.loads(str(item.get(key) or 'null'))
             except json.JSONDecodeError:
                 item[key] = default
+        if not isinstance(item.get('audit_identity_json'), dict):
+            item['audit_identity_json'] = {}
         return item
 
     def create_chat_image_candidate(self, *, ref: str, session_id: str, group_id: str = '',
@@ -4401,9 +4405,12 @@ class ImageIndexDB:
 
     def claim_next_chat_image_candidate(self) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             row = conn.execute(
                 "SELECT * FROM chat_image_candidates WHERE status = 'captured' AND file_path != '' "
-                'ORDER BY id LIMIT 1'
+                "AND COALESCE(json_extract(audit_identity_json, '$.next_retry_at'), '') <= ? "
+                'ORDER BY id LIMIT 1',
+                (utcnow_str(),),
             ).fetchone()
             if row is None:
                 return None
@@ -4416,10 +4423,47 @@ class ImageIndexDB:
         claimed['status'] = 'auditing'
         return self._chat_candidate_row(claimed)
 
+    @staticmethod
+    def _audit_identity_dump(value: dict[str, Any] | None) -> str | None:
+        if value is None:
+            return None
+        text = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+        if len(text.encode('utf-8')) > 32768:
+            raise ValueError('群聊识别记录超过 32 KiB 限制')
+        return text
+
+    def reserve_chat_image_audit_call(self, candidate_id: int, *, max_calls: int,
+                                      metadata: dict[str, Any]) -> dict[str, Any] | None:
+        """Persist budget consumption before an external call, including across restarts."""
+        with self._lock, self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute(
+                "SELECT * FROM chat_image_candidates WHERE id = ? AND status = 'auditing'",
+                (int(candidate_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            identity = dict(self._chat_candidate_row(row)['audit_identity_json'])
+            calls = int(identity.get('call_count', 0))
+            legacy = int(identity.get('legacy_attempt_count', row['attempt_count'] or 0))
+            used = calls + legacy
+            if used >= max(1, int(max_calls)):
+                return None
+            identity.update(metadata)
+            identity.update(call_count=calls + 1, budget_used=used + 1,
+                            legacy_attempt_count=legacy, next_retry_at='',
+                            last_error_category='', identity_state='pending')
+            conn.execute(
+                'UPDATE chat_image_candidates SET audit_identity_json = ?, updated_at = ? WHERE id = ?',
+                (self._audit_identity_dump(identity), utcnow_str(), int(candidate_id)),
+            )
+        return identity
+
     def complete_chat_image_candidate_audit(self, candidate_id: int, *, status: str, decision: str,
                                             provider: str, prompt_version: str,
                                             quality: dict[str, Any], flags: list[str],
-                                            reason: str, proposed_tag_ids: list[int]) -> None:
+                                            reason: str, proposed_tag_ids: list[int],
+                                            audit_identity: dict[str, Any] | None = None) -> None:
         now = utcnow_str()
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -4427,18 +4471,20 @@ class ImageIndexDB:
                 UPDATE chat_image_candidates SET
                     status = ?, audit_decision = ?, audit_provider = ?, audit_prompt_version = ?,
                     audit_quality_json = ?, audit_flags_json = ?, audit_reason = ?,
-                    proposed_tag_ids_json = ?, audited_at = ?, updated_at = ?
+                    proposed_tag_ids_json = ?, audited_at = ?, updated_at = ?,
+                    audit_identity_json = COALESCE(?, audit_identity_json)
                 WHERE id = ?
                 """,
                 (str(status), str(decision), str(provider), str(prompt_version),
                  json.dumps(quality or {}, ensure_ascii=False),
                  json.dumps(list(flags or []), ensure_ascii=False),
                  str(reason or '')[:1000], json.dumps([int(x) for x in proposed_tag_ids], ensure_ascii=False),
-                 now, now, int(candidate_id)),
+                 now, now, self._audit_identity_dump(audit_identity), int(candidate_id)),
             )
 
     def fail_chat_image_candidate_audit(self, candidate_id: int, *, error: str,
-                                        max_attempts: int = 3) -> str:
+                                        max_attempts: int = 3, retryable: bool = True,
+                                        audit_identity: dict[str, Any] | None = None) -> str:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 'SELECT attempt_count, error_log FROM chat_image_candidates WHERE id = ? LIMIT 1',
@@ -4447,14 +4493,14 @@ class ImageIndexDB:
             if row is None:
                 return 'audit_error'
             attempt_count = int(row['attempt_count'] or 0) + 1
-            status = 'audit_error' if attempt_count >= max(1, int(max_attempts)) else 'captured'
+            status = 'audit_error' if not retryable or attempt_count >= max(1, int(max_attempts)) else 'captured'
             history = str(row['error_log'] or '')
             entry = f"{utcnow_str()} {str(error)[:500]}"
             history = (history + '\n' + entry)[-2000:].strip()
             conn.execute(
                 'UPDATE chat_image_candidates SET status = ?, attempt_count = ?, error_log = ?, '
-                'updated_at = ? WHERE id = ?',
-                (status, attempt_count, history, utcnow_str(), int(candidate_id)),
+                'updated_at = ?, audit_identity_json = COALESCE(?, audit_identity_json) WHERE id = ?',
+                (status, attempt_count, history, utcnow_str(), self._audit_identity_dump(audit_identity), int(candidate_id)),
             )
         return status
 

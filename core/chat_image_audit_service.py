@@ -1,26 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from astrbot.api import logger
 
 from .llm_image_review_service import VALID_FLAGS, LlmImageReviewContractError
+from .chat_image_audit_trace import (
+    IMPLEMENTATION_VERSION, AuditContractError, classify_error, finite_number,
+    load_audit_json, shadow_identity,
+)
 
 AUDIT_DECISIONS = {"approve", "reject", "uncertain"}
 
 
 def _parse_score(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise LlmImageReviewContractError(f"quality.{field} 必须是数字")
-    return min(max(float(value), 0.0), 100.0)
+    return finite_number(value, field=f'quality.{field}', maximum=100, category='invalid_score')
 
 
 def _parse_confidence(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise LlmImageReviewContractError("confidence 必须是数字")
-    return min(max(float(value), 0.0), 1.0)
+    return finite_number(value, field='confidence', maximum=1, category='invalid_confidence')
 
 
 def build_audit_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -71,6 +75,8 @@ def build_audit_prompt(candidates: list[dict[str, Any]]) -> str:
         "不要收录，decision 用 reject。先确认画面中明确出现的角色，再评估质量；不确定用 uncertain。"
         "不能因为发色相似、只有一个角色、文件名或用户声称就确定角色。多角色、全员图都可以选；"
         "未出现在画面中的角色不要选。\n"
+        "每个角色提供 0～1 的 confidence（不是百分数）和简短 evidence（可见外观依据，最多80字）；"
+        "只写可见依据，不输出推理过程。不确定的细节不要编造。\n"
         "附加标签（团体/CP）只能从给定候选中选择：团体标签要求它的全部 member_ids 都已选中；"
         "CP 只选已有组合，普通两人同框不算 CP。\n"
         "第二步：质量评分 technical（清晰度/压缩/畸形/裁切）、aesthetic（构图色彩完成度）、"
@@ -82,7 +88,7 @@ def build_audit_prompt(candidates: list[dict[str, Any]]) -> str:
         f"候选：{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n"
         "只输出一个 JSON 对象，不要 Markdown、代码块或额外文字，格式："
         '{"quality":{"technical":0,"aesthetic":0,"gallery_fit":0,"overall":0,"flags":[]},'
-        f'"characters":[{{"tag_id":{example},"confidence":0.0}}],'
+        f'"characters":[{{"tag_id":{example},"confidence":0.0,"evidence":"简短可见依据"}}],'
         '"additional_tags":[],"decision":"approve|reject|uncertain","reason":"简短中文理由"}'
     )
 
@@ -91,12 +97,7 @@ def parse_audit_response(text: str, *, candidates: list[dict[str, Any]]) -> dict
     payload = build_audit_candidates(candidates)
     character_ids = {int(item['tag_id']) for item in payload['characters']}
     extras = {int(item['tag_id']): item for item in payload['additional']}
-    try:
-        data = json.loads(str(text or '').strip())
-    except json.JSONDecodeError as exc:
-        raise LlmImageReviewContractError("不是单个 JSON 对象") from exc
-    if not isinstance(data, dict):
-        raise LlmImageReviewContractError("顶层必须是 JSON 对象")
+    data, fence_removed = load_audit_json(text)
     quality_raw = data.get("quality")
     if not isinstance(quality_raw, dict):
         raise LlmImageReviewContractError("缺少 quality 对象")
@@ -113,7 +114,7 @@ def parse_audit_response(text: str, *, candidates: list[dict[str, Any]]) -> dict
         if not flag or flag in flags:
             continue
         if flag not in VALID_FLAGS:
-            raise LlmImageReviewContractError(f"未知质量 flag：{flag}")
+            raise AuditContractError(f"未知质量 flag：{flag[:80]}", 'invalid_flag')
         flags.append(flag)
     quality["flags"] = flags
 
@@ -121,17 +122,22 @@ def parse_audit_response(text: str, *, candidates: list[dict[str, Any]]) -> dict
     if not isinstance(characters_raw, list):
         raise LlmImageReviewContractError("characters 必须是数组")
     selected_characters: list[int] = []
+    identities: list[dict[str, Any]] = []
     for item in characters_raw:
         if not isinstance(item, dict):
             raise LlmImageReviewContractError("characters 项类型非法")
         tag_id = item.get("tag_id")
         if isinstance(tag_id, bool) or not isinstance(tag_id, int):
-            raise LlmImageReviewContractError("角色 tag_id 必须是整数")
+            raise AuditContractError("角色 tag_id 必须是整数", 'invalid_tag_id')
         if tag_id not in character_ids:
-            raise LlmImageReviewContractError(f"角色 tag_id {tag_id} 不在候选范围")
+            raise AuditContractError(f"角色 tag_id {tag_id} 不在候选范围", 'unknown_tag_id')
         if tag_id in selected_characters:
-            raise LlmImageReviewContractError("角色 tag_id 重复")
-        _parse_confidence(item.get("confidence"))
+            raise AuditContractError("角色 tag_id 重复", 'duplicate_tag_id')
+        confidence = _parse_confidence(item.get("confidence"))
+        evidence = item.get('evidence', '')
+        if not isinstance(evidence, str):
+            raise AuditContractError('角色 evidence 必须是文字', 'invalid_evidence')
+        identities.append({'tag_id': tag_id, 'confidence': confidence, 'evidence': evidence.strip()[:160]})
         selected_characters.append(tag_id)
 
     extras_raw = data.get("additional_tags", [])
@@ -145,23 +151,28 @@ def parse_audit_response(text: str, *, candidates: list[dict[str, Any]]) -> dict
             continue
         item = extras.get(value)
         if item is None:
-            raise LlmImageReviewContractError(f"附加标签 {value} 不在候选范围")
+            raise AuditContractError(f"附加标签 {value} 不在候选范围", 'unknown_tag_id')
         members = {int(x) for x in (item.get('member_ids') or [])}
         if members and not members.issubset(set(selected_characters)):
             continue
         selected_extras.append(value)
 
     decision = str(data.get("decision", "") or "").strip().lower()
+    model_decision = decision
     if decision not in AUDIT_DECISIONS:
         raise LlmImageReviewContractError("decision 必须是 approve、reject 或 uncertain")
     if decision == "approve" and (not selected_characters or flags):
         decision = "uncertain"
-    reason = str(data.get("reason", "") or "").strip()[:500]
-    if not reason:
-        raise LlmImageReviewContractError("reason 不能为空")
+    reason = data.get('reason', '')
+    if not isinstance(reason, str) or not reason.strip():
+        raise AuditContractError('reason 必须是非空文字', 'missing_reason')
+    reason = reason.strip()[:500]
     return {
         "quality": quality,
         "characters": selected_characters,
+        "identities": identities,
+        "model_decision": model_decision,
+        "fence_removed": fence_removed,
         "additional_tags": selected_extras,
         "proposed_tag_ids": [*selected_characters, *selected_extras],
         "decision": decision,
@@ -191,16 +202,30 @@ class ChatImageAuditService:
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
+        self._run_lock = asyncio.Lock()
 
     def enabled(self) -> bool:
         return bool(self.config.get("chat_image_collection_enabled", False))
 
     def provider_id(self) -> str:
-        return self.review_service.provider_id()
+        return str(self.config.get('chat_image_audit_provider_id', '') or '').strip() or self.review_service.provider_id()
 
     def prompt_version(self) -> str:
         value = str(self.config.get("chat_image_audit_prompt_version", "chat-v1") or "chat-v1").strip()
-        return value[:80] or "chat-v1"
+        return f'{value[:70] or "chat-v1"}/{IMPLEMENTATION_VERSION}'
+
+    def identity_mode(self) -> str:
+        value = str(self.config.get('chat_image_audit_identity_mode', 'shadow'))
+        return value if value in {'off', 'shadow'} else 'shadow'
+
+    def identity_threshold(self) -> float:
+        try:
+            value = float(self.config.get('chat_image_audit_identity_threshold', 0.93))
+            if math.isfinite(value) and 0 <= value <= 1:
+                return value
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return 0.93
 
     def interval_seconds(self) -> int:
         return min(max(15, int(self.config.get("chat_image_audit_interval_seconds", 60) or 60)), 3600)
@@ -259,6 +284,10 @@ class ChatImageAuditService:
                 continue
 
     async def run_once(self, max_runs: int | None = None) -> dict[str, int]:
+        async with self._run_lock:
+            return await self._run_once(max_runs)
+
+    async def _run_once(self, max_runs: int | None = None) -> dict[str, int]:
         summary = {"processed": 0, "audited": 0, "pending_webui": 0, "retried": 0, "failed": 0}
         if not self.enabled() or not self.provider_id():
             return summary
@@ -274,8 +303,9 @@ class ChatImageAuditService:
             try:
                 outcome = await self._process(candidate)
             except Exception as exc:
-                self._fail(int(candidate["id"]), f"审核异常：{self.review_service._sanitize_error(exc)}")
-                outcome = "retried"
+                category, retryable = classify_error(exc)
+                outcome = self._fail(int(candidate['id']), self.review_service._sanitize_error(exc),
+                                     category=category, retryable=retryable)
             if outcome == "audited":
                 summary["audited"] += 1
             elif outcome == "pending_webui":
@@ -294,19 +324,33 @@ class ChatImageAuditService:
 
     async def _process(self, candidate) -> str:
         candidate_id = int(candidate["id"])
+        trace = dict(candidate.get('audit_identity_json') or {})
+        trace.setdefault('call_count', 0)
+        trace.setdefault('legacy_attempt_count', int(candidate.get('attempt_count') or 0))
+        trace.update(schema_version=1, implementation_version=IMPLEMENTATION_VERSION,
+                     requested_provider=self.provider_id(), prompt_version=self.prompt_version(),
+                     profile_version='none', output_mode='prompt_json',
+                     identity_state='unknown', characters=[], next_retry_at='',
+                     shadow={'mode': self.identity_mode(), 'applied': False, 'suggested_action': 'unknown'})
         file_path = str(candidate.get("file_path") or "")
         if not file_path:
-            self._fail(candidate_id, "候选缺少本地图片路径")
-            return "retried"
+            return self._fail(candidate_id, '候选缺少本地图片路径',
+                              category='missing_file', retryable=False, trace=trace)
         try:
             preview = await asyncio.to_thread(
                 self.review_service._prepare_preview,
                 {"file_path": file_path, "sha256": str(candidate.get("content_sha256") or "")},
             )
         except Exception as exc:
-            self._fail(candidate_id, f"本地图片检查失败：{self.review_service._sanitize_error(exc)}")
-            return "retried"
+            category = 'missing_file' if isinstance(exc, FileNotFoundError) else 'preview_error'
+            return self._fail(candidate_id, f'本地图片检查失败：{self.review_service._sanitize_error(exc)}',
+                              category=category, retryable=False, trace=trace)
         if preview["blocking_flags"]:
+            trace.update(identity_state='not_evaluated', quality=dict(preview['quality']),
+                         model_decision=None, decision='uncertain', last_error_category='',
+                         call_count=int(trace.get('call_count', 0)))
+            trace['shadow'] = {'mode': self.identity_mode(), 'applied': False,
+                               'suggested_action': 'pending_review', 'reason': 'local_quality_gate'}
             self.db.complete_chat_image_candidate_audit(
                 candidate_id,
                 status="pending_webui",
@@ -317,11 +361,22 @@ class ChatImageAuditService:
                 flags=list(preview["blocking_flags"]),
                 reason="本地硬检查未通过：" + "、".join(preview["blocking_flags"]),
                 proposed_tag_ids=[],
+                audit_identity=trace,
             )
             return "pending_webui"
 
         candidates = self.candidate_tags_provider()
+        if not build_audit_candidates(candidates)['characters']:
+            return self._fail(candidate_id, '没有可用角色候选', category='no_candidates',
+                              retryable=False, trace=trace)
         prompt = build_audit_prompt(candidates)
+        trace['prompt_sha256'] = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        trace = self.db.reserve_chat_image_audit_call(
+            candidate_id, max_calls=self.review_service.max_attempts(), metadata=trace)
+        if trace is None:
+            return self._fail(candidate_id, '该候选已用完调用预算',
+                              category='budget_exhausted', retryable=False)
+        started = time.monotonic()
         try:
             response = await asyncio.wait_for(
                 self.context.llm_generate(
@@ -343,12 +398,37 @@ class ChatImageAuditService:
             ).strip()
             parsed = parse_audit_response(raw_text, candidates=candidates)
         except LlmImageReviewContractError as exc:
-            self._fail(candidate_id, f"模型结果不符合契约：{exc}")
-            return "retried"
+            category, retryable = classify_error(exc)
+            self._finish_call(trace, started, category=category)
+            return self._fail(candidate_id, f'模型结果不符合契约：{self.review_service._sanitize_error(exc)}',
+                              category=category, retryable=retryable, trace=trace)
         except Exception as exc:
-            self._fail(candidate_id, f"审核调用失败：{self.review_service._sanitize_error(exc)}")
-            return "retried"
+            category, retryable = classify_error(exc)
+            self._finish_call(trace, started, category=category)
+            return self._fail(candidate_id, f'审核调用失败：{self.review_service._sanitize_error(exc)}',
+                              category=category, retryable=retryable, trace=trace)
 
+        self._finish_call(trace, started)
+        trace.update(characters=parsed['identities'], quality=parsed['quality'],
+                     identity_state='recognized' if parsed['identities'] else 'unknown',
+                     model_decision=parsed['model_decision'], decision=parsed['decision'],
+                     fence_removed=parsed['fence_removed'], last_error_category='', retryable=False,
+                     shadow=shadow_identity(parsed, threshold=self.identity_threshold(), mode=self.identity_mode()))
+        usage = getattr(response, 'usage', None)
+        completion = getattr(response, 'raw_completion', None)
+        raw_usage = completion.get('usage') if isinstance(completion, dict) else getattr(completion, 'usage', None)
+        trace['usage'] = {}
+        if completion is None or raw_usage is not None:
+            for key, names in {'input_tokens': ('input_tokens', 'input'),
+                               'output_tokens': ('output_tokens', 'output'),
+                               'cached_input_tokens': ('input_cached',)}.items():
+                for name in names:
+                    value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        trace['usage'][key] = value
+                        break
+        model = completion.get('model') if isinstance(completion, dict) else getattr(completion, 'model', None)
+        trace['reported_model'] = str(model)[:120] if model else None
         status = "audited" if parsed["decision"] == "approve" else "pending_webui"
         self.db.complete_chat_image_candidate_audit(
             candidate_id,
@@ -360,15 +440,44 @@ class ChatImageAuditService:
             flags=list(parsed["quality"]["flags"]),
             reason=parsed["reason"],
             proposed_tag_ids=list(parsed["proposed_tag_ids"]),
+            audit_identity=trace,
         )
         return status
 
-    def _fail(self, candidate_id: int, error: str) -> str:
+    @staticmethod
+    def _finish_call(trace: dict[str, Any], started: float, *, category: str = '') -> None:
+        elapsed = max(0, round((time.monotonic() - started) * 1000))
+        trace['last_call_ms'] = elapsed
+        trace['total_call_ms'] = int(trace.get('total_call_ms', 0)) + elapsed
+        history = list(trace.get('attempts') or [])[-3:]
+        history.append({'call': trace['call_count'], 'elapsed_ms': elapsed,
+                        'error_category': category, 'outcome': 'error' if category else 'parsed',
+                        'completed_at': datetime.now(timezone.utc).isoformat(timespec='seconds')})
+        trace['attempts'] = history
+
+    def _fail(self, candidate_id: int, error: str, *, category: str = 'provider_error',
+              retryable: bool = True, trace: dict[str, Any] | None = None) -> str:
+        if trace is None:
+            row = self.db.get_chat_image_candidate(candidate_id)
+            trace = dict((row or {}).get('audit_identity_json') or {})
+        used = int(trace.get('budget_used', trace.get('call_count', 0)))
+        retryable = retryable and used < self.review_service.max_attempts()
+        trace.update(schema_version=1, identity_state='error',
+                     last_error_category=category, retryable=retryable)
+        delay = min(600, self.interval_seconds() * (2 ** min(max(used - 1, 0), 3)))
+        if category == 'rate_limit':
+            delay = max(delay, 120)
+        trace['next_retry_at'] = (
+            (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec='seconds')
+            if retryable else ''
+        )
         status = self.db.fail_chat_image_candidate_audit(
             candidate_id,
             error=error,
             max_attempts=self.review_service.max_attempts(),
+            retryable=retryable,
+            audit_identity=trace,
         )
         if status == "audit_error":
             logger.warning("[PJSKPic] 群聊候选审核失败 candidate=%s error=%s", candidate_id, error)
-        return status
+        return 'retried' if status == 'captured' else 'failed'
