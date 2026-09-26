@@ -183,6 +183,55 @@ class ParseCorrectionTests(unittest.TestCase):
 
 
 class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
+    async def test_multiselect_skip_and_numbering(self):
+        ids = [self.make_image(name, 'sha-' + name) for name in ('a.png', 'b.png', 'c.png')]
+        self.importer = FakeImporter({name: (image_id, 'sha-' + name) for name, image_id in zip(('a.png', 'b.png', 'c.png'), ids)})
+        bot = FakeBot()
+        service = self.make_service(bot)
+        rows = [self.make_audited(name) for name in ('a.png', 'b.png', 'c.png')]
+        await service.run_once()
+        async def reply(text):
+            return await service.handle_reply(Event([{'type': 'reply', 'data': {'id': '555'}}], message_str=text, bot=bot))
+        self.assertTrue(await reply('收1、9'))
+        self.assertEqual([], self.importer.calls)
+        self.assertTrue(await reply('收1、3、1'))
+        self.assertEqual(['a.png', 'c.png'], self.importer.calls)
+        receipt = bot.sent[-1][1][-1]['data']['text']
+        self.assertIn(f'第3张 → 图片 ID：#{ids[2]}', receipt)
+        self.assertIn('还有 1 张', receipt)
+        self.assertTrue(await reply('跳过2'))
+        self.assertEqual('rejected', self.db.get_chat_image_candidate(rows[1]['id'])['status'])
+        self.assertEqual(['a.png', 'c.png'], self.importer.calls)
+
+    async def test_this_image_correction_and_ambiguous_batch(self):
+        image_id = self.make_image('a.png', 'sha-a')
+        self.importer = FakeImporter({'a.png': (image_id, 'sha-a')})
+        bot = FakeBot()
+        service = self.make_service(bot)
+        row = self.make_audited('a.png')
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '555'}}], message_str='这张是白石杏和小豆泽心羽，收了', bot=bot)
+        self.assertTrue(await service.handle_reply(event))
+        self.assertEqual([self.tag_an, self.tag_kohane], self.db.get_chat_image_candidate(row['id'])['confirmed_tag_ids_json'])
+        bot.message_id = 556
+        for name in ('b.png', 'c.png'):
+            self.make_audited(name)
+        await service.run_once()
+        event = Event([{'type': 'reply', 'data': {'id': '556'}}], message_str='这张是白石杏，收了', bot=bot)
+        self.assertTrue(await service.handle_reply(event))
+        self.assertEqual(['a.png'], self.importer.calls)
+        self.assertIn('明确编号', bot.sent[-1][1][-1]['data']['text'])
+
+    async def test_collect_all_alias_with_custom_accept_words(self):
+        image_id = self.make_image('a.png', 'sha-a')
+        self.importer = FakeImporter({'a.png': (image_id, 'sha-a')})
+        bot = FakeBot()
+        service = self.make_service(bot, config={'chat_image_confirm_accept_words': '确定'})
+        self.make_audited('a.png')
+        await service.run_once()
+        self.assertTrue(await service.handle_reply(Event([{'type': 'reply', 'data': {'id': '555'}}], message_str='收全部', bot=bot)))
+        self.assertEqual(['a.png'], self.importer.calls)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = db_module.ImageIndexDB(Path(self.tmp.name) / "test.db")
@@ -373,8 +422,8 @@ class ChatImageConfirmTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("approved_written", corrected["status"])
         self.assertEqual([self.tag_an], corrected["confirmed_tag_ids_json"])
         peer = self.db.get_chat_image_candidate(int(first["id"]))
-        self.assertEqual("approved_written", peer["status"])
-        self.assertEqual([self.tag_an, self.tag_kohane, self.tag_pair], peer["confirmed_tag_ids_json"])
+        self.assertEqual("asked", peer["status"])
+        self.assertEqual([], peer["confirmed_tag_ids_json"])
         detail = self.db.get_image_detail(image_b, sync_files=False)
         self.assertEqual({"白石杏"}, {tag["name"] for tag in detail["tags"]})
 

@@ -55,7 +55,7 @@ class PJSKPicPlugin(Star):
     OPEN_REVIEW_STATUSES = ("pending", "uncertain", "rejected")
     SENDABLE_REVIEW_STATUSES = {"approved", "manual_approved"}
     DIRECT_IMAGE_ID_PATTERN = re.compile(
-        r"^\s*(?:看看|看下|看一看|看一下|看)\s*(?:(?:图片|图)\s*)?(?:id|编号|#)\s*(?:[:：#号=为是-]\s*)?([0-9０-９]+)\s*(?:的?(?:图片|图))?\s*$",
+        r"^\s*(?:看看|看下|看一看|看一下|看)\s*(?:(?:图片|图)\s*(?:(?:id|编号|#)\s*)?|(?:id|编号|#)\s*)(?:[:：#号=为是-]\s*)?([0-9０-９]+)\s*(?:的?(?:图片|图))?\s*$",
         re.IGNORECASE,
     )
 

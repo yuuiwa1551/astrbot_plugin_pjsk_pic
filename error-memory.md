@@ -24,3 +24,10 @@
 - Fix: 改用 UTF8 Base64 的 eval -b，明确 source workdir，9 项检查成功且清除 QA 标注
 - Prevention: 浏览器检查必须有明确断言返回；仓库命令显式设置工作目录
 - Evidence: eval -b 返回 checks=9 verified=0
+### 2026-09-27 00:06:22 - QQ交互30期验证
+
+- Symptom: 文档命令提示测试因 staging 缺 README 失败
+- Root cause: 仅复制了 core main tests，遗漏测试依赖文档
+- Fix: 补齐 README 和配置再重跑该测试
+- Prevention: 运行测试前检查其外部文件依赖，rg 搜索使用目录加 -g 参数
+- Evidence: FileNotFoundError /tmp/pjsk-qq30/README.md

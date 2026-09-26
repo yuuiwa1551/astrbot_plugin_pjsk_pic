@@ -19,7 +19,7 @@ CORRECTION_PATTERN = re.compile(
     r'^第\s*([0-9０-９一二三四五六七八九十两]+)\s*张\s*(?:是|改成|改为|换成|[:：])\s*(.+)$'
 )
 CORRECTION_HINT_PATTERN = re.compile(r'^第\s*.{1,6}?\s*张')
-DEFAULT_ACCEPT_WORDS = ('确认', '对', '可以', '没问题', '收', '全部收', '全部确认')
+DEFAULT_ACCEPT_WORDS = ('确认', '对', '可以', '没问题', '收', '全部收', '收全部', '全部确认')
 DEFAULT_REJECT_WORDS = ('不要', '不对', '拒绝', '不收')
 _STRIP_CHARS = ' \t\u3000。．.!！~～?？,，、;；:：'
 _NUMBER_CHARS = {
@@ -61,7 +61,7 @@ def _parse_index(raw: str) -> int | None:
 
 
 def _split_tag_names(raw: str) -> list[str]:
-    parts = re.split(r'[、，,／/|;；]+', str(raw or ''))
+    parts = re.split(r'[、，,／/|;；和]+', str(raw or ''))
     names = []
     for part in parts:
         name = part.strip()
@@ -71,7 +71,8 @@ def _split_tag_names(raw: str) -> list[str]:
 
 
 def parse_correction(text: str) -> tuple[int, list[str]] | None:
-    match = CORRECTION_PATTERN.match(str(text or '').strip())
+    text = re.sub(r'[，,、\s]*(?:收了|收录|收吧|收)$', '', str(text or '').strip(_STRIP_CHARS))
+    match = CORRECTION_PATTERN.match(text)
     if not match:
         return None
     index = _parse_index(match.group(1))
@@ -83,6 +84,16 @@ def parse_correction(text: str) -> tuple[int, list[str]] | None:
 
 def looks_like_correction(text: str) -> bool:
     return bool(CORRECTION_HINT_PATTERN.match(str(text or '').strip()))
+
+
+def parse_selection(text: str) -> tuple[str, list[int]] | None:
+    """Only explicit lists; validate all indices before mutating any candidate."""
+    match = re.fullmatch(r'(收|确认|跳过|不收)\s*((?:第?\s*[0-9０-９一二三四五六七八九十两]+\s*张?)(?:\s*[、，,]\s*第?\s*[0-9０-９一二三四五六七八九十两]+\s*张?)*)', text.strip(_STRIP_CHARS))
+    if not match:
+        return None
+    indices = [_parse_index(re.sub(r'[第张\s]', '', part)) or 0
+               for part in re.split(r'[、，,]', match.group(2))]
+    return ('skip' if match.group(1) in {'跳过', '不收'} else 'collect', list(dict.fromkeys(indices)))
 
 
 class ChatImageConfirmService:
@@ -275,8 +286,8 @@ class ChatImageConfirmService:
                 {'type': 'image', 'data': {'file': f'base64://{encoded}'}},
             ])
         segments.append({'type': 'text', 'data': {'text': (
-            '\n回复「确认」或「全部收」收录本批；回复「收第2张」只收对应图片。\n'
-            '要改请回复「第2张是<tag名>」（更正该张并确认本批剩余图片）；回复「不要」取消剩余图片。\n'
+            '\n回复「收全部」收录剩余图片；「收1、3」多选；「跳过2」忽略指定图片。\n'
+            '更正并只收该张：「第2张是角色A和角色B，收了」；单图可说「这张是…，收了」。回复「不要」取消剩余图片。\n'
             f'{self.timeout_hours()} 小时内未回复会自动转入待审。\n确认批次：{token}'
         )}})
         ok, message_id = await self._send_group(
@@ -405,8 +416,8 @@ class ChatImageConfirmService:
         elif at_self:
             batch = self.db.find_single_asked_chat_image_batch(session_id, sender_id)
             if not batch and (self.db.find_latest_asked_chat_image_candidates(session_id, sender_id)):
-                if (_normalize_text(text) in self.accept_words() | self.reject_words()
-                        or SELECT_PATTERN.match(text) or looks_like_correction(text)):
+                if (_normalize_text(text) in self.accept_words() | self.reject_words() | {'收全部'}
+                        or parse_selection(text) or looks_like_correction(text) or text.startswith('这张')):
                     await self._send_group(session_id, f'{CONFIRM_HEADER}有多批图片待确认，请引用对应的带图确认消息回复。')
                     return True
         if not batch:
@@ -421,26 +432,39 @@ class ChatImageConfirmService:
 
     async def _apply_reply(self, event, batch: list[dict[str, Any]], text: str,
                            sender_id: str) -> bool:
+        if text.startswith('这张'):
+            if len(batch) != 1:
+                await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}本批有多张图片，请明确编号，例如「第2张是角色名，收了」。')
+                return True
+            text = '第1张' + text[2:]
         correction = parse_correction(text)
         if correction is not None:
             await self._apply_correction(event, batch, correction, sender_id)
             return True
         normalized = _normalize_text(text)
         if normalized in self.reject_words():
-            self.db.mark_chat_image_candidates_rejected(
+            count = self.db.mark_chat_image_candidates_rejected(
                 [int(row['id']) for row in batch], user_id=sender_id)
+            await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}已取消剩余 {count} 张。')
             return True
-        selection = SELECT_PATTERN.match(str(text).strip(_STRIP_CHARS))
-        if normalized in self.accept_words() or selection:
+        selection = parse_selection(text)
+        if normalized in self.accept_words() or normalized == '收全部' or selection:
             selected = batch
             if selection:
-                index = _parse_index(selection.group(1)) or 0
-                if index < 1 or index > len(batch):
-                    await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}本批共 {len(batch)} 张，没有第 {index} 张。')
+                action, indices = selection
+                if any(index < 1 or index > len(batch) for index in indices):
+                    await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}本批共 {len(batch)} 张，编号有误，本次未作修改。')
                     return True
-                selected = [batch[index - 1]]
-                if selected[0].get('status') != 'asked':
-                    await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}第 {index} 张已处理，无需重复确认。')
+                selected = [batch[index - 1] for index in indices]
+                if action == 'skip':
+                    pending = [row for row in selected if row.get('status') == 'asked']
+                    self.db.mark_chat_image_candidates_rejected([int(row['id']) for row in pending], user_id=sender_id)
+                    labels = '、'.join(str(row['_confirm_index']) for row in pending)
+                    remaining = sum(row.get('status') == 'asked' for row in batch) - len(pending)
+                    await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}' + (f'已跳过第{labels}张；本批剩余 {remaining} 张待确认。' if pending else '所选图片已处理。'))
+                    return True
+                if not any(row.get('status') == 'asked' for row in selected):
+                    await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}所选图片已处理，无需重复确认。')
                     return True
             selected = [row for row in selected if row.get('status') == 'asked']
             ids = [int(row['id']) for row in selected]
@@ -474,11 +498,7 @@ class ChatImageConfirmService:
                 int(target['id']), corrected_tag_ids=tag_ids, user_id=sender_id):
             await self._send_group(str(event.unified_msg_origin), f'{CONFIRM_HEADER}第 {index} 张已处理，无需重复更正。')
             return
-        selected = [row for row in batch if row.get('status') == 'asked']
-        peers = [int(row['id']) for row in selected if int(row['id']) != int(target['id'])]
-        if peers:
-            self.db.mark_chat_image_candidates_confirmed(peers, user_id=sender_id)
-        await self._write_batch(self._refresh_selected(selected), user_id=sender_id)
+        await self._write_batch(self._refresh_selected([target]), user_id=sender_id)
 
     def _refresh_selected(self, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
         fresh = []
@@ -614,6 +634,13 @@ class ChatImageConfirmService:
         if not lines:
             lines.append("【收图回执】本批没有可收录的图片。")
         confirm_id = str(candidate.get('confirm_message_id') or '')
+        if written:
+            lines.append(f'查看图片：看图{written[0][2]}（沿用图库查看权限）')
+        if confirm_id:
+            remaining = self.db.find_chat_image_candidates_by_confirm(confirm_id, sender_id=str(candidate.get('sender_id') or ''), session_id=str(candidate.get('session_id') or ''), include_resolved=True)
+            pending = sum(row.get('status') == 'asked' for row in remaining)
+            if pending:
+                lines.append(f'本批还有 {pending} 张待确认；请继续引用原带图消息回复。')
         segments = [{'type': 'reply', 'data': {'id': confirm_id}}] if confirm_id.isdigit() else []
         segments.append({'type': 'text', 'data': {'text': '\n'.join(lines)}})
         await self._send_group(str(candidate.get('session_id') or ''), '\n'.join(lines),
