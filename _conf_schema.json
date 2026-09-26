@@ -100,6 +100,12 @@
     "options": ["shadow", "off"],
     "default": "shadow"
   },
+  "chat_image_audit_profile_mode": {
+    "type": "string",
+    "description": "角色文字档案提示：off 保持原提示词；text 使用已核对的常见造型参考。默认关闭，需人工样本对照验收后启用。不会发送参考图或增加模型调用。",
+    "options": ["off", "text"],
+    "default": "off"
+  },
   "chat_image_audit_identity_threshold": {
     "type": "float",
     "description": "群聊身份置信度的旁路观察阈值（0-1），独立于图库审核阈值；不是校准后的正确率，不用于自动收录。",

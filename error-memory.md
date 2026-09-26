@@ -14,3 +14,13 @@
 - 原因：新增历史补图直接附加远程 URL，未复用 resolved_path，也未在发送前解析图片数据。
 - 修复：历史图先用本地缓存或下载解析成 data URI；不可用历史图跳过，当前 image_urls 不改；入库复用解析后的本地文件。
 - 验证：真实 AstrBot MediaResolver 对本地原图成功生成 data URI；坏历史图不再进入请求，当前图片参数不变。未调用模型或写入正式图库。
+
+## Error Postmortems
+
+### 2026-09-26 23:46:44 - B 阶段离线标注 QA
+
+- Symptom: PowerShell 管道传 agent-browser eval --stdin 只返回 null，未执行预期检查；一次读取省略 workdir 导致路径错误
+- Root cause: 本机 stdin 传递与默认旧工作目录不能作为可靠前提
+- Fix: 改用 UTF8 Base64 的 eval -b，明确 source workdir，9 项检查成功且清除 QA 标注
+- Prevention: 浏览器检查必须有明确断言返回；仓库命令显式设置工作目录
+- Evidence: eval -b 返回 checks=9 verified=0

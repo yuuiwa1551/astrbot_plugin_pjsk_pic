@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -217,6 +218,26 @@ class AuditParseTests(unittest.TestCase):
 
 
 class AuditServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_profile_modes_preserve_call_count_and_trace_version(self):
+        for mode in ('off', 'text'):
+            candidate = self.make_candidate(ref=mode)
+            service, context = self.make_service()
+            service.config['chat_image_audit_profile_mode'] = mode
+            await service.run_once()
+            trace = self.db.get_chat_image_candidate(candidate['id'])['audit_identity_json']
+            self.assertEqual(1, context.calls)
+            self.assertEqual(mode == 'off', trace['profile_version'] == 'none')
+
+    async def test_invalid_profile_stops_before_model_call(self):
+        candidate = self.make_candidate()
+        service, context = self.make_service()
+        service.config['chat_image_audit_profile_mode'] = 'text'
+        with patch.object(audit_module, 'build_profile_context', side_effect=ValueError('bad profile')):
+            await service.run_once()
+        trace = self.db.get_chat_image_candidate(candidate['id'])['audit_identity_json']
+        self.assertEqual('profile_config', trace['last_error_category'])
+        self.assertEqual(0, context.calls)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = db_module.ImageIndexDB(Path(self.tmp.name) / "test.db")
