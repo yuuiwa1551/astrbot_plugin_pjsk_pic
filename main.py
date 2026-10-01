@@ -5,6 +5,7 @@ import re
 import sys
 import shutil
 import unicodedata
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import ProviderRequest
 from .core.chat_image_context import ChatImageContext
+from .core.gallery_contact_sheet import parse_contact_query, render_contact_sheet
 
 from .core import (
     AutoCrawlService,
@@ -62,6 +64,7 @@ class PJSKPicPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.config = config
+        self._contact_sheet_lock = asyncio.Lock()
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_pjsk_pic")
         self.db = ImageIndexDB(self.data_dir / "image_index.db")
         self.pixiv_client = PixivAppClient(config)
@@ -1043,8 +1046,49 @@ class PJSKPicPlugin(Star):
             return "send_failed"
         return None
 
+    async def _send_contact_sheet(self, event, query: str):
+        match = self.db.resolve_tag(query, allow_fuzzy=False)
+        if not match.matched:
+            await event.send(MessageChain().message(f'没有精确找到角色或别名：{query}'))
+            return
+        tag = self.db.get_tag_row_by_id(int(match.tag_id))
+        if not tag or str(tag['status']) != 'active':
+            await event.send(MessageChain().message('这个标签当前未启用。'))
+            return
+        if self._contact_sheet_lock.locked():
+            await event.send(MessageChain().message('正在生成另一张图库长图，请稍后重试。'))
+            return
+        async with self._contact_sheet_lock:
+            rows = await asyncio.to_thread(self.db.list_sendable_images_for_tag, int(match.tag_id))
+            if not rows:
+                await event.send(MessageChain().message(f'{match.tag_name} 暂无已通过审核的可发送图片。'))
+                return
+            path = self.data_dir / 'contact_sheets' / f'{uuid.uuid4().hex}.png'
+            await event.send(MessageChain().message(f'正在生成 {match.tag_name} 的全部 {len(rows)} 张缩略图，合成一张长图。'))
+            task = asyncio.create_task(asyncio.to_thread(render_contact_sheet, rows, path))
+            try:
+                try:
+                    result = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    await task
+                    raise
+                await event.send(MessageChain().file_image(str(path)))
+                note = f'；{result["missing"]} 张文件不可读，已保留 ID 占位' if result['missing'] else ''
+                await event.send(MessageChain().message(
+                    f'{match.tag_name}｜共 {len(rows)} 张{note}。小图下方为图库 ID；发送「看图1234」查看大图（沿用查看权限）。'))
+            except Exception:
+                logger.error('[PJSKPic] 图库长图生成或发送失败', exc_info=True)
+                await event.send(MessageChain().message('长图生成或发送失败，未拆页或减少结果。请稍后重试或联系管理员检查图片发送限制。'))
+            finally:
+                path.unlink(missing_ok=True)
+
     @filter.regex(r"^(?!(?:看看|看下|看一看|看一下|看)\s*[0-9０-９]+\s*$)(?:看看|看下|看一看|看一下|看|来张|来一张|发一张|来点).+", priority=sys.maxsize)
     async def send_image_by_natural_language(self, event: AstrMessageEvent):
+        contact_query = parse_contact_query(event.message_str)
+        if contact_query:
+            await self._send_contact_sheet(event, contact_query)
+            event.stop_event()
+            return
         if await self._handle_direct_image_id_message(event):
             event.stop_event()
             return

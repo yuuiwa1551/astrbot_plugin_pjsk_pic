@@ -31,3 +31,10 @@
 - Fix: 补齐 README 和配置再重跑该测试
 - Prevention: 运行测试前检查其外部文件依赖，rg 搜索使用目录加 -g 参数
 - Evidence: FileNotFoundError /tmp/pjsk-qq30/README.md
+### 2026-10-01 12:00:01 - 31期长图目录测试
+
+- Symptom: 测试手工插入 image_tags 时缺少必填字段
+- Root cause: fixture 未完整对照 source_type 和 updated_at 约束
+- Fix: 补全 fixture 必填字段后全部通过
+- Prevention: 手工SQL fixture 按实际表定义填写全部 NOT NULL 列
+- Evidence: 5项测试通过，真实框架单图发送 smoke 通过

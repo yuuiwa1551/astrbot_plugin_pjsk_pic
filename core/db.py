@@ -3964,6 +3964,15 @@ class ImageIndexDB:
                 'old_name_promoted_to_alias': old_name_promoted_to_alias,
             }
 
+    def list_sendable_images_for_tag(self, tag_id: int) -> list[dict[str, Any]]:
+        placeholders = ','.join('?' for _ in APPROVED_STATUSES)
+        with self._lock, self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                f"SELECT DISTINCT i.id, i.file_path FROM images i JOIN image_tags it ON it.image_id=i.id "
+                f"WHERE it.tag_id=? AND i.is_active=1 AND it.review_status IN ({placeholders}) ORDER BY i.id",
+                (int(tag_id), *APPROVED_STATUSES),
+            ).fetchall()]
+
     def get_random_image_for_tag(self, tag_id: int, excluded_image_ids: list[int] | None = None) -> sqlite3.Row | None:
         excluded_image_ids = excluded_image_ids or []
         approved_placeholder = ','.join('?' for _ in APPROVED_STATUSES)
