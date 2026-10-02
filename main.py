@@ -18,6 +18,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import ProviderRequest
 from .core.chat_image_context import ChatImageContext
 from .core.gallery_contact_sheet import parse_contact_query, render_contact_sheet
+from .core.review_grid_service import ReviewGridService
 
 from .core import (
     AutoCrawlService,
@@ -154,6 +155,8 @@ class PJSKPicPlugin(Star):
         self.tag_governance_service = TagGovernanceService(self.db)
         self.submission_notify_service = SubmissionNotifyService(context, self.db, config)
         self.qq_review_service = QQReviewSessionService(self.db, config)
+        self.review_grid_service = ReviewGridService(
+            self.db, self.qq_review_service, config, self.data_dir, self._resolve_qq_review_tag)
         self.webui = GalleryWebUI(
             self.db,
             self.crawl_service,
@@ -181,6 +184,9 @@ class PJSKPicPlugin(Star):
 
     @event_filter.event_message_type(event_filter.EventMessageType.ALL, priority=sys.maxsize)
     async def capture_gallery_images(self, event: AstrMessageEvent):
+        if await self.review_grid_service.handle_reply(event):
+            event.stop_event()
+            return
         if not self._chat_collection_allowed(event):
             return
         if str(event.get_sender_id()) == str(event.get_self_id()):
@@ -241,6 +247,7 @@ class PJSKPicPlugin(Star):
         await self.chat_image_audit_service.stop()
         await self.chat_image_intake.stop()
         await self.qq_review_service.clear()
+        await self.review_grid_service.clear()
         await self.webui.stop()
         await self.llm_image_review_service.stop()
         await self.xhs_backfill_service.stop()
@@ -1084,6 +1091,9 @@ class PJSKPicPlugin(Star):
 
     @filter.regex(r"^(?!(?:看看|看下|看一看|看一下|看)\s*[0-9０-９]+\s*$)(?:看看|看下|看一看|看一下|看|来张|来一张|发一张|来点).+", priority=sys.maxsize)
     async def send_image_by_natural_language(self, event: AstrMessageEvent):
+        if await self.review_grid_service.handle_reply(event):
+            event.stop_event()
+            return
         contact_query = parse_contact_query(event.message_str)
         if contact_query:
             await self._send_contact_sheet(event, contact_query)
@@ -2228,6 +2238,14 @@ class PJSKPicPlugin(Star):
                 ]
             )
         )
+
+    @pjsk_gallery.command("审图列表")
+    async def open_review_grid(self, event: AstrMessageEvent, platform_or_tag: str = '', candidate_tag: str = ''):
+        try:
+            await self.review_grid_service.start(event, platform_or_tag, candidate_tag)
+        except Exception:
+            logger.error('[PJSKPic] 九宫格打开失败', exc_info=True)
+            await event.send(MessageChain().message('九宫格生成或发送失败，请稍后重试。'))
 
     @pjsk_gallery.command("随机审核", alias={"抽审"})
     async def claim_random_qq_review(

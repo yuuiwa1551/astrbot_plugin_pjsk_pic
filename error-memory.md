@@ -38,3 +38,10 @@
 - Fix: 补全 fixture 必填字段后全部通过
 - Prevention: 手工SQL fixture 按实际表定义填写全部 NOT NULL 列
 - Evidence: 5项测试通过，真实框架单图发送 smoke 通过
+### 2026-10-02 23:26:08 - 33期九宫格文档回归
+
+- Symptom: 命令前缀检查将角色/alias占位描述识别为斜杠命令
+- Root cause: 文档使用斜杠分隔占位选项触发仓库现有词法检查
+- Fix: 占位描述改成角色或alias后重跑文档检查
+- Prevention: QQ指令帮助中的占位选项使用或，保留统一点号前缀
+- Evidence: 其余44项测试通过，唯一失败是README命令示例行

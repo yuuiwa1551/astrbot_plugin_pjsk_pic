@@ -281,3 +281,38 @@ class QQReviewSessionService:
             self._sessions.clear()
             self._claims.clear()
             self._recent.clear()
+
+    async def apply_grid_review(self, *, origin: str, reviewer_id: str, image_id: int,
+                                platform: str, expected_version: str, tag_name: str = '',
+                                reject: bool = False, reason: str = '') -> tuple[bool, dict[str, Any]]:
+        """Share the random-review claim lock, keeping its existing session intact."""
+        async with self._lock:
+            self._cleanup_expired_locked()
+            key = self.make_session_key(origin, reviewer_id)
+            if not self.config.get('qq_review_enabled', True):
+                return False, {'code': 'disabled', 'message': '群友审图当前未启用。'}
+            owner = self._claims.get(image_id)
+            if owner is not None and owner != key:
+                return False, {'code': 'claimed', 'message': '这张图正在被其他人领取审核，请稍后再试。'}
+            audit_reason = f'QQ 九宫格 {reviewer_id} 人工' + ('拒绝' if reject else '审核通过')
+            if reason:
+                audit_reason += '：' + reason[:200]
+            if reject:
+                operation = lambda: self.db.reject_image_source(
+                    image_id, platform=platform, reason=audit_reason, require_open_review=True,
+                    expected_review_version=expected_version)
+            else:
+                operation = lambda: self.db.apply_image_review(
+                    image_id, selected_tag_names=[tag_name], source_terms=[], platform=platform,
+                    reason=audit_reason, reject_unselected=True, require_open_review=True,
+                    expected_review_version=expected_version)
+            # Cancellation must not release the claim lock while the transaction still runs.
+            task = asyncio.create_task(asyncio.to_thread(operation))
+            try:
+                result = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+            if result[0] and owner == key:
+                self._release_locked(key, remember=True)
+            return result
