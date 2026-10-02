@@ -4834,7 +4834,7 @@ class ImageIndexDB:
         now = utcnow_str()
         rejected_reason = str(reason or '').strip() or f'{platform_text} 人工拒绝图片'
         with self._lock, self._connect() as conn:
-            if require_open_review or expected_review_version is not None:
+            if require_open_review or expected_review_version is not None or platform_text == 'all':
                 conn.execute('BEGIN IMMEDIATE')
             if expected_review_version is not None and self._review_grid_snapshot_conn(
                     conn, int(image_id), platform_text)['version'] != expected_review_version:
@@ -4853,27 +4853,30 @@ class ImageIndexDB:
                         'code': 'stale_review',
                         'image_id': int(image_id),
                     }
-            source = conn.execute(
+            source_rows = conn.execute(
                 """
-                SELECT post_url
+                SELECT post_url, platform
                 FROM sources
-                WHERE image_id = ? AND platform = ?
+                WHERE image_id = ? AND ((? = 'all' AND platform IN ('pixiv','xiaohongshu')) OR platform = ?)
                 ORDER BY id DESC
-                LIMIT 1
                 """,
-                (int(image_id), platform_text),
-            ).fetchone()
-            if not source:
+                (int(image_id), platform_text, platform_text),
+            ).fetchall()
+            if platform_text != 'all':
+                source_rows = source_rows[:1]
+            if not source_rows:
                 return False, {'message': f'图片 #{image_id} 没有 {platform_text} 来源记录。'}
-
-            rejected_source = self._upsert_rejected_source_conn(
-                conn,
-                platform=platform_text,
-                post_url=str(source['post_url'] or ''),
-                image_id=int(image_id),
-                reason=rejected_reason,
-                now=now,
-            )
+            source = source_rows[0]
+            seen_sources = set()
+            rejected_sources = []
+            for item in source_rows:
+                key = (item['platform'], self.normalize_source_post_url(item['platform'], item['post_url']))
+                if key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                rejected_sources.append(self._upsert_rejected_source_conn(
+                    conn, platform=item['platform'], post_url=str(item['post_url'] or ''),
+                    image_id=int(image_id), reason=rejected_reason, now=now))
             tasks = conn.execute(
                 """
                 SELECT rt.id, t.name AS tag_name
@@ -4903,7 +4906,7 @@ class ImageIndexDB:
         return True, {
             'message': f'已拒绝图片 #{image_id}，后续 {platform_text} 来源搜图会跳过该作品',
             'image_id': int(image_id),
-            'post_url': str(rejected_source['normalized_post_url'] or source['post_url']),
+            'post_url': str(rejected_sources[0]['normalized_post_url'] or source['post_url']),
             'rejected_tasks': [str(row['tag_name']) for row in tasks],
             'rejected_tag_links': int(cursor.rowcount if cursor.rowcount is not None else 0),
         }
@@ -6350,6 +6353,13 @@ class ImageIndexDB:
         return split_status_filter(statuses or ["pending", "uncertain"])
 
     @staticmethod
+    def _review_source_clause(platform: str, *, exclude_rejected: bool = False) -> tuple[str, list[Any]]:
+        selector = "s.platform IN ('pixiv','xiaohongshu')" if platform == 'all' else 's.platform=?'
+        blocked = (" AND NOT EXISTS(SELECT 1 FROM rejected_sources rs WHERE rs.image_id=i.id AND rs.platform=s.platform)"
+                   if exclude_rejected or platform == 'all' else '')
+        return f'EXISTS(SELECT 1 FROM sources s WHERE s.image_id=i.id AND {selector}{blocked})', ([] if platform == 'all' else [platform])
+
+    @staticmethod
     def _review_grid_snapshot_conn(conn: sqlite3.Connection, image_id: int, platform: str) -> dict[str, Any]:
         image = conn.execute('SELECT * FROM images WHERE id=?', (image_id,)).fetchone()
         tasks = [dict(r) for r in conn.execute(
@@ -6357,17 +6367,23 @@ class ImageIndexDB:
             'WHERE rt.image_id=? ORDER BY rt.id', (image_id,))]
         links = [dict(r) for r in conn.execute('SELECT * FROM image_tags WHERE image_id=? ORDER BY id', (image_id,))]
         sources = [dict(r) for r in conn.execute('SELECT * FROM sources WHERE image_id=? ORDER BY id', (image_id,))]
-        blocked = [dict(r) for r in conn.execute('SELECT * FROM rejected_sources WHERE image_id=? AND platform=? ORDER BY id', (image_id, platform))]
+        blocked = [dict(r) for r in conn.execute(
+            "SELECT * FROM rejected_sources WHERE image_id=? AND ((?='all' AND platform IN ('pixiv','xiaohongshu')) OR platform=?) ORDER BY id",
+            (image_id, platform, platform))]
         state = {'image': dict(image) if image else None, 'tasks': tasks, 'links': links, 'sources': sources, 'blocked': blocked}
         version = hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         pending = [t for t in tasks if t['status'] in ('pending', 'uncertain')]
-        available = bool(image and image['is_active'] and not blocked and any(s['platform'] == platform for s in sources))
+        blocked_platforms = {r['platform'] for r in blocked}
+        allowed = {'pixiv', 'xiaohongshu'} if platform == 'all' else {platform}
+        review_platforms = list(dict.fromkeys(s['platform'] for s in sources
+                                             if s['platform'] in allowed and s['platform'] not in blocked_platforms))
+        available = bool(image and image['is_active'] and review_platforms)
         names = list(dict.fromkeys(t['tag_name'] for t in pending))
         status = '待审' if available and pending else ('已拒绝' if tasks and all(
             t['status'] in ('manual_rejected', 'rejected') for t in tasks) else '已处理/不可用')
         return {'image_id': image_id, 'file_path': str(image['file_path']) if image else '',
                 'version': version, 'available': available, 'open': bool(available and pending), 'status_label': status,
-                'candidate_names': names}
+                'candidate_names': names, 'review_platforms': review_platforms}
 
     def get_review_grid_snapshots(self, image_ids: Iterable[int], *, platform: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
@@ -6380,10 +6396,10 @@ class ImageIndexDB:
             conn.execute('BEGIN')
             if upper_id is None:
                 upper_id = int(conn.execute('SELECT COALESCE(MAX(id),0) FROM images').fetchone()[0])
-            where = ("i.is_active=1 AND i.id<=? AND EXISTS(SELECT 1 FROM sources s WHERE s.image_id=i.id AND s.platform=?) "
-                     "AND EXISTS(SELECT 1 FROM review_tasks rt WHERE rt.image_id=i.id AND rt.status IN ('pending','uncertain')) "
-                     "AND NOT EXISTS(SELECT 1 FROM rejected_sources rs WHERE rs.image_id=i.id AND rs.platform=?)")
-            params: list[Any] = [upper_id, platform, platform]
+            source_clause, source_params = self._review_source_clause(platform, exclude_rejected=True)
+            where = (f'i.is_active=1 AND i.id<=? AND {source_clause} '
+                     "AND EXISTS(SELECT 1 FROM review_tasks rt WHERE rt.image_id=i.id AND rt.status IN ('pending','uncertain'))")
+            params: list[Any] = [upper_id, *source_params]
             if tag_id:
                 where += " AND EXISTS(SELECT 1 FROM review_tasks rt WHERE rt.image_id=i.id AND rt.tag_id=? AND rt.status IN ('pending','uncertain'))"
                 params.append(int(tag_id))
@@ -6406,6 +6422,7 @@ class ImageIndexDB:
         if not normalized_statuses or not platform_text:
             return None
         status_placeholders = ",".join("?" for _ in normalized_statuses)
+        source_clause, source_params = self._review_source_clause(platform_text)
         sql = f"""
             SELECT i.id AS image_id,
                    i.file_path,
@@ -6415,12 +6432,9 @@ class ImageIndexDB:
             JOIN review_tasks rt ON rt.image_id = i.id
             WHERE i.is_active = 1
               AND rt.status IN ({status_placeholders})
-              AND EXISTS (
-                  SELECT 1 FROM sources s
-                  WHERE s.image_id = i.id AND s.platform = ?
-              )
+              AND {source_clause}
         """
-        params: list[Any] = [*normalized_statuses, platform_text]
+        params: list[Any] = [*normalized_statuses, *source_params]
         wanted_tag_id = int(candidate_tag_id or 0)
         if wanted_tag_id > 0:
             sql += f"""
@@ -6457,18 +6471,16 @@ class ImageIndexDB:
         if not normalized_statuses or not platform_text:
             return 0
         status_placeholders = ",".join("?" for _ in normalized_statuses)
+        source_clause, source_params = self._review_source_clause(platform_text)
         sql = f"""
             SELECT COUNT(DISTINCT i.id) AS total
             FROM images i
             JOIN review_tasks rt ON rt.image_id = i.id
             WHERE i.is_active = 1
               AND rt.status IN ({status_placeholders})
-              AND EXISTS (
-                  SELECT 1 FROM sources s
-                  WHERE s.image_id = i.id AND s.platform = ?
-              )
+              AND {source_clause}
         """
-        params: list[Any] = [*normalized_statuses, platform_text]
+        params: list[Any] = [*normalized_statuses, *source_params]
         wanted_tag_id = int(candidate_tag_id or 0)
         if wanted_tag_id > 0:
             sql += f"""
@@ -6498,6 +6510,7 @@ class ImageIndexDB:
         if not normalized_statuses or not platform_text:
             return False
         placeholders = ",".join("?" for _ in normalized_statuses)
+        source_clause, source_params = self._review_source_clause(platform_text)
         sql = f"""
             SELECT 1
             FROM images i
@@ -6505,16 +6518,13 @@ class ImageIndexDB:
             WHERE i.id = ?
               AND i.is_active = 1
               AND rt.status IN ({placeholders})
-              AND EXISTS (
-                  SELECT 1 FROM sources s
-                  WHERE s.image_id = i.id AND s.platform = ?
-              )
+              AND {source_clause}
             LIMIT 1
         """
         with self._lock, self._connect() as conn:
             return conn.execute(
                 sql,
-                (int(image_id), *normalized_statuses, platform_text),
+                (int(image_id), *normalized_statuses, *source_params),
             ).fetchone() is not None
 
     def get_random_pixiv_review_image(
@@ -6846,11 +6856,16 @@ class ImageIndexDB:
         rejected_reason = str(reason or '').strip() or f'{platform_text} 人工审批拒绝'
 
         with self._lock, self._connect() as conn:
-            if require_open_review or expected_review_version is not None:
+            if require_open_review or expected_review_version is not None or platform_text == 'all':
                 conn.execute('BEGIN IMMEDIATE')
             if expected_review_version is not None and self._review_grid_snapshot_conn(
                     conn, int(image_id), platform_text)['version'] != expected_review_version:
                 return False, {'message': '审核状态已变化，请刷新本页后再操作。', 'code': 'stale_review'}
+            if platform_text == 'all':
+                eligible = self._review_grid_snapshot_conn(conn, int(image_id), 'all')['review_platforms']
+                if not eligible:
+                    return False, {'message': '这张图已不可审核，请刷新列表。', 'code': 'stale_review'}
+                platform_text = eligible[0]
             image = conn.execute('SELECT id FROM images WHERE id = ? AND is_active = 1 LIMIT 1', (image_id,)).fetchone()
             if not image:
                 return False, {'message': f'图片不存在：{image_id}'}

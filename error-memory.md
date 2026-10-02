@@ -45,3 +45,10 @@
 - Fix: 占位描述改成角色或alias后重跑文档检查
 - Prevention: QQ指令帮助中的占位选项使用或，保留统一点号前缀
 - Evidence: 其余44项测试通过，唯一失败是README命令示例行
+### 2026-10-03 00:11:36 - 34期QQ统一审图测试
+
+- Symptom: 真实卡片测试夹具假设get_image_detail返回顶层file_path，引发KeyError；一次补丁未对照实际元组参数
+- Root cause: 沿用不匹配的详情返回结构和代码形状
+- Fix: 使用get_image_file_path接口并对照现有源码修正补丁，卡片测试通过
+- Prevention: 测试夹具优先使用公开查询接口，修改SQL参数先核对实际调用格式
+- Evidence: 主卡片实际方法测试通过，文本不包含平台或来源链接

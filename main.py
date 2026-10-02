@@ -540,9 +540,17 @@ class PJSKPicPlugin(Star):
         if direct.matched and direct.tag_name:
             return str(direct.tag_name), str(direct.match_type or ""), []
         platform_text = str(platform or "pixiv").strip().lower() or "pixiv"
-        platform_match = self.db.resolve_platform_term(platform_text, query)
-        if platform_match.matched and platform_match.tag_name:
-            return str(platform_match.tag_name), str(platform_match.match_type or f"platform:{platform_text}"), []
+        platforms = ('pixiv', 'xiaohongshu') if platform_text == 'all' else (platform_text,)
+        matches = {}
+        for source_platform in platforms:
+            platform_match = self.db.resolve_platform_term(source_platform, query)
+            if platform_match.matched and platform_match.tag_name:
+                matches[str(platform_match.tag_name)] = str(platform_match.match_type or 'platform_term')
+        if len(matches) == 1:
+            name, match_type = next(iter(matches.items()))
+            return name, match_type, []
+        if len(matches) > 1:
+            return None, '', list(matches)
         fuzzy = self.db.resolve_tag(
             query,
             allow_fuzzy=True,
@@ -582,7 +590,8 @@ class PJSKPicPlugin(Star):
             (
                 item
                 for item in list(detail.get("sources") or [])
-                if str(item.get("platform") or "").strip().lower() == source_platform
+                if str(item.get("platform") or "").strip().lower() in (
+                    ('pixiv', 'xiaohongshu') if source_platform == 'all' else (source_platform,))
             ),
             {},
         )
@@ -604,7 +613,7 @@ class PJSKPicPlugin(Star):
             visible_terms.append(f"…另 {len(source_terms) - source_limit} 个")
 
         lines = [
-            f"{self._review_platform_label(source_platform)} 群友审核 · 图片 #{session.image_id}",
+            f"群友审核 · 图片 #{session.image_id}",
             "候选 tag：" + ("、".join(candidate_tags) if candidate_tags else "无"),
         ]
         llm_suggestion = self.llm_image_review_service.latest_suggestion(session.image_id)
@@ -645,10 +654,7 @@ class PJSKPicPlugin(Star):
         if author:
             lines.append(f"作者：{author}")
         if visible_terms:
-            lines.append(f"{self._review_platform_label(source_platform)} 来源词：" + "、".join(visible_terms))
-        post_url = str(source.get("post_url") or "").strip()
-        if post_url:
-            lines.append(f"来源：{post_url}")
+            lines.append("参考标签：" + "、".join(visible_terms))
         if remaining is not None:
             lines.append(f"当前队列：约 {max(0, int(remaining))} 张待审")
         lines.extend(
@@ -656,7 +662,7 @@ class PJSKPicPlugin(Star):
                 "通过并归类：.pp 审图通过 <最终tag>",
                 "整图不要：.pp 审图拒绝 [原因]",
                 "换一张：.pp 审图跳过",
-                f"提示：整图拒绝会阻止这个{self._review_platform_label(source_platform)}来源以后再次被抓取。",
+                "提示：整图拒绝后，后续采集会跳过相关记录；标签错了请指定正确标签通过。",
             ]
         )
         await event.send(MessageChain().file_image(str(image_path)))
@@ -667,7 +673,7 @@ class PJSKPicPlugin(Star):
         self,
         event: AstrMessageEvent,
         *,
-        platform: str = "pixiv",
+        platform: str = "all",
         filter_tag_id: int = 0,
         filter_tag_name: str = "",
         replace_current: bool = True,
@@ -704,7 +710,7 @@ class PJSKPicPlugin(Star):
     @staticmethod
     def _review_platform_label(platform: str) -> str:
         normalized = str(platform or "pixiv").strip().lower()
-        return {"pixiv": "Pixiv", "xiaohongshu": "小红书"}.get(normalized, normalized or "来源平台")
+        return {"pixiv": "Pixiv", "xiaohongshu": "小红书", "all": "图库"}.get(normalized, normalized or "来源平台")
 
     def _resolve_existing_tag_name(self, raw_query: str, *, allow_fuzzy: bool = False) -> tuple[str | None, str]:
         query = str(raw_query or "").strip()
@@ -2225,7 +2231,7 @@ class PJSKPicPlugin(Star):
             "\n".join(
                 [
                     "PJSK 群友审图命令：",
-                    ".pp 随机审核 [Pixiv|小红书] [候选tag]：随机领取一张指定来源待审图",
+                    ".pp 随机审核 [角色或alias]：随机领取一张待审图",
                     ".pp 审图通过 <最终tag>：归入指定现有主 tag",
                     ".pp 审图拒绝 [原因]：整图拒绝并阻止以后重复抓取",
                     ".pp 审图跳过：不修改审核结果并换一张",
@@ -2269,15 +2275,16 @@ class PJSKPicPlugin(Star):
             "rednote": "xiaohongshu",
             "xiaohongshu": "xiaohongshu",
         }
-        platform = platform_aliases.get(normalized_first, "pixiv")
-        query = str(candidate_tag or "").strip() if normalized_first in platform_aliases else first
+        platform = 'all'
+        query = str(candidate_tag or "").strip() if normalized_first in platform_aliases else ' '.join(
+            value for value in (first, str(candidate_tag or '').strip()) if value)
         if query:
             resolved, _, candidates = self._resolve_qq_review_tag(query, platform=platform)
             if not resolved:
                 hint = (
                     f"你想找的是不是：{'、'.join(candidates)}"
                     if candidates
-                    else f"请使用已经存在的主 tag、alias 或 {self._review_platform_label(platform)} 平台词。"
+                    else "请使用已经存在的角色主标签或别名。"
                 )
                 yield event.plain_result(f"没有精确找到候选 tag“{query}”。{hint}")
                 return
@@ -2333,7 +2340,6 @@ class PJSKPicPlugin(Star):
         await event.send(
             MessageChain().message(
                 f"已通过图片 #{int(result.get('image_id', 0) or 0)}，归入 {resolved}"
-                + (f"（{match_type}）" if match_type else "")
             )
         )
         if self._qq_review_auto_next():
@@ -2366,7 +2372,7 @@ class PJSKPicPlugin(Star):
         await event.send(
             MessageChain().message(
                 f"已整图拒绝图片 #{int(result.get('image_id', 0) or 0)}；"
-                f"该 {self._review_platform_label(str(result.get('platform', 'pixiv')))} 来源以后不会再次进入采集队列。"
+                "后续采集会跳过相关记录。"
             )
         )
         if self._qq_review_auto_next():
@@ -2738,7 +2744,7 @@ class PJSKPicPlugin(Star):
             return "\n".join(
                 [
                     "PJSK 审核命令：",
-                    ".pp 随机审核 [Pixiv|小红书] [候选tag]：群友随机领取指定来源待审图",
+                    ".pp 随机审核 [角色或alias]：领取待审图",
                     ".pp 审图通过 <最终tag>；.pp 审图拒绝 [原因]；.pp 审图跳过",
                     ".pp 审图当前；.pp 审图结束；.pp 审图帮助",
                     ".pp 审核列表 [status]：查看最近审核任务",
@@ -2777,7 +2783,7 @@ class PJSKPicPlugin(Star):
                 "管理子命令可省略 pp，例如 .统计；原 .pp 统计 仍可使用。",
                 "发图：看看初音未来、来张 miku、看看id123",
                 "投稿：.tg <tag>，可用 .pp 帮助 投稿 查看 alias 写法",
-                "群友审图：.pp 随机审核 [Pixiv|小红书]，可用 .pp 审图帮助 查看完整流程",
+                "群友审图：.pp 审图列表 [角色或alias] 或 .pp 随机审核 [角色或alias]，可用 .pp 审图帮助 查看流程",
                 "LLM 辅助：.pp LLM审图状态（管理员）",
                 "管理：.pp 统计、.pp 查看 <tag>、.pp 看图 <image_id>",
                 "面板：.pp 面板地址",

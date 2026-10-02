@@ -82,10 +82,6 @@ class ReviewGridService:
     def identity(event):
         return str(event.unified_msg_origin), str(event.get_sender_id())
 
-    @staticmethod
-    def platform_label(platform):
-        return '小红书' if platform == 'xiaohongshu' else 'Pixiv'
-
     async def _notice(self, event, text):
         await event.send(MessageChain().message(text))
 
@@ -115,8 +111,10 @@ class ReviewGridService:
                 await self._notice(event, '群友审图当前未启用。')
                 return
             first = str(platform_or_tag or '').strip()
-            platform = PLATFORMS.get(first.casefold(), 'pixiv')
-            query = str(candidate_tag or '').strip() if first.casefold() in PLATFORMS else first
+            platform = 'all'
+            # Legacy platform prefixes remain parseable; participants now share one pool.
+            query = str(candidate_tag or '').strip() if first.casefold() in PLATFORMS else ' '.join(
+                value for value in (first, str(candidate_tag or '').strip()) if value)
             tag_id, tag_name = 0, ''
             if query:
                 tag_name, _, candidates = self.resolve_tag(query, platform=platform)
@@ -147,7 +145,7 @@ class ReviewGridService:
         for row in rows:
             if row['image_id'] in browse.skipped and row['open']:
                 row['status_label'] = '本轮跳过'
-        heading = f'{self.platform_label(browse.platform)} · {browse.tag_name or "全部"} · 第{index}组 · 本页{len(rows)}张'
+        heading = f'待审图库 · {browse.tag_name or "全部角色"} · 第{index}组 · 本页{len(rows)}张'
         path = self.data_dir / 'review_grid' / f'{uuid.uuid4().hex}.png'
         task = asyncio.create_task(asyncio.to_thread(render_review_grid, rows, path, heading=heading))
         try:
@@ -160,7 +158,7 @@ class ReviewGridService:
             text = (GRID_HEADER + heading + f'；查询时待审约{total}张\n'
                     '引用本条：看第3张；通过3 角色名；拒绝3 [原因]；跳过3\n'
                     '下一页 / 上一页 / 刷新本页 / 结束审图列表。仅发起人可操作。\n'
-                    '拒绝会屏蔽该平台来源；标签认错请指定正确角色通过。\n'
+                    '整图拒绝后不再收录；标签认错请指定正确角色通过。\n'
                     + f'九宫格批次：{token}')
             message_id = await self._send_grid_message(event, path, text)
             self._pages[token] = GridPage(browse, index, rows, set(rendered['readable']), rendered['stamps'])
@@ -355,5 +353,5 @@ class ReviewGridService:
         browse.expires = self.clock() + self.ttl()
         current = await asyncio.to_thread(self.db.get_review_grid_snapshots, [r['image_id'] for r in page.rows], platform=browse.platform)
         remaining = sum(r['open'] and r['image_id'] not in browse.skipped for r in current)
-        outcome = f'已通过：{tag_name}' if action == 'approve' else f'已整图拒绝；该{self.platform_label(browse.platform)}来源将被屏蔽'
+        outcome = f'已通过：{tag_name}' if action == 'approve' else '已整图拒绝，后续采集会跳过相关记录'
         await self._notice(event, f'第{number}张 → #{image_id}，{outcome}；本页还剩{remaining}张待审。')

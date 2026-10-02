@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -111,7 +112,7 @@ class GridTests(unittest.IsolatedAsyncioTestCase):
         token = self.service._messages.get(('qq:GroupMessage:1', str(message)))
         return self.service._pages[token]
 
-    async def test_page_sizes_and_source_tag_filter(self):
+    async def test_page_sizes_mixed_pool_and_tag_filter(self):
         for n in range(10): self.add(n)
         self.add(11, platform='xiaohongshu')
         self.add(12, tag=self.other)
@@ -122,10 +123,109 @@ class GridTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(9, len(page.rows))
         self.assertEqual('初音未来', page.browse.tag_name)
         await self.reply(first, '下一页')
-        self.assertEqual(1, len(self.page(self.bot.counter).rows))
+        self.assertEqual(2, len(self.page(self.bot.counter).rows))
         _, xhs = await self.start('小红书')
-        self.assertEqual('xiaohongshu', self.page(xhs).browse.platform)
-        self.assertEqual(1, len(self.page(xhs).rows))
+        self.assertEqual('all', self.page(xhs).browse.platform)
+        self.assertEqual(9, len(self.page(xhs).rows))
+
+    async def test_role_alias_mixes_sources_and_deduplicates_shared_image(self):
+        self.db.add_alias('初音未来', 'miku')
+        ena = self.db.get_or_create_tag('东云绘名', tag_type='character')
+        self.db.add_alias('东云绘名', 'ena')
+        first = self.add(1)
+        second = self.add(2, platform='xiaohongshu')
+        self.add(3, tag=ena)
+        self.db.upsert_source(first, 'xiaohongshu', 'https://www.xiaohongshu.com/explore/shared', 'https://images.test/shared', raw_tags=[])
+        _, message = await self.start('miku')
+        self.assertEqual([first, second], [r['image_id'] for r in self.page(message).rows])
+        self.assertEqual({'pixiv', 'xiaohongshu'}, set(self.page(message).rows[0]['review_platforms']))
+        body = ''.join(s['data']['text'] for s in self.bot.messages[message]['message'] if s['type'] == 'text')
+        self.assertNotIn('Pixiv', body)
+        self.assertNotIn('小红书', body)
+        self.assertNotIn('xiaohongshu', body)
+        self.assertIn('初音未来', body)
+        _, ena_message = await self.start('ena')
+        self.assertEqual(1, len(self.page(ena_message).rows))
+        self.assertEqual('东云绘名', self.page(ena_message).browse.tag_name)
+
+    async def test_unified_rejection_blocks_both_sources_atomically(self):
+        image_id = self.add(1)
+        xhs_url = 'https://www.xiaohongshu.com/explore/shared'
+        self.db.upsert_source(image_id, 'xiaohongshu', xhs_url, 'https://images.test/shared', raw_tags=[])
+        _, message = await self.start()
+        _, event = await self.reply(message, '拒绝1 质量不好')
+        self.assertIn('已整图拒绝', event.text())
+        self.assertNotIn('Pixiv', event.text())
+        self.assertNotIn('小红书', event.text())
+        self.assertTrue(self.db.is_rejected_source_post_url('https://www.pixiv.net/artworks/1', platform='pixiv'))
+        self.assertTrue(self.db.is_rejected_source_post_url(xhs_url, platform='xiaohongshu'))
+        self.assertFalse(self.db.get_review_grid_page(platform='all')['rows'])
+
+    async def test_unified_approval_keeps_source_metadata(self):
+        image_id = self.add(1, platform='xiaohongshu')
+        self.db.upsert_source(image_id, 'pixiv', 'https://www.pixiv.net/artworks/100', 'https://images.test/100', raw_tags=['raw'])
+        before = self.db.get_image_detail(image_id, sync_files=False)['sources']
+        _, message = await self.start()
+        _, event = await self.reply(message, '通过1 初音')
+        self.assertIn('已通过', event.text())
+        self.assertEqual(before, self.db.get_image_detail(image_id, sync_files=False)['sources'])
+        self.assertFalse(self.db.is_open_review_image(image_id, platform='all'))
+
+    def test_one_blocked_source_other_available_and_web_rejection_unchanged(self):
+        image_id = self.add(1)
+        xhs_url = 'https://www.xiaohongshu.com/explore/shared'
+        self.db.upsert_source(image_id, 'xiaohongshu', xhs_url, 'https://images.test/shared', raw_tags=[])
+        self.db.reject_image_source(image_id, platform='pixiv')
+        self.assertFalse(self.db.is_rejected_source_post_url(xhs_url, platform='xiaohongshu'))
+        self.db.create_review_task(image_id, self.other, 'pending')
+        rows = self.db.get_review_grid_page(platform='all')['rows']
+        self.assertEqual([image_id], [r['image_id'] for r in rows])
+        self.assertEqual(['xiaohongshu'], rows[0]['review_platforms'])
+
+    def test_second_source_failure_rolls_back_whole_rejection(self):
+        image_id = self.add(1)
+        xhs_url = 'https://www.xiaohongshu.com/explore/shared'
+        self.db.upsert_source(image_id, 'xiaohongshu', xhs_url, 'https://images.test/shared', raw_tags=[])
+        original = self.db._upsert_rejected_source_conn
+        count = 0
+        def fail_second(*args, **kwargs):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise RuntimeError('simulated write failure')
+            return original(*args, **kwargs)
+        with patch.object(self.db, '_upsert_rejected_source_conn', side_effect=fail_second):
+            with self.assertRaises(RuntimeError):
+                self.db.reject_image_source(image_id, platform='all', require_open_review=True)
+        self.assertFalse(self.db.is_rejected_source_post_url('https://www.pixiv.net/artworks/1', platform='pixiv'))
+        self.assertFalse(self.db.is_rejected_source_post_url(xhs_url, platform='xiaohongshu'))
+        self.assertTrue(self.db.is_open_review_image(image_id, platform='all'))
+
+    async def test_random_pool_and_real_main_card_hide_source(self):
+        ids = {self.add(1), self.add(2, platform='xiaohongshu')}
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'main.py').read_text(encoding='utf-8'))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'PJSKPicPlugin')
+        handler = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == '_send_qq_review_session')
+        handler.decorator_list = []
+        scope = {'MessageChain': grid.MessageChain, 'QQReviewSessionService': qq.QQReviewSessionService,
+                 'AstrMessageEvent': Event, 'QQReviewSession': qq.QQReviewSession}
+        exec(compile(ast.Module(body=[handler], type_ignores=[]), 'main_card', 'exec'), scope)
+        plugin = types.SimpleNamespace(db=self.db,
+            _review_image_path=lambda i: Path(self.db.get_image_file_path(i)),
+            _qq_review_source_term_limit=lambda: 12,
+            llm_image_review_service=types.SimpleNamespace(latest_suggestion=lambda i: None))
+        session, total = await self.reviews.claim_next(origin='qq:GroupMessage:1', reviewer_id='101', platform='all')
+        self.assertEqual(2, total)
+        event = Event(self.bot)
+        self.assertTrue(await scope[handler.name](plugin, event, session, remaining=total))
+        for word in ('Pixiv', '小红书', 'xiaohongshu', '来源：', 'https://'):
+            self.assertNotIn(word, event.text())
+        self.assertIn('群友审核', event.text())
+        ok, _ = await self.reviews.approve_current(origin='qq:GroupMessage:1', reviewer_id='101', tag_name='初音未来')
+        self.assertTrue(ok)
+        following, total = await self.reviews.claim_next(origin='qq:GroupMessage:1', reviewer_id='101', platform='all')
+        self.assertEqual(ids - {session.image_id}, {following.image_id})
+        self.assertEqual(1, total)
 
     async def test_zero_one_eight_nine_images_and_layout(self):
         event, _ = await self.start()
